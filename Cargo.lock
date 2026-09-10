@@ -32,6 +32,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ai-memory-auth"
+version = "2.1.1"
+dependencies = [
+ "ai-memory-core",
+ "jiff",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "ai-memory-cli"
 version = "2.2.0"
 dependencies = [
