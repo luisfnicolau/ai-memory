@@ -1529,6 +1529,20 @@ impl ReaderPool {
         self.tuning
     }
 
+    /// Every grant this user holds on this repository, revoked ones included
+    /// so the decision can tell "never granted" from "revoked".
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn grants_for(
+        &self,
+        user_id: ai_memory_core::UserId,
+        repository_id: ProjectId,
+    ) -> StoreResult<Vec<ai_memory_auth::MemoryGrant>> {
+        self.with_conn(move |conn| crate::auth::grants_for(conn, user_id, repository_id))
+            .await
+    }
+
     /// Run a synchronous closure against a pooled read-only connection.
     ///
     /// The closure runs on the tokio blocking pool so it never starves the

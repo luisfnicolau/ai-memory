@@ -6,8 +6,8 @@ use std::sync::Arc;
 use ai_memory_core::{ObservationKind, PageId, PagePath, ProjectId, SessionId, WorkspaceId};
 use ai_memory_store::{
     BriefingSnapshot, HealthPage, ObservationOrder, ObservationPage, ObservationRecord, PageHit,
-    RelatedPage, ScopeName, ScopeResolutionError, SessionSummary, lookup_existing_scope,
-    resolve_many_existing_scopes,
+    RelatedPage, ScopeName, ScopeResolutionError, SessionSummary, lookup_existing_scope_guarded,
+    resolve_many_existing_scopes_guarded,
 };
 use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::{HeaderValue, StatusCode, header};
@@ -156,9 +156,10 @@ async fn projects_handler(
 
 async fn pages_handler(
     State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::UserId>>,
     Path((workspace, project)): Path<(String, String)>,
 ) -> Result<Response, Response> {
-    let _ = lookup_project(&state, &workspace, &project).await?;
+    let _ = lookup_project(&state, &workspace, &project, viewer_of(viewer)).await?;
     let pages = state
         .reader
         .list_pages(&workspace, &project)
@@ -267,20 +268,22 @@ async fn page_handler(
 
 async fn search_handler(
     State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::UserId>>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Response, Response> {
     let query = SearchQuery::from_raw(raw_query.as_deref()).map_err(ApiFailure::into_response)?;
     let request = query
         .try_into_request()
         .map_err(ApiFailure::into_response)?;
-    search_with_request(&state, request).await
+    search_with_request(&state, request, viewer_of(viewer)).await
 }
 
 async fn search_post_handler(
     State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::UserId>>,
     Json(request): Json<SearchRequest>,
 ) -> Result<Response, Response> {
-    search_with_request(&state, request).await
+    search_with_request(&state, request, viewer_of(viewer)).await
 }
 
 // NOTE (deferred): vector/semantic search. `ReaderPool::hybrid_search` already
@@ -295,6 +298,7 @@ async fn search_post_handler(
 async fn search_with_request(
     state: &WebState,
     request: SearchRequest,
+    viewer: Option<ai_memory_core::UserId>,
 ) -> Result<Response, Response> {
     let term = request.q.trim().to_owned();
     if term.is_empty() {
@@ -317,7 +321,7 @@ async fn search_with_request(
             "scopes cannot be combined with workspace/project",
         ));
     }
-    let hits = match scoped_search_mode(state, &request).await? {
+    let hits = match scoped_search_mode(state, &request, viewer).await? {
         SearchMode::Global => state.reader.search_pages(term, limit).await,
         SearchMode::Scoped(scopes) => search_scopes(state, scopes, term, limit).await,
     }
@@ -332,6 +336,7 @@ async fn search_with_request(
 async fn scoped_search_mode(
     state: &WebState,
     request: &SearchRequest,
+    viewer: Option<ai_memory_core::UserId>,
 ) -> Result<SearchMode, Response> {
     if !request.scopes.is_empty() {
         if request.scopes.len() > MAX_SEARCH_SCOPES {
@@ -340,7 +345,7 @@ async fn scoped_search_mode(
                 format!("at most {MAX_SEARCH_SCOPES} scopes are allowed"),
             ));
         }
-        let scopes = resolve_scopes(state, &request.scopes).await?;
+        let scopes = resolve_scopes(state, &request.scopes, viewer).await?;
         return Ok(SearchMode::Scoped(scopes));
     }
 
@@ -349,7 +354,8 @@ async fn scoped_search_mode(
         trimmed_opt(request.project.as_deref()),
     ) {
         (Some(workspace), Some(project)) => {
-            let (workspace_id, project_id) = lookup_project(state, workspace, project).await?;
+            let (workspace_id, project_id) =
+                lookup_project(state, workspace, project, viewer).await?;
             Ok(SearchMode::Scoped(vec![ResolvedSearchScope {
                 project_id,
                 workspace_id,
@@ -366,23 +372,30 @@ async fn scoped_search_mode(
 async fn resolve_scopes(
     state: &WebState,
     scopes: &[ApiSearchScope],
+    viewer: Option<ai_memory_core::UserId>,
 ) -> Result<Vec<ResolvedSearchScope>, Response> {
     let names: Vec<_> = scopes
         .iter()
         .map(|scope| ScopeName::new(&scope.workspace, &scope.project))
         .collect();
-    resolve_many_existing_scopes(&state.reader, &names, MAX_SEARCH_SCOPES)
-        .await
-        .map(|scopes| {
-            scopes
-                .into_iter()
-                .map(|scope| ResolvedSearchScope {
-                    workspace_id: scope.workspace_id,
-                    project_id: scope.project_id,
-                })
-                .collect()
-        })
-        .map_err(scope_error_response)
+    resolve_many_existing_scopes_guarded(
+        &state.reader,
+        &names,
+        MAX_SEARCH_SCOPES,
+        viewer,
+        ai_memory_auth::GrantRole::Reader,
+    )
+    .await
+    .map(|scopes| {
+        scopes
+            .into_iter()
+            .map(|scope| ResolvedSearchScope {
+                workspace_id: scope.workspace_id,
+                project_id: scope.project_id,
+            })
+            .collect()
+    })
+    .map_err(scope_error_response)
 }
 
 async fn search_scopes(
@@ -426,10 +439,11 @@ async fn search_scopes(
 
 async fn recent_handler(
     State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::UserId>>,
     Path((workspace, project)): Path<(String, String)>,
     Query(query): Query<LimitQuery>,
 ) -> Result<Response, Response> {
-    let _ = lookup_project(&state, &workspace, &project).await?;
+    let _ = lookup_project(&state, &workspace, &project, viewer_of(viewer)).await?;
     let mut pages = state
         .reader
         .list_pages(&workspace, &project)
@@ -442,11 +456,13 @@ async fn recent_handler(
 
 async fn briefing_handler(
     State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::UserId>>,
     actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Path((workspace, project)): Path<(String, String)>,
     Query(query): Query<LimitQuery>,
 ) -> Result<Response, Response> {
-    let (workspace_id, project_id) = lookup_project(&state, &workspace, &project).await?;
+    let (workspace_id, project_id) =
+        lookup_project(&state, &workspace, &project, viewer_of(viewer)).await?;
     let briefing = state
         .reader
         .briefing_for_project(
@@ -711,12 +727,14 @@ const fn default_handoff_limit() -> usize {
 /// server that *does* authenticate shows to a caller it cannot place.
 async fn handoffs_handler(
     State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::UserId>>,
     actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
     auth: Option<axum::Extension<ai_memory_core::AuthLevel>>,
     Path((workspace, project)): Path<(String, String)>,
     Query(query): Query<HandoffListQuery>,
 ) -> Result<Response, Response> {
-    let (workspace_id, project_id) = lookup_project(&state, &workspace, &project).await?;
+    let (workspace_id, project_id) =
+        lookup_project(&state, &workspace, &project, viewer_of(viewer)).await?;
     let handoff_state = match query.state.as_deref().map(str::trim) {
         None | Some("") => None,
         Some(raw) => Some(raw.parse::<ai_memory_core::HandoffState>().map_err(|_| {
@@ -775,11 +793,13 @@ async fn handoffs_handler(
 
 async fn project_overview_handler(
     State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::UserId>>,
     actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Path((workspace, project)): Path<(String, String)>,
     Query(query): Query<LimitQuery>,
 ) -> Result<Response, Response> {
-    let (workspace_id, project_id) = lookup_project(&state, &workspace, &project).await?;
+    let (workspace_id, project_id) =
+        lookup_project(&state, &workspace, &project, viewer_of(viewer)).await?;
     let limit = query.limit.clamp(1, 100);
 
     // Same scoping as `overview_handler`; computed once and reused for the
@@ -847,11 +867,13 @@ const SESSION_OBSERVATIONS_MAX_BODY_CHARS: usize = 16_384;
 
 async fn sessions_handler(
     State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::UserId>>,
     actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Path((workspace, project)): Path<(String, String)>,
     Query(query): Query<SessionListQuery>,
 ) -> Result<Response, Response> {
-    let (workspace_id, project_id) = lookup_project(&state, &workspace, &project).await?;
+    let (workspace_id, project_id) =
+        lookup_project(&state, &workspace, &project, viewer_of(viewer)).await?;
     let sessions = state
         .reader
         .sessions_for_scope(
@@ -871,11 +893,13 @@ async fn sessions_handler(
 
 async fn session_observations_handler(
     State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::UserId>>,
     actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Path((workspace, project, session_id)): Path<(String, String, String)>,
     Query(query): Query<SessionObservationsQuery>,
 ) -> Result<Response, Response> {
-    let (workspace_id, project_id) = lookup_project(&state, &workspace, &project).await?;
+    let (workspace_id, project_id) =
+        lookup_project(&state, &workspace, &project, viewer_of(viewer)).await?;
     let session_id = session_id.parse::<SessionId>().map_err(|_| {
         json_error(
             StatusCode::BAD_REQUEST,
@@ -991,20 +1015,44 @@ fn cap_body(body: &str, max_chars: usize) -> String {
     out
 }
 
+/// The authenticated database user, when there is one.
+///
+/// `None` covers two different situations that authorize identically: an
+/// install with no auth configured, and the operator's root token. The auth
+/// middleware only stamps a `UserId` on the DB-user rung, so `None` means "no
+/// per-repository check applies" — which is what keeps every existing
+/// single-user install behaving exactly as it did before the guard existed.
+fn viewer_of(
+    viewer: Option<axum::Extension<ai_memory_core::UserId>>,
+) -> Option<ai_memory_core::UserId> {
+    viewer.map(|axum::Extension(id)| id)
+}
+
+/// Resolve a workspace/project pair the viewer is allowed to read.
+///
+/// Every `/api/v1` route is a GET, so the whole surface needs exactly
+/// [`ai_memory_auth::GrantRole::Reader`] and no caller has to choose a level.
 async fn lookup_project(
     state: &WebState,
     workspace: &str,
     project: &str,
+    viewer: Option<ai_memory_core::UserId>,
 ) -> Result<(WorkspaceId, ProjectId), Response> {
-    lookup_existing_scope(&state.reader, workspace, project)
-        .await
-        .map(ai_memory_store::ResolvedScope::as_tuple)
-        .map_err(|err| match err {
-            ScopeResolutionError::ProjectNotFoundInWorkspace { project, .. } => {
-                not_found(format!("project '{project}' not found"))
-            }
-            other => scope_error_response(other),
-        })
+    lookup_existing_scope_guarded(
+        &state.reader,
+        workspace,
+        project,
+        viewer,
+        ai_memory_auth::GrantRole::Reader,
+    )
+    .await
+    .map(ai_memory_store::ResolvedScope::as_tuple)
+    .map_err(|err| match err {
+        ScopeResolutionError::ProjectNotFoundInWorkspace { project, .. } => {
+            not_found(format!("project '{project}' not found"))
+        }
+        other => scope_error_response(other),
+    })
 }
 
 async fn enrich_hits(state: &WebState, hits: Vec<PageHit>) -> Result<Vec<ApiSearchHit>, Response> {

@@ -12,6 +12,7 @@ description = "MCP server transport and tool router for ai-memory."
 # first run.
 
 [dependencies]
+ai-memory-auth.workspace = true
 ai-memory-core.workspace = true
 ai-memory-consolidate.workspace = true
 ai-memory-llm.workspace = true

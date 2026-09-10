@@ -63,6 +63,22 @@ impl ResolvedScope {
 /// Scope-resolution failure, independent of HTTP/MCP response types.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScopeResolutionError {
+    /// The caller is authenticated but not authorized for this repository, or
+    /// not to the level this operation needs (#708).
+    ///
+    /// Deliberately distinct from `ProjectNotFoundInWorkspace`. Returning
+    /// "not found" for a project somebody may not read is a defensible choice
+    /// in some systems, but not here: the same error would then mean both "you
+    /// cannot see this" and "this does not exist", and a developer whose grant
+    /// was never issued would spend the afternoon debugging a typo.
+    NotAuthorized {
+        /// The repository as a person would name it.
+        repository: String,
+        /// What the caller holds today, if anything.
+        held: Option<ai_memory_auth::GrantRole>,
+        /// What the operation needed.
+        required: ai_memory_auth::GrantRole,
+    },
     /// Only one of workspace/project was provided.
     WorkspaceProjectPairRequired,
     /// A multi-scope entry had an empty workspace.
@@ -133,6 +149,28 @@ impl ScopeResolutionError {
 impl fmt::Display for ScopeResolutionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ScopeResolutionError::NotAuthorized {
+                repository,
+                held,
+                required,
+            } => {
+                // Name both levels: "you have reader and this needs writer"
+                // tells somebody what to ask for, where a bare denial starts a
+                // conversation.
+                match held {
+                    Some(held) => write!(
+                        f,
+                        "not authorized for {repository}: you have {} and this needs {}.                          Ask someone with admin on it to raise your access.",
+                        held.as_str(),
+                        required.as_str()
+                    ),
+                    None => write!(
+                        f,
+                        "not authorized for {repository}. This is an access problem, not an                          empty memory — ask an operator to grant you {} on it.",
+                        required.as_str()
+                    ),
+                }
+            }
             ScopeResolutionError::WorkspaceProjectPairRequired => {
                 f.write_str(WORKSPACE_PROJECT_PAIR_REQUIRED)
             }
@@ -189,7 +227,12 @@ pub struct ScopeResolver<'a> {
 ///
 /// This free function serves surfaces like admin/web routes that do not have a
 /// current-project default. [`ScopeResolver::lookup_existing`] delegates here.
-pub async fn lookup_existing_scope(
+///
+/// Crate-private on purpose: resolving a repository outside this crate must go
+/// through [`lookup_existing_scope_guarded`], so a caller cannot reach a
+/// repository without stating which user is asking and what they need (#708).
+/// The compiler enforces that; a review convention would not.
+pub(crate) async fn lookup_existing_scope(
     reader: &ReaderPool,
     workspace: &str,
     project: &str,
@@ -212,6 +255,12 @@ pub async fn lookup_existing_scope(
 ///
 /// This is for admin/destructive surfaces that operate at workspace granularity
 /// and must fail closed on typos instead of auto-creating a scope.
+///
+/// Deliberately left public and unguarded: a grant is held against a
+/// repository, and this returns a workspace id, which is not one. Every path
+/// that goes on to touch a project inside the workspace still has to resolve
+/// that project through a guarded function, so nothing is reachable from a
+/// bare workspace id that the guard would otherwise refuse.
 pub async fn lookup_existing_workspace(
     reader: &ReaderPool,
     workspace: &str,
@@ -224,11 +273,133 @@ pub async fn lookup_existing_workspace(
         })
 }
 
+/// Authorize a resolved scope, or explain why not (#708).
+///
+/// `authorized_user` is `None` when authorization is off, or when the caller is
+/// the operator's root token — both mean "no per-repository check applies", and
+/// both must keep working exactly as before this existed. That is what lets
+/// this land without changing the behaviour of every install that has one user.
+///
+/// # Errors
+/// [`ScopeResolutionError::NotAuthorized`] when the user holds nothing on this
+/// repository, or holds less than `required`. Propagates store errors.
+pub async fn authorize_scope(
+    reader: &ReaderPool,
+    scope: ResolvedScope,
+    authorized_user: Option<ai_memory_core::UserId>,
+    required: ai_memory_auth::GrantRole,
+    repository_label: &str,
+) -> Result<ResolvedScope, ScopeResolutionError> {
+    let Some(user) = authorized_user else {
+        return Ok(scope);
+    };
+    let grants = reader.grants_for(user, scope.project_id).await?;
+    match ai_memory_auth::decide(&grants, user, scope.project_id, required) {
+        ai_memory_auth::Access::Granted => Ok(scope),
+        ai_memory_auth::Access::Denied(denial) => {
+            let held = match denial {
+                ai_memory_auth::Denial::InsufficientRole { held, .. } => Some(held),
+                _ => None,
+            };
+            Err(ScopeResolutionError::NotAuthorized {
+                repository: repository_label.to_string(),
+                held,
+                required,
+            })
+        }
+    }
+}
+
+/// [`lookup_existing_scope`] with the authorization check applied.
+///
+/// # Errors
+/// As [`lookup_existing_scope`], plus [`ScopeResolutionError::NotAuthorized`].
+pub async fn lookup_existing_scope_guarded(
+    reader: &ReaderPool,
+    workspace: &str,
+    project: &str,
+    authorized_user: Option<ai_memory_core::UserId>,
+    required: ai_memory_auth::GrantRole,
+) -> Result<ResolvedScope, ScopeResolutionError> {
+    let scope = lookup_existing_scope(reader, workspace, project).await?;
+    authorize_scope(reader, scope, authorized_user, required, project).await
+}
+
+/// [`create_explicit_scope`] with the authorization check applied.
+///
+/// Creating is a two-shape operation and the two shapes authorize differently:
+///
+/// - The repository already exists: the user must hold `required` on it, the
+///   same as any other write. Otherwise "create" would be a way to reach a
+///   repository the guard would have refused on the read path.
+/// - The repository does not exist yet: there is nothing to hold a grant on,
+///   so creation proceeds. Note the creator does not receive a grant here —
+///   there is no grant *write* path in the store yet, so on an install with
+///   authorization enabled the creator cannot read back what they just made.
+///   The enable/grant-admin work closes that; until it lands nobody can be in
+///   that state, because nothing can enable authorization.
+///
+/// # Errors
+/// As [`create_explicit_scope`], plus [`ScopeResolutionError::NotAuthorized`].
+pub async fn create_explicit_scope_guarded(
+    reader: &ReaderPool,
+    writer: &WriterHandle,
+    workspace: &str,
+    project: &str,
+    authorized_user: Option<ai_memory_core::UserId>,
+    required: ai_memory_auth::GrantRole,
+) -> Result<ResolvedScope, ScopeResolutionError> {
+    match lookup_existing_scope(reader, workspace, project).await {
+        Ok(existing) => {
+            authorize_scope(reader, existing, authorized_user, required, project).await?;
+        }
+        // A repository that is not there yet cannot carry a grant. Any other
+        // failure is a real store problem and must not be read as "absent".
+        Err(err) if err.is_not_found() => {}
+        Err(err) => return Err(err),
+    }
+    create_explicit_scope(writer, workspace, project).await
+}
+
+/// [`resolve_many_existing_scopes`] with the authorization check applied to
+/// every scope.
+///
+/// A denied scope fails the whole call rather than being dropped from the
+/// result. Silently returning the permitted subset would answer a
+/// cross-repository search with a short list that looks like "nothing was
+/// found there" — authorization must never be indistinguishable from empty
+/// memory.
+///
+/// # Errors
+/// As [`resolve_many_existing_scopes`], plus
+/// [`ScopeResolutionError::NotAuthorized`] naming the first refused repository.
+pub async fn resolve_many_existing_scopes_guarded(
+    reader: &ReaderPool,
+    scopes: &[ScopeName],
+    max: usize,
+    authorized_user: Option<ai_memory_core::UserId>,
+    required: ai_memory_auth::GrantRole,
+) -> Result<Vec<ResolvedScope>, ScopeResolutionError> {
+    let resolved = resolve_many_existing_scopes_labelled(reader, scopes, max).await?;
+    if authorized_user.is_none() {
+        return Ok(resolved.into_iter().map(|(_, ids)| ids).collect());
+    }
+    let mut authorized = Vec::with_capacity(resolved.len());
+    for (label, ids) in resolved {
+        authorize_scope(reader, ids, authorized_user, required, &label).await?;
+        authorized.push(ids);
+    }
+    Ok(authorized)
+}
+
 /// Create or fetch an explicit workspace/project pair.
 ///
 /// This is the only helper that may create a scope, and should only be used by
 /// write-style paths whose public contract says they create missing projects.
-pub async fn create_explicit_scope(
+///
+/// Crate-private for the same reason as [`lookup_existing_scope`]: outside this
+/// crate the door is [`create_explicit_scope_guarded`].
+pub(crate) async fn create_explicit_scope(
     writer: &WriterHandle,
     workspace: &str,
     project: &str,
@@ -248,6 +419,13 @@ pub async fn create_explicit_scope(
 /// without creating it. Returns `Ok(None)` when it doesn't exist yet — the
 /// scope participates in default reads by existence, so an absent scope
 /// means "nothing to union in", never an error (issue #154).
+///
+/// Deliberately left public and unguarded, together with
+/// [`create_global_scope`]: the global scope is the one repository that is
+/// shared by construction. It is unioned into everybody's default reads, so
+/// requiring a grant on it would mean every user needs an explicit grant to
+/// the shared layer before memory works at all. Per-repository authorization
+/// is about the project scopes; the global preferences scope is common ground.
 ///
 /// # Errors
 /// Propagates store failures only; a missing workspace or project is `None`.
@@ -295,11 +473,33 @@ pub async fn create_global_scope(
 /// anything. Surfaces that do not have a current-project default (admin/web)
 /// can call this directly; [`ScopeResolver::resolve_many_existing`] delegates
 /// here.
-pub async fn resolve_many_existing_scopes(
+///
+/// Crate-private for the same reason as [`lookup_existing_scope`]: outside this
+/// crate the door is [`resolve_many_existing_scopes_guarded`].
+pub(crate) async fn resolve_many_existing_scopes(
     reader: &ReaderPool,
     scopes: &[ScopeName],
     max: usize,
 ) -> Result<Vec<ResolvedScope>, ScopeResolutionError> {
+    Ok(resolve_many_existing_scopes_labelled(reader, scopes, max)
+        .await?
+        .into_iter()
+        .map(|(_, ids)| ids)
+        .collect())
+}
+
+/// [`resolve_many_existing_scopes`] keeping the project name each scope was
+/// asked for.
+///
+/// De-duplication drops entries, so the result cannot be zipped back against
+/// the input names — an authorization refusal that named the wrong repository
+/// would be worse than no name at all. Carrying the label through is the only
+/// way to report the refusal against what the caller actually typed.
+async fn resolve_many_existing_scopes_labelled(
+    reader: &ReaderPool,
+    scopes: &[ScopeName],
+    max: usize,
+) -> Result<Vec<(String, ResolvedScope)>, ScopeResolutionError> {
     if scopes.len() > max {
         return Err(ScopeResolutionError::TooManyScopes {
             max,
@@ -315,7 +515,7 @@ pub async fn resolve_many_existing_scopes(
             trimmed_opt(Some(&scope.project)).ok_or(ScopeResolutionError::ScopeProjectEmpty)?;
         let ids = lookup_existing_scope(reader, workspace, project).await?;
         if seen.insert(ids) {
-            resolved.push(ids);
+            resolved.push((project.to_owned(), ids));
         }
     }
     Ok(resolved)
@@ -501,6 +701,324 @@ fn trimmed_opt(value: Option<&str>) -> Option<&str> {
 mod tests {
     use super::*;
     use crate::Store;
+
+    use ai_memory_auth::GrantRole;
+    use ai_memory_core::NewUser;
+
+    /// Insert a grant row directly.
+    ///
+    /// The store has no grant *write* path yet — that lands with the admin
+    /// grant endpoints — so the guard would otherwise be untestable, and an
+    /// untested guard is a claim rather than a control. Writing the row by
+    /// hand also keeps these tests honest about the schema: they fail if
+    /// V62's shape changes under them.
+    fn grant_row(
+        db: &std::path::Path,
+        user: ai_memory_core::UserId,
+        repository: ProjectId,
+        role: &str,
+        revoked_by: Option<ai_memory_core::UserId>,
+    ) {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.execute(
+            "INSERT INTO memory_grant \
+             (id, user_id, repository_id, role, granted_by_user_id, granted_at, \
+              revoked_at, revoked_by_user_id) \
+             VALUES (?1, ?2, ?3, ?4, ?2, 1, ?5, ?6)",
+            rusqlite::params![
+                ai_memory_core::ids::MemoryGrantId::new()
+                    .as_bytes()
+                    .to_vec(),
+                user.as_bytes().to_vec(),
+                repository.as_bytes().to_vec(),
+                role,
+                revoked_by.map(|_| 2_i64),
+                revoked_by.map(|id| id.as_bytes().to_vec()),
+            ],
+        )
+        .unwrap();
+    }
+
+    async fn user_named(store: &Store, username: &str, byte: u8) -> ai_memory_core::UserId {
+        store
+            .writer
+            .create_user(
+                NewUser {
+                    username: username.to_owned(),
+                    name: None,
+                    email: None,
+                },
+                [byte; crate::TOKEN_HASH_LEN],
+            )
+            .await
+            .unwrap()
+    }
+
+    /// A repository plus two users, one of whom will hold nothing on it.
+    async fn guard_fixture(
+        store: &Store,
+    ) -> (
+        WorkspaceId,
+        ProjectId,
+        ai_memory_core::UserId,
+        ai_memory_core::UserId,
+    ) {
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let project = store
+            .writer
+            .get_or_create_project(ws, "client-work", None)
+            .await
+            .unwrap();
+        let alice = user_named(store, "alice", 1).await;
+        let bob = user_named(store, "bob", 2).await;
+        (ws, project, alice, bob)
+    }
+
+    #[tokio::test]
+    async fn an_absent_user_is_the_unauthorized_install_and_still_resolves() {
+        // Authorization off, and the operator's root token, both arrive here
+        // as `None`. Neither may change behaviour, or enabling this crate
+        // would break every install that has one user.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, project, _, _) = guard_fixture(&store).await;
+
+        let scope = lookup_existing_scope_guarded(
+            &store.reader,
+            "default",
+            "client-work",
+            None,
+            GrantRole::Admin,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            scope,
+            ResolvedScope {
+                workspace_id: ws,
+                project_id: project
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_user_reaches_only_what_they_were_granted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (_, project, alice, bob) = guard_fixture(&store).await;
+        grant_row(store.db_path(), alice, project, "writer", None);
+
+        // Alice holds writer: reader and writer pass, admin does not.
+        for required in [GrantRole::Reader, GrantRole::Writer] {
+            lookup_existing_scope_guarded(
+                &store.reader,
+                "default",
+                "client-work",
+                Some(alice),
+                required,
+            )
+            .await
+            .unwrap();
+        }
+        let err = lookup_existing_scope_guarded(
+            &store.reader,
+            "default",
+            "client-work",
+            Some(alice),
+            GrantRole::Admin,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ScopeResolutionError::NotAuthorized {
+                repository: "client-work".to_owned(),
+                held: Some(GrantRole::Writer),
+                required: GrantRole::Admin,
+            }
+        );
+
+        // Bob holds nothing. The refusal must say so — not resolve to an
+        // empty repository, which would read as "there is nothing here".
+        let err = lookup_existing_scope_guarded(
+            &store.reader,
+            "default",
+            "client-work",
+            Some(bob),
+            GrantRole::Reader,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ScopeResolutionError::NotAuthorized {
+                repository: "client-work".to_owned(),
+                held: None,
+                required: GrantRole::Reader,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn creating_authorizes_against_a_repository_that_already_exists() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, project, alice, bob) = guard_fixture(&store).await;
+        grant_row(store.db_path(), alice, project, "reader", None);
+
+        // "Create" must not be a way around the read guard: the project is
+        // already there, so Bob's write is refused exactly as a read would be.
+        let err = create_explicit_scope_guarded(
+            &store.reader,
+            &store.writer,
+            "default",
+            "client-work",
+            Some(bob),
+            GrantRole::Writer,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ScopeResolutionError::NotAuthorized { held: None, .. }
+        ));
+
+        // Alice holds reader, which does not cover a write.
+        let err = create_explicit_scope_guarded(
+            &store.reader,
+            &store.writer,
+            "default",
+            "client-work",
+            Some(alice),
+            GrantRole::Writer,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ScopeResolutionError::NotAuthorized {
+                held: Some(GrantRole::Reader),
+                ..
+            }
+        ));
+
+        // A repository that does not exist yet cannot carry a grant, so
+        // creating it proceeds.
+        let fresh = create_explicit_scope_guarded(
+            &store.reader,
+            &store.writer,
+            "default",
+            "brand-new",
+            Some(bob),
+            GrantRole::Writer,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fresh.workspace_id, ws);
+        assert_ne!(fresh.project_id, project);
+    }
+
+    #[tokio::test]
+    async fn a_refused_scope_fails_the_search_instead_of_shortening_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, granted, alice, _) = guard_fixture(&store).await;
+        let refused = store
+            .writer
+            .get_or_create_project(ws, "other-team", None)
+            .await
+            .unwrap();
+        grant_row(store.db_path(), alice, granted, "reader", None);
+
+        let names = vec![
+            ScopeName::new("default", "client-work"),
+            ScopeName::new("default", "other-team"),
+        ];
+        let err = resolve_many_existing_scopes_guarded(
+            &store.reader,
+            &names,
+            25,
+            Some(alice),
+            GrantRole::Reader,
+        )
+        .await
+        .unwrap_err();
+        // Named against what the caller typed, not the id it resolved to.
+        assert_eq!(
+            err,
+            ScopeResolutionError::NotAuthorized {
+                repository: "other-team".to_owned(),
+                held: None,
+                required: GrantRole::Reader,
+            }
+        );
+        assert_ne!(granted, refused);
+
+        // Every scope granted: the call succeeds and de-duplication still
+        // applies, so the labels cannot be zipped back positionally.
+        grant_row(store.db_path(), alice, refused, "reader", None);
+        let resolved = resolve_many_existing_scopes_guarded(
+            &store.reader,
+            &[
+                ScopeName::new("default", "client-work"),
+                ScopeName::new("default", "client-work"),
+                ScopeName::new("default", "other-team"),
+            ],
+            25,
+            Some(alice),
+            GrantRole::Reader,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_revoked_grant_denies_and_does_not_read_as_never_granted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (_, project, alice, bob) = guard_fixture(&store).await;
+        grant_row(store.db_path(), alice, project, "admin", Some(bob));
+
+        let err = lookup_existing_scope_guarded(
+            &store.reader,
+            "default",
+            "client-work",
+            Some(alice),
+            GrantRole::Reader,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ScopeResolutionError::NotAuthorized {
+                repository: "client-work".to_owned(),
+                held: None,
+                required: GrantRole::Reader,
+            }
+        );
+    }
+
+    /// The global scope is shared ground and stays reachable without a grant.
+    #[tokio::test]
+    async fn the_global_scope_needs_no_grant() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (_, _, _, bob) = guard_fixture(&store).await;
+        let global = create_global_scope(&store.writer).await.unwrap();
+        assert!(
+            lookup_global_scope(&store.reader)
+                .await
+                .unwrap()
+                .is_some_and(|found| found == global)
+        );
+        // Bob holds nothing anywhere, and still shares the global layer.
+        let _ = bob;
+    }
 
     #[tokio::test]
     async fn read_args_reject_partial_scope() {

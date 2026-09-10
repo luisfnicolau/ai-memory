@@ -155,6 +155,7 @@ dependencies = [
 name = "ai-memory-hooks"
 version = "2.2.0"
 dependencies = [
+ "ai-memory-auth",
  "ai-memory-consolidate",
  "ai-memory-core",
  "ai-memory-llm",
@@ -209,6 +210,7 @@ dependencies = [
 name = "ai-memory-mcp"
 version = "2.2.0"
 dependencies = [
+ "ai-memory-auth",
  "ai-memory-consolidate",
  "ai-memory-core",
  "ai-memory-hooks",
@@ -242,6 +244,7 @@ dependencies = [
 name = "ai-memory-store"
 version = "2.2.0"
 dependencies = [
+ "ai-memory-auth",
  "ai-memory-core",
  "anyhow",
  "argon2",
@@ -272,6 +275,7 @@ version = "2.2.0"
 name = "ai-memory-web"
 version = "2.2.0"
 dependencies = [
+ "ai-memory-auth",
  "ai-memory-core",
  "ai-memory-store",
  "ai-memory-wiki",

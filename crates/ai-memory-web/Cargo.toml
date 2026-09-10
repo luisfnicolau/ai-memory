@@ -9,6 +9,7 @@ authors.workspace = true
 description = "Read-only HTTP browser for the ai-memory wiki (project list, tree navigation, markdown rendering, FTS5 search)."
 
 [dependencies]
+ai-memory-auth.workspace = true
 ai-memory-core.workspace = true
 ai-memory-store.workspace = true
 ai-memory-wiki.workspace = true

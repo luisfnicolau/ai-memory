@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 
 mod api_credentials;
+mod auth;
 mod auto_improve;
 pub mod decay;
 mod error;
@@ -71,8 +72,9 @@ pub use reader::{
 pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 pub use scope::{
     ResolvedScope, ScopeName, ScopeResolutionError, ScopeResolver, WORKSPACE_PROJECT_PAIR_REQUIRED,
-    create_explicit_scope, create_global_scope, lookup_existing_scope, lookup_existing_workspace,
-    lookup_global_scope, resolve_many_existing_scopes,
+    authorize_scope, create_explicit_scope_guarded, create_global_scope,
+    lookup_existing_scope_guarded, lookup_existing_workspace, lookup_global_scope,
+    resolve_many_existing_scopes_guarded,
 };
 pub use session_consolidation::{SESSION_CONSOLIDATION_MAX_ATTEMPTS, SessionConsolidationJob};
 pub use users::{

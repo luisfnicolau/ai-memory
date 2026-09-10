@@ -11,6 +11,7 @@ description = "SQLite storage layer with single-writer actor and FTS5/sqlite-vec
 # links the whole dep graph and gets scanned by macOS on first run.
 
 [dependencies]
+ai-memory-auth.workspace = true
 ai-memory-core.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true

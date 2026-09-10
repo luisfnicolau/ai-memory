@@ -65,8 +65,8 @@ use ai_memory_store::{
     ApproveAutoImproveProposalResult, AuditLogFilter, AutoImproveProposalOperation,
     AutoImproveProposalStatus, DecayParams, NewAutoImproveProposal, PagesMode, ReaderPool,
     RejectAutoImproveProposal, ScopeResolutionError, SkippedProposal, StageAutoImproveRun,
-    StoreError, WriterHandle, create_explicit_scope, f32_vec_to_bytes, lookup_existing_scope,
-    lookup_existing_workspace,
+    StoreError, WriterHandle, create_explicit_scope_guarded, f32_vec_to_bytes,
+    lookup_existing_scope_guarded, lookup_existing_workspace,
 };
 use ai_memory_wiki::{
     AdmissionContext, AdmissionOp, Markdown, SessionPageFile, Wiki, WikiError, WritePageRequest,
@@ -1653,6 +1653,28 @@ fn trimmed_opt(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|s| !s.is_empty())
 }
 
+/// Who the admin surface resolves scopes as.
+///
+/// `/admin/*` is the operator's door: the router attaches
+/// [`require_root_for_multiuser_admin`] as a `route_layer`, so on a multi-user
+/// install only `AuthLevel::Root` reaches any handler below (a DB user gets
+/// 403 — covered by the `admin_*_token` tests). Root authenticates from
+/// configuration, not from a `users` row, so the auth middleware stamps no
+/// `UserId` on the request and there is no per-repository grant to check.
+///
+/// This is therefore an assertion, not a forgotten argument: the operator is
+/// authorized by the middleware above, at a coarser granularity than grants.
+/// If a handler here ever needs to run as a named user, it must take the
+/// `UserId` extension and pass it instead of this.
+const OPERATOR: Option<ai_memory_core::UserId> = None;
+
+/// The role the operator resolves scopes with.
+///
+/// Unused while [`OPERATOR`] is `None` — `authorize_scope` returns early on an
+/// absent user — but stating it keeps the call sites readable and makes the
+/// switch to a named user a one-line change.
+const OPERATOR_ROLE: ai_memory_auth::GrantRole = ai_memory_auth::GrantRole::Admin;
+
 /// Resolve workspace + project IDs, creating them if absent. Returns
 /// either the IDs or a ready-to-return error response.
 async fn create_ws_proj(
@@ -1660,10 +1682,17 @@ async fn create_ws_proj(
     workspace: &str,
     project: &str,
 ) -> Result<(WorkspaceId, ProjectId), (StatusCode, Json<serde_json::Value>)> {
-    create_explicit_scope(&state.writer, workspace, project)
-        .await
-        .map(ai_memory_store::ResolvedScope::as_tuple)
-        .map_err(scope_err)
+    create_explicit_scope_guarded(
+        &state.reader,
+        &state.writer,
+        workspace,
+        project,
+        OPERATOR,
+        OPERATOR_ROLE,
+    )
+    .await
+    .map(ai_memory_store::ResolvedScope::as_tuple)
+    .map_err(scope_err)
 }
 
 /// Look up workspace + project by name **without** auto-creating them.
@@ -1675,7 +1704,7 @@ async fn lookup_ws_proj_no_create(
     workspace: &str,
     project: &str,
 ) -> Result<(WorkspaceId, ProjectId), (StatusCode, Json<serde_json::Value>)> {
-    lookup_existing_scope(&state.reader, workspace, project)
+    lookup_existing_scope_guarded(&state.reader, workspace, project, OPERATOR, OPERATOR_ROLE)
         .await
         .map(ai_memory_store::ResolvedScope::as_tuple)
         .map_err(scope_err)
@@ -5209,7 +5238,9 @@ async fn resolve_move_session_target(
             .await
             .map(MoveTarget::Existing);
     }
-    match lookup_existing_scope(&state.reader, workspace, project).await {
+    match lookup_existing_scope_guarded(&state.reader, workspace, project, OPERATOR, OPERATOR_ROLE)
+        .await
+    {
         Ok(scope) => Ok(MoveTarget::Existing(scope.as_tuple())),
         Err(e) if create && e.is_not_found() => Ok(MoveTarget::WouldCreate),
         Err(e) => Err(scope_err(e)),

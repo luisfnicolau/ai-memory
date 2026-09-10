@@ -12,6 +12,7 @@ description = "Hook payload schemas, sanitisation, and HTTP ingress for agent li
 # first run.
 
 [dependencies]
+ai-memory-auth.workspace = true
 ai-memory-core.workspace = true
 ai-memory-store.workspace = true
 ai-memory-wiki.workspace = true

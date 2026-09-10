@@ -15,8 +15,8 @@ use ai_memory_core::{
 };
 use ai_memory_store::{
     FinishWorkstreamRun, PrepareWorkstreamRun, ReaderPool, RenameWorkstream, ScopeResolutionError,
-    StoreError, WorkstreamSelection, WorkstreamSelector, WriterHandle, create_explicit_scope,
-    lookup_existing_scope,
+    StoreError, WorkstreamSelection, WorkstreamSelector, WriterHandle,
+    create_explicit_scope_guarded, lookup_existing_scope_guarded,
 };
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
@@ -105,9 +105,20 @@ fn authorize(
     })
 }
 
+/// The authenticated database user, when there is one.
+///
+/// `None` is both "no auth configured" and "the operator's root token": the
+/// auth middleware stamps a `UserId` only on the DB-user rung. Both mean no
+/// per-repository check applies, which is what leaves single-user installs
+/// behaving exactly as they did before the guard existed.
+fn actor_user(actor: Option<Extension<ai_memory_core::UserId>>) -> Option<ai_memory_core::UserId> {
+    actor.map(|Extension(id)| id)
+}
+
 async fn prepare_run(
     State(state): State<WorkstreamState>,
     level: Option<Extension<AuthLevel>>,
+    actor: Option<Extension<ai_memory_core::UserId>>,
     Json(request): Json<PrepareManagedRunRequest>,
 ) -> Response {
     if let Err(response) = authorize(level, Capability::NormalWrite) {
@@ -190,10 +201,13 @@ async fn prepare_run(
             return error(StatusCode::BAD_REQUEST, format!("{label} is too long"));
         }
     }
-    let scope = match create_explicit_scope(
+    let scope = match create_explicit_scope_guarded(
+        &state.reader,
         &state.writer,
         request.workspace.trim(),
         request.project.trim(),
+        actor_user(actor),
+        ai_memory_auth::GrantRole::Writer,
     )
     .await
     {
@@ -387,6 +401,7 @@ const fn default_event_limit() -> usize {
 async fn list_recent_workstreams(
     State(state): State<WorkstreamState>,
     level: Option<Extension<AuthLevel>>,
+    actor: Option<Extension<ai_memory_core::UserId>>,
     Json(request): Json<ListManagedWorkstreamsRequest>,
 ) -> Response {
     if let Err(response) = authorize(level, Capability::NormalRead) {
@@ -408,10 +423,12 @@ async fn list_recent_workstreams(
             return error(StatusCode::BAD_REQUEST, format!("{label} is too long"));
         }
     }
-    let scope = match lookup_existing_scope(
+    let scope = match lookup_existing_scope_guarded(
         &state.reader,
         request.workspace.trim(),
         request.project.trim(),
+        actor_user(actor),
+        ai_memory_auth::GrantRole::Reader,
     )
     .await
     {
@@ -473,6 +490,7 @@ async fn list_recent_workstreams(
 async fn rename_workstream(
     State(state): State<WorkstreamState>,
     level: Option<Extension<AuthLevel>>,
+    actor: Option<Extension<ai_memory_core::UserId>>,
     Json(request): Json<RenameManagedWorkstreamRequest>,
 ) -> Response {
     if let Err(response) = authorize(level, Capability::NormalWrite) {
@@ -520,10 +538,12 @@ async fn rename_workstream(
             );
         }
     };
-    let scope = match lookup_existing_scope(
+    let scope = match lookup_existing_scope_guarded(
         &state.reader,
         request.workspace.trim(),
         request.project.trim(),
+        actor_user(actor),
+        ai_memory_auth::GrantRole::Writer,
     )
     .await
     {
@@ -1003,6 +1023,7 @@ mod tests {
         let ok = rename_workstream(
             State(state.clone()),
             None,
+            None,
             Json(request(Some("typo-nmae"), "refactor-db")),
         )
         .await;
@@ -1020,27 +1041,30 @@ mod tests {
         // A name that exists, but in another worktree, must not be reachable.
         let mut wrong_worktree = request(Some("refactor-db"), "stolen");
         wrong_worktree.worktree_fingerprint = "other-worktree".into();
-        let response = rename_workstream(State(state.clone()), None, Json(wrong_worktree)).await;
+        let response =
+            rename_workstream(State(state.clone()), None, None, Json(wrong_worktree)).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         // Unknown scopes stay 404 rather than being created by the write.
         let mut missing = request(Some("refactor-db"), "stolen");
         missing.workspace = "missing".into();
-        let response = rename_workstream(State(state.clone()), None, Json(missing)).await;
+        let response = rename_workstream(State(state.clone()), None, None, Json(missing)).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         // Neither selector, and both selectors, are caller errors the server
         // rejects on its own rather than trusting clap to have done it.
-        let neither = rename_workstream(State(state.clone()), None, Json(request(None, "x"))).await;
+        let neither =
+            rename_workstream(State(state.clone()), None, None, Json(request(None, "x"))).await;
         assert_eq!(neither.status(), StatusCode::BAD_REQUEST);
         let mut both = request(Some("refactor-db"), "x");
         both.workstream_id = Some(prepared.workstream_id);
-        let both = rename_workstream(State(state.clone()), None, Json(both)).await;
+        let both = rename_workstream(State(state.clone()), None, None, Json(both)).await;
         assert_eq!(both.status(), StatusCode::BAD_REQUEST);
 
         // An invalid destination name is a 400, not a 500.
         let invalid = rename_workstream(
             State(state.clone()),
+            None,
             None,
             Json(request(Some("refactor-db"), "a/b")),
         )
@@ -1058,6 +1082,7 @@ mod tests {
             .unwrap();
         let conflict = rename_workstream(
             State(state),
+            None,
             None,
             Json(request(Some("refactor-db"), "taken")),
         )
@@ -1096,6 +1121,7 @@ mod tests {
         let response = list_recent_workstreams(
             State(state.clone()),
             None,
+            None,
             Json(ListManagedWorkstreamsRequest {
                 workspace: "default".into(),
                 project: "managed".into(),
@@ -1121,6 +1147,7 @@ mod tests {
         let other_checkout = list_recent_workstreams(
             State(state.clone()),
             None,
+            None,
             Json(ListManagedWorkstreamsRequest {
                 workspace: "default".into(),
                 project: "managed".into(),
@@ -1140,6 +1167,7 @@ mod tests {
 
         let missing = list_recent_workstreams(
             State(state),
+            None,
             None,
             Json(ListManagedWorkstreamsRequest {
                 workspace: "missing".into(),
@@ -1186,6 +1214,7 @@ mod tests {
         let response = prepare_run(
             State(state),
             None,
+            None,
             Json(PrepareManagedRunRequest {
                 workspace: "default".into(),
                 project: "managed".into(),
@@ -1220,6 +1249,7 @@ mod tests {
 
         let explicit = prepare_run(
             State(state.clone()),
+            None,
             None,
             Json(PrepareManagedRunRequest {
                 workspace: "default".into(),
@@ -1258,6 +1288,7 @@ mod tests {
         let automatic = prepare_run(
             State(state),
             None,
+            None,
             Json(PrepareManagedRunRequest {
                 workspace: "default".into(),
                 project: "managed".into(),
@@ -1284,6 +1315,7 @@ mod tests {
 
         let explicit = prepare_run(
             State(state.clone()),
+            None,
             None,
             Json(PrepareManagedRunRequest {
                 workspace: "default".into(),
@@ -1321,6 +1353,7 @@ mod tests {
         let automatic = prepare_run(
             State(state),
             None,
+            None,
             Json(PrepareManagedRunRequest {
                 workspace: "default".into(),
                 project: "managed".into(),
@@ -1347,6 +1380,7 @@ mod tests {
 
         let explicit = prepare_run(
             State(state.clone()),
+            None,
             None,
             Json(PrepareManagedRunRequest {
                 workspace: "default".into(),
@@ -1384,6 +1418,7 @@ mod tests {
         let automatic = prepare_run(
             State(state),
             None,
+            None,
             Json(PrepareManagedRunRequest {
                 workspace: "default".into(),
                 project: "managed".into(),
@@ -1410,6 +1445,7 @@ mod tests {
 
         let explicit = prepare_run(
             State(state.clone()),
+            None,
             None,
             Json(PrepareManagedRunRequest {
                 workspace: "default".into(),
@@ -1447,6 +1483,7 @@ mod tests {
         let automatic = prepare_run(
             State(state),
             None,
+            None,
             Json(PrepareManagedRunRequest {
                 workspace: "default".into(),
                 project: "managed".into(),
@@ -1476,6 +1513,7 @@ mod tests {
 
         let explicit = prepare_run(
             State(state.clone()),
+            None,
             None,
             Json(PrepareManagedRunRequest {
                 workspace: "default".into(),
@@ -1512,6 +1550,7 @@ mod tests {
 
         let automatic = prepare_run(
             State(state),
+            None,
             None,
             Json(PrepareManagedRunRequest {
                 workspace: "default".into(),
