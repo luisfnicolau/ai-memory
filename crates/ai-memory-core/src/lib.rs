@@ -15,6 +15,8 @@ pub mod ids;
 pub mod observation;
 pub mod okf;
 pub mod page;
+pub mod repository_identity;
+pub use repository_identity::{MARKER_FILENAME, MARKER_FILENAMES};
 pub mod routing_skills;
 pub mod scaffolding;
 pub use scaffolding::looks_like_scaffolding;
