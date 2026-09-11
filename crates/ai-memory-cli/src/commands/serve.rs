@@ -3348,7 +3348,7 @@ mod tests {
         let resolved =
             ai_memory_store::ScopeResolver::new(&store.reader, workspace_id, scratch, None)
                 .with_active_project(&active_project)
-                .resolve_read_args(None, None, &actor)
+                .resolve_existing_args(None, None, &actor, ai_memory_store::GrantRole::Reader)
                 .await
                 .unwrap();
         assert_eq!(

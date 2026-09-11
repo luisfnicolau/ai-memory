@@ -363,6 +363,17 @@ pub enum PostOutcome {
     /// so the drain can skip past them instead of stopping at the first one
     /// (#493).
     Unreachable,
+    /// `403` — the server understood the request and will never accept it.
+    /// Today that means the author holds no `writer` grant on the repository
+    /// the event belongs to.
+    ///
+    /// Terminal, and that is the whole point of separating it from
+    /// [`Self::Failed`]. A refusal that counts as a failure gets re-sent until
+    /// it exhausts `MAX_ATTEMPTS`, and every one of those attempts is
+    /// guaranteed to be refused for the same reason. Retrying something that
+    /// cannot succeed is how a parse failure once cost this project 10.7M
+    /// tokens in a day. The entry is dropped on the spot.
+    Refused,
     /// `401` — the server rejected the bearer. Distinguished from
     /// [`Self::Failed`] because it says something about the *credential*
     /// rather than the entry: a spooled event carries the token frozen at
@@ -398,6 +409,7 @@ pub async fn post_hook(
             PostOutcome::Saturated
         }
         Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => PostOutcome::Unauthorized,
+        Ok(resp) if resp.status() == reqwest::StatusCode::FORBIDDEN => PostOutcome::Refused,
         Ok(_) => PostOutcome::Failed,
         Err(_) => PostOutcome::Unreachable,
     }
@@ -690,6 +702,23 @@ mod tests {
         let url = serve_once("202 Accepted", "queued").await;
         let outcome = post_hook(&build_client(), &url, "{}", None, Duration::from_secs(1)).await;
         assert_eq!(outcome, PostOutcome::Delivered);
+    }
+
+    #[tokio::test]
+    async fn post_hook_refused_on_403_is_terminal_not_a_failure() {
+        // 403 means the server will never accept this event. Classifying it as
+        // `Failed` would re-send it until it burnt `MAX_ATTEMPTS`, and every
+        // attempt would be refused identically — the shape of retry loop that
+        // once cost this project 10.7M tokens in a day. It must be its own
+        // outcome so the drain can drop it on the spot.
+        let url = serve_once("403 Forbidden", "capture not authorized").await;
+        let outcome = post_hook(&build_client(), &url, "{}", None, Duration::from_secs(1)).await;
+        assert_eq!(outcome, PostOutcome::Refused);
+        assert_ne!(
+            outcome,
+            PostOutcome::Failed,
+            "a refusal must never be charged a retry attempt"
+        );
     }
 
     #[tokio::test]

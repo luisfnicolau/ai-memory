@@ -610,25 +610,36 @@ impl<'a> ScopeResolver<'a> {
         self.guard(scope, required, Some(project)).await
     }
 
-    /// Resolve MCP-style read arguments: explicit pair if both names are
-    /// provided, reject partial pair, otherwise use project-only lookup or the
-    /// current-project/default fallback chain.
-    pub async fn resolve_read_args(
+    /// Resolve MCP-style arguments naming an EXISTING scope: explicit pair if
+    /// both names are provided, reject partial pair, otherwise use project-only
+    /// lookup or the current-project/default fallback chain. Never creates —
+    /// that is [`Self::resolve_write_args`].
+    ///
+    /// `required` is the level the caller's operation needs, because this
+    /// argument shape is not the same thing as a read. Tools that delete a
+    /// page, record feedback, sweep, lint or accept a handoff all take these
+    /// same arguments and all mutate; naming the shape "read args" and pinning
+    /// it to `Reader` is what let a reader-only grant delete pages. The shape
+    /// says which scope; `required` says what you may do to it.
+    pub async fn resolve_existing_args(
         &self,
         explicit_workspace: Option<&str>,
         explicit_project: Option<&str>,
         actor: &ActorKey,
+        required: ai_memory_auth::GrantRole,
     ) -> Result<ResolvedScope, ScopeResolutionError> {
         match (
             trimmed_opt(explicit_workspace),
             trimmed_opt(explicit_project),
         ) {
             (Some(workspace), Some(project)) => {
-                self.lookup_existing(workspace, project, ai_memory_auth::GrantRole::Reader)
-                    .await
+                self.lookup_existing(workspace, project, required).await
             }
             (Some(_), None) => Err(ScopeResolutionError::WorkspaceProjectPairRequired),
-            (None, project) => self.resolve_current_or_project(project, actor).await,
+            (None, project) => {
+                self.resolve_current_or_project(project, actor, required)
+                    .await
+            }
         }
     }
 
@@ -641,6 +652,7 @@ impl<'a> ScopeResolver<'a> {
         &self,
         explicit_project: Option<&str>,
         actor: &ActorKey,
+        required: ai_memory_auth::GrantRole,
     ) -> Result<ResolvedScope, ScopeResolutionError> {
         let scope = self
             .resolve_current_or_project_unguarded(explicit_project, actor)
@@ -648,12 +660,8 @@ impl<'a> ScopeResolver<'a> {
         // Guarded here rather than at each `return` inside the chain below:
         // that chain has three exits and grows a fourth every time the
         // fallback rules change. One exit is one place to be right.
-        self.guard(
-            scope,
-            ai_memory_auth::GrantRole::Reader,
-            trimmed_opt(explicit_project),
-        )
-        .await
+        self.guard(scope, required, trimmed_opt(explicit_project))
+            .await
     }
 
     async fn resolve_current_or_project_unguarded(
@@ -890,6 +898,49 @@ mod tests {
         let alice = user_named(store, "alice", 1).await;
         let bob = user_named(store, "bob", 2).await;
         (ws, project, alice, bob)
+    }
+
+    /// The argument shape and the level are independent, and must stay so.
+    ///
+    /// `resolve_existing_args` takes the arguments read tools take. Pinning it
+    /// to `Reader` — which is what it used to do — is what let a reader-only
+    /// grant delete pages, because the mutating tools take those same
+    /// arguments. This asserts the level is the caller's to state, for both
+    /// the explicit-pair branch and the current-project fallback.
+    #[tokio::test]
+    async fn the_argument_shape_does_not_decide_the_level() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, project, alice, _) = guard_fixture(&store).await;
+        grant_row(store.db_path(), alice, project, "reader", None);
+        let resolver = ScopeResolver::new(&store.reader, ws, project, Some(alice));
+        let actor = ActorKey::default();
+
+        for (label, workspace, name) in [
+            ("explicit pair", Some("default"), Some("client-work")),
+            ("current-project fallback", None, None),
+        ] {
+            resolver
+                .resolve_existing_args(workspace, name, &actor, GrantRole::Reader)
+                .await
+                .unwrap_or_else(|e| panic!("{label}: a reader may read: {e}"));
+
+            let err = resolver
+                .resolve_existing_args(workspace, name, &actor, GrantRole::Writer)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ScopeResolutionError::NotAuthorized {
+                        held: Some(GrantRole::Reader),
+                        required: GrantRole::Writer,
+                        ..
+                    }
+                ),
+                "{label}: a reader must not reach a write: {err:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1150,7 +1201,12 @@ mod tests {
             .unwrap();
         let resolver = ScopeResolver::new(&store.reader, ws, project, None);
         let err = resolver
-            .resolve_read_args(Some("default"), None, &ActorKey::default())
+            .resolve_existing_args(
+                Some("default"),
+                None,
+                &ActorKey::default(),
+                GrantRole::Reader,
+            )
             .await
             .unwrap_err();
         assert_eq!(err, ScopeResolutionError::WorkspaceProjectPairRequired);
@@ -1187,13 +1243,13 @@ mod tests {
         let resolver = ScopeResolver::new(&store.reader, default_ws, default_scratch, None)
             .with_active_project(&active_project);
         let scope = resolver
-            .resolve_read_args(None, Some("scratch"), &actor)
+            .resolve_existing_args(None, Some("scratch"), &actor, GrantRole::Reader)
             .await
             .unwrap();
         assert_eq!(scope.as_tuple(), (active_ws, active_scratch));
 
         let err = resolver
-            .resolve_read_args(None, Some("missing"), &actor)
+            .resolve_existing_args(None, Some("missing"), &actor, GrantRole::Reader)
             .await
             .unwrap_err();
         assert_eq!(
@@ -1522,7 +1578,7 @@ mod tests {
             let resolver = ScopeResolver::new(&store.reader, default_ws, default_scratch, None)
                 .with_active_project(&active_project);
             let result = resolver
-                .resolve_read_args(case.workspace, case.project, &actor)
+                .resolve_existing_args(case.workspace, case.project, &actor, GrantRole::Reader)
                 .await;
             match (&result, &case.expected) {
                 (Ok(scope), Expected::Resolved(ws, proj)) => {
@@ -1775,7 +1831,7 @@ mod tests {
             .with_active_project(&active_project);
 
         let scope = resolver
-            .resolve_read_args(None, None, &stranger)
+            .resolve_existing_args(None, None, &stranger, GrantRole::Reader)
             .await
             .unwrap();
         assert_eq!(scope.as_tuple(), (default_ws, default_proj));
@@ -1807,7 +1863,7 @@ mod tests {
         ] {
             let read = ScopeResolver::new(&store.reader, default_ws, default_proj, None)
                 .with_active_project(&active_project)
-                .resolve_read_args(None, None, &actor)
+                .resolve_existing_args(None, None, &actor, GrantRole::Reader)
                 .await
                 .unwrap();
             assert_eq!(
@@ -1834,7 +1890,12 @@ mod tests {
         // `real-work` exists only in `team`.
         let named = ScopeResolver::new(&store.reader, default_ws, default_proj, None)
             .with_active_project(&active_project)
-            .resolve_read_args(None, Some("real-work"), &ActorKey::default())
+            .resolve_existing_args(
+                None,
+                Some("real-work"),
+                &ActorKey::default(),
+                GrantRole::Reader,
+            )
             .await
             .unwrap();
         assert_eq!(named.as_tuple(), (team_ws, team_proj));

@@ -1529,12 +1529,20 @@ impl AiMemoryServer {
         viewer: Option<ai_memory_core::UserId>,
     ) -> Result<(WorkspaceId, ProjectId), McpError> {
         self.scope_resolver_as(viewer)
-            .resolve_current_or_project(explicit_project, actor)
+            .resolve_current_or_project(explicit_project, actor, ai_memory_auth::GrantRole::Reader)
             .await
             .map(ai_memory_store::ResolvedScope::as_tuple)
             .map_err(Self::scope_error)
     }
 
+    /// Resolve the scope for a tool that only READS it.
+    ///
+    /// Paired with [`Self::effective_ids_for_mutation_args_with_actor`], which
+    /// takes identical arguments and differs only in the level it demands. Two
+    /// methods named for intent rather than one with a role argument: a role
+    /// argument is a thing a call site can forget, or copy from the wrong
+    /// neighbour, and the neighbours here are tools that delete pages. The
+    /// name at the call site should say which one this is.
     async fn effective_ids_for_read_args_with_actor(
         &self,
         explicit_workspace: Option<&str>,
@@ -1542,8 +1550,54 @@ impl AiMemoryServer {
         actor: &ai_memory_core::ActorKey,
         viewer: Option<ai_memory_core::UserId>,
     ) -> Result<(WorkspaceId, ProjectId), McpError> {
+        self.resolve_existing_args_as(
+            explicit_workspace,
+            explicit_project,
+            actor,
+            viewer,
+            ai_memory_auth::GrantRole::Reader,
+        )
+        .await
+    }
+
+    /// Resolve the scope for a tool that CHANGES it, without creating it.
+    ///
+    /// Same argument shape as a read — an explicit workspace/project pair, or
+    /// the current-project fallback chain — and that is exactly the trap this
+    /// exists to close. `memory_delete_page`, `memory_feedback`,
+    /// `memory_forget_sweep`, `memory_lint`, `memory_auto_improve` and the
+    /// handoff accept/cancel pair all take read-shaped arguments and all
+    /// mutate; every one of them authorized as a reader until this split.
+    ///
+    /// Distinct from [`Self::write_target_ids_with_actor`], which may CREATE
+    /// the target. These tools act on something that must already be there.
+    async fn effective_ids_for_mutation_args_with_actor(
+        &self,
+        explicit_workspace: Option<&str>,
+        explicit_project: Option<&str>,
+        actor: &ai_memory_core::ActorKey,
+        viewer: Option<ai_memory_core::UserId>,
+    ) -> Result<(WorkspaceId, ProjectId), McpError> {
+        self.resolve_existing_args_as(
+            explicit_workspace,
+            explicit_project,
+            actor,
+            viewer,
+            ai_memory_auth::GrantRole::Writer,
+        )
+        .await
+    }
+
+    async fn resolve_existing_args_as(
+        &self,
+        explicit_workspace: Option<&str>,
+        explicit_project: Option<&str>,
+        actor: &ai_memory_core::ActorKey,
+        viewer: Option<ai_memory_core::UserId>,
+        required: ai_memory_auth::GrantRole,
+    ) -> Result<(WorkspaceId, ProjectId), McpError> {
         self.scope_resolver_as(viewer)
-            .resolve_read_args(explicit_workspace, explicit_project, actor)
+            .resolve_existing_args(explicit_workspace, explicit_project, actor, required)
             .await
             .map(ai_memory_store::ResolvedScope::as_tuple)
             .map_err(Self::scope_error)
@@ -2344,7 +2398,7 @@ impl AiMemoryServer {
             .map_err(|e| McpError::invalid_params(format!("invalid path: {e}"), None))?;
         let kind = args.signal;
         let (ws, proj) = self
-            .effective_ids_for_read_args_with_actor(
+            .effective_ids_for_mutation_args_with_actor(
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
@@ -2587,7 +2641,7 @@ impl AiMemoryServer {
         self.require_admin_capability(&parts).await?;
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let (ws, proj) = self
-            .effective_ids_for_read_args_with_actor(
+            .effective_ids_for_mutation_args_with_actor(
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
@@ -2628,7 +2682,7 @@ impl AiMemoryServer {
             ));
         };
         let (ws, proj) = self
-            .effective_ids_for_read_args_with_actor(
+            .effective_ids_for_mutation_args_with_actor(
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
@@ -2768,7 +2822,7 @@ impl AiMemoryServer {
             .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
         let author_id = parts.extensions.get::<ai_memory_core::UserId>().copied();
         let (ws, proj) = self
-            .effective_ids_for_read_args_with_actor(
+            .effective_ids_for_mutation_args_with_actor(
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
@@ -3524,7 +3578,7 @@ impl AiMemoryServer {
         let path = PagePath::new(args.path.clone())
             .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
         let (ws, proj) = self
-            .effective_ids_for_read_args_with_actor(
+            .effective_ids_for_mutation_args_with_actor(
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
@@ -3764,7 +3818,7 @@ impl AiMemoryServer {
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let (ws, proj) = self
-            .effective_ids_for_read_args_with_actor(
+            .effective_ids_for_mutation_args_with_actor(
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
@@ -3872,7 +3926,7 @@ impl AiMemoryServer {
         let handoff_id = HandoffId::from_str(&args.handoff_id)
             .map_err(|e| McpError::internal_error(format!("invalid handoff_id: {e}"), None))?;
         let (ws, proj) = self
-            .effective_ids_for_read_args_with_actor(
+            .effective_ids_for_mutation_args_with_actor(
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
@@ -9645,6 +9699,31 @@ mod tests {
     }
 
     /// Insert a grant row directly — the store has no grant write path yet.
+    /// Grant `role` on `repository`, by writing the row directly.
+    fn grant_role(
+        db: &std::path::Path,
+        user: ai_memory_core::UserId,
+        repository: ProjectId,
+        role: &str,
+    ) {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.execute(
+            "INSERT INTO memory_grant \
+             (id, user_id, repository_id, repository_label, role, granted_by_user_id, \
+              granted_at) \
+             VALUES (?1, ?2, ?3, 'fixture', ?4, ?2, 1)",
+            rusqlite::params![
+                ai_memory_core::ids::MemoryGrantId::new()
+                    .as_bytes()
+                    .to_vec(),
+                user.as_bytes().to_vec(),
+                repository.as_bytes().to_vec(),
+                role,
+            ],
+        )
+        .unwrap();
+    }
+
     fn grant_writer(db: &std::path::Path, user: ai_memory_core::UserId, repository: ProjectId) {
         let conn = rusqlite::Connection::open(db).unwrap();
         conn.execute(
@@ -9661,6 +9740,234 @@ mod tests {
             ],
         )
         .unwrap();
+    }
+
+    /// A reader-only grant must not be able to change anything.
+    ///
+    /// This is the bug this branch exists for. Every tool below takes the same
+    /// read-shaped arguments as `memory_read_page`, and every one of them
+    /// mutates; they all resolved through the read path, so `reader` was
+    /// enough to delete a page. The table is the audit: if a tool moves
+    /// between the two lists, that is a deliberate policy change and this test
+    /// is where it has to be argued.
+    #[tokio::test]
+    async fn a_reader_may_read_everything_and_change_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "client-work", None)
+            .await
+            .unwrap();
+        let reader_user = store
+            .writer
+            .create_human_user(
+                NewUser {
+                    username: "ray".into(),
+                    name: None,
+                    email: None,
+                },
+                ai_memory_core::UserRole::User,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        grant_role(store.db_path(), reader_user, proj, "reader");
+
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_wiki(wiki);
+
+        // Seed a page as the operator (no viewer stamped = authorization off
+        // for this call), so there is something to try to delete.
+        server
+            .memory_write_page(
+                Parameters(WritePageArgs {
+                    path: "notes/keep.md".into(),
+                    body: "# Keep\n\nSomething to try to delete.".into(),
+                    title: None,
+                    tier: Some("semantic".into()),
+                    tags: vec![],
+                    pinned: false,
+                    project: None,
+                    workspace: None,
+                    scope: None,
+                    expires_at: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect("operator seeds the page");
+
+        let parts_as_reader = || {
+            let mut parts = test_parts_default();
+            parts.extensions.insert(AuthLevel::User);
+            parts.extensions.insert(reader_user);
+            parts
+                .extensions
+                .insert(ai_memory_core::AuthorizedViewer(reader_user));
+            parts
+        };
+
+        // Reads: allowed, and must stay allowed. Raising these would be its
+        // own bug — a reader who cannot read holds nothing at all.
+        server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    path: Some("notes/keep.md".into()),
+                    query: None,
+                    project: None,
+                    workspace: None,
+                }),
+                OptionalParts(parts_as_reader()),
+            )
+            .await
+            .expect("a reader may read");
+        server
+            .memory_status(
+                Parameters(StatusArgs {
+                    project: None,
+                    workspace: None,
+                }),
+                OptionalParts(parts_as_reader()),
+            )
+            .await
+            .expect("a reader may see status");
+
+        // Mutations: refused, and the refusal says what is missing.
+        let err = server
+            .memory_delete_page(
+                Parameters(DeletePageArgs {
+                    path: "notes/keep.md".into(),
+                    project: None,
+                    workspace: None,
+                }),
+                OptionalParts(parts_as_reader()),
+            )
+            .await
+            .expect_err("a reader must not delete a page");
+        let message = err.message.to_string();
+        assert!(
+            message.contains("you have reader and this needs writer"),
+            "the refusal must name both levels: {message}"
+        );
+
+        let err = server
+            .memory_feedback(
+                Parameters(FeedbackArgs {
+                    path: "notes/keep.md".into(),
+                    signal: ai_memory_core::FeedbackKind::Stale,
+                    reason: None,
+                    project: None,
+                    workspace: None,
+                }),
+                OptionalParts(parts_as_reader()),
+            )
+            .await
+            .expect_err("a reader must not record feedback");
+        assert!(
+            err.message.to_string().contains("needs writer"),
+            "{}",
+            err.message
+        );
+
+        // The page is still there: a refused delete must not half-happen.
+        server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    path: Some("notes/keep.md".into()),
+                    query: None,
+                    project: None,
+                    workspace: None,
+                }),
+                OptionalParts(parts_as_reader()),
+            )
+            .await
+            .expect("the refused delete left the page alone");
+    }
+
+    /// A writer may do the things a reader was just refused.
+    ///
+    /// The other half of the pair: without it, the fix above would also pass
+    /// if the guard simply refused everyone.
+    #[tokio::test]
+    async fn a_writer_may_change_what_a_reader_may_not() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "client-work", None)
+            .await
+            .unwrap();
+        let scribe = store
+            .writer
+            .create_human_user(
+                NewUser {
+                    username: "wren".into(),
+                    name: None,
+                    email: None,
+                },
+                ai_memory_core::UserRole::User,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        grant_role(store.db_path(), scribe, proj, "writer");
+
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_wiki(wiki);
+        let parts = || {
+            let mut parts = test_parts_default();
+            parts.extensions.insert(AuthLevel::User);
+            parts.extensions.insert(scribe);
+            parts
+                .extensions
+                .insert(ai_memory_core::AuthorizedViewer(scribe));
+            parts
+        };
+
+        server
+            .memory_write_page(
+                Parameters(WritePageArgs {
+                    path: "notes/mine.md".into(),
+                    body: "# Mine\n\nWritten by a writer.".into(),
+                    title: None,
+                    tier: Some("semantic".into()),
+                    tags: vec![],
+                    pinned: false,
+                    project: None,
+                    workspace: None,
+                    scope: None,
+                    expires_at: None,
+                }),
+                OptionalParts(parts()),
+            )
+            .await
+            .expect("a writer may write");
+        server
+            .memory_delete_page(
+                Parameters(DeletePageArgs {
+                    path: "notes/mine.md".into(),
+                    project: None,
+                    workspace: None,
+                }),
+                OptionalParts(parts()),
+            )
+            .await
+            .expect("a writer may delete");
     }
 
     /// The finding that started #708, as a test.

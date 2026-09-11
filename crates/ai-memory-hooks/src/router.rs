@@ -413,6 +413,24 @@ fn ingest_rate_key(env: &HookEnvelope, actor_user: Option<&str>) -> String {
     )
 }
 
+/// A capture whose author holds no `writer` grant on the repository it
+/// resolved to.
+///
+/// A distinct type rather than a string, because the two call paths have to
+/// tell it apart from a genuine failure and do opposite things with it: this
+/// one is *final*. The event can never succeed, so the client must stop
+/// holding it, exactly as it would for a capture-policy drop.
+#[derive(Debug)]
+pub struct CaptureNotAuthorized;
+
+impl std::fmt::Display for CaptureNotAuthorized {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("capture not authorized for this repository")
+    }
+}
+
+impl std::error::Error for CaptureNotAuthorized {}
+
 /// Shared state passed to the hook handler.
 #[derive(Clone)]
 pub struct HookState {
@@ -596,6 +614,7 @@ async fn handle_hook(
     Query(query): Query<HookQuery>,
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
     level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    viewer_ext: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     headers: HeaderMap,
     Json(mut body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
@@ -622,6 +641,11 @@ async fn handle_hook(
     // extensions — so `process()` can key the `ActiveProject` map by the
     // authenticated identity when `[auto_scope] mode = per_actor` is on.
     let actor = actor_identity(actor_ext);
+    // Captured here for the same reason as the actor: the request extensions
+    // are gone by the time the spawned task runs. `AuthorizedViewer` is the
+    // gated marker, so this is `None` whenever per-repository authorization is
+    // off, and captures behave exactly as they always have.
+    let viewer = viewer_ext.map(|axum::Extension(v)| v.user());
     // Same reason: the skip-list header is read here, while the request
     // extensions still exist, and travels with the event into `process()`.
     let skip_webhooks = admission_skips(level_ext, &headers);
@@ -656,6 +680,7 @@ async fn handle_hook(
             actor,
             level_ext.map_or(ai_memory_core::AuthLevel::Anonymous, |v| v.0),
             skip_webhooks,
+            viewer,
         )
         .await;
         // Stamped only when `process_envelope` actually cleared the writer.
@@ -769,6 +794,7 @@ async fn handle_hook_batch(
     State(state): State<Arc<HookState>>,
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
     level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    viewer_ext: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     headers: HeaderMap,
     Json(items): Json<Vec<HookBatchItem>>,
 ) -> impl IntoResponse {
@@ -783,6 +809,9 @@ async fn handle_hook_batch(
     // All items in a batch share the drain's single identity, so the actor is
     // captured once from the batch request (mirrors `handle_hook`).
     let actor = actor_identity(actor_ext);
+    // Same gated marker as the single-event path: `None` whenever
+    // per-repository authorization is off.
+    let viewer = viewer_ext.map(|axum::Extension(v)| v.user());
     let skip_webhooks = admission_skips(level_ext, &headers);
     let actor_storage_key = actor.as_ref().map(IdentityKey::storage_key);
     let mut accepted_indices = Vec::new();
@@ -850,9 +879,20 @@ async fn handle_hook_batch(
             actor.clone(),
             level_ext.map_or(ai_memory_core::AuthLevel::Anonymous, |v| v.0),
             skip_webhooks.clone(),
+            viewer,
         )
         .await
         {
+            if e.downcast_ref::<CaptureNotAuthorized>().is_some() {
+                // Counted as accepted so the client DROPS it. The item can
+                // never be stored, so leaving it spooled would retry it until
+                // its attempt budget ran out and stall every item behind it.
+                // Same treatment a capture-policy drop already gets.
+                state.ingest_metrics.record_dropped_unauthorized();
+                warn!("hook batch capture dropped: author holds no writer grant");
+                accepted_indices.push(idx);
+                continue;
+            }
             if matches!(
                 e.downcast_ref::<StoreError>(),
                 Some(StoreError::SessionCollision)
@@ -2388,9 +2428,16 @@ async fn process_envelope(
     actor: Option<IdentityKey>,
     level: ai_memory_core::AuthLevel,
     skip_webhooks: Vec<String>,
+    viewer: Option<ai_memory_core::UserId>,
 ) -> bool {
-    if let Err(e) = process_authorized(&state, env, actor, level, skip_webhooks).await {
-        if matches!(
+    if let Err(e) = process_authorized(&state, env, actor, level, skip_webhooks, viewer).await {
+        if e.downcast_ref::<CaptureNotAuthorized>().is_some() {
+            // Counted separately from a policy drop so an operator can tell
+            // "my configuration is discarding these" from "somebody has been
+            // working all day and none of it is being kept".
+            state.ingest_metrics.record_dropped_unauthorized();
+            warn!("capture dropped: author holds no writer grant on the repository");
+        } else if matches!(
             e.downcast_ref::<StoreError>(),
             Some(StoreError::SessionCollision)
         ) {
@@ -2475,6 +2522,7 @@ async fn process(
         actor,
         ai_memory_core::AuthLevel::Anonymous,
         skip_webhooks,
+        None,
     )
     .await
     {
@@ -2500,6 +2548,7 @@ async fn process_authorized(
     // Admission webhooks this request opted out of (see `admission_skips`).
     // Empty for every caller with no HTTP request behind it.
     skip_webhooks: Vec<String>,
+    viewer: Option<ai_memory_core::UserId>,
 ) -> anyhow::Result<()> {
     let session_id = resolve_session_id(&env)?;
     // Build the actor key used to scope the in-process `ActiveProject`
@@ -2576,6 +2625,27 @@ async fn process_authorized(
             .await?
         }
     };
+
+    // A capture is a write, so it needs `writer` — the same rule the MCP write
+    // tools follow. The check lands here, rather than in the handler, because
+    // here is the first moment the repository is known: the handler answers
+    // 202 before this resolution runs, and resolving it up there would put a
+    // database round trip in front of every tool call an agent makes.
+    //
+    // The consequence is that the refusal cannot be an HTTP status, and that
+    // is the right outcome anyway. A 403 would reach the client as an ordinary
+    // failure and be retried until it burnt the entry's attempt budget, which
+    // is how this project once spent 10.7M tokens re-sending something that
+    // could never succeed. Dropping it here is final by construction.
+    if let Some(viewer) = viewer {
+        let grants = state.reader.grants_for(viewer, proj).await?;
+        if matches!(
+            ai_memory_auth::decide(&grants, viewer, proj, ai_memory_auth::GrantRole::Writer),
+            ai_memory_auth::Access::Denied(_)
+        ) {
+            return Err(CaptureNotAuthorized.into());
+        }
+    }
 
     // Hooks are fire-and-forget and may arrive out of order. Begin the
     // session idempotently before every observation so a resumed agent
@@ -3543,6 +3613,245 @@ mod tests {
     }
 
     /// Build a minimal `HookState` backed by a real on-disk store.
+    /// A capture is a write, so it needs `writer`.
+    ///
+    /// Captures wrote observations into whichever repository a working
+    /// directory resolved to, with no grant check at all — the one mutating
+    /// path that checked nothing. The refusal has to be silent at the HTTP
+    /// layer (the handler answered 202 long before the repository was known),
+    /// so what this pins is the part that matters: nothing is stored, and the
+    /// drop is counted where an operator can see it.
+    #[tokio::test]
+    async fn a_capture_needs_writer_on_the_repository_it_lands_in() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let cwd = tmp.path().to_path_buf();
+
+        // Which repository a capture lands in is resolved from the cwd, not
+        // from the server's baked project, so ask the resolver rather than
+        // assuming: a grant on the wrong repository would make this test pass
+        // for the wrong reason.
+        let probe = SessionId::new().to_string();
+        capture_as(&state, &cwd, &probe, None).await.unwrap();
+        let landed = state
+            .reader
+            .observations_for_session(probe.parse().unwrap())
+            .await
+            .unwrap()[0]
+            .project_id;
+
+        let reader = user_holding(
+            &state,
+            "ray",
+            landed,
+            Some(ai_memory_store::GrantRole::Reader),
+        )
+        .await;
+        let writer = user_holding(
+            &state,
+            "wren",
+            landed,
+            Some(ai_memory_store::GrantRole::Writer),
+        )
+        .await;
+        let stranger = user_holding(&state, "sam", landed, None).await;
+
+        // A reader-only grant, and no grant at all, are both refused.
+        for (who, user) in [("reader", reader), ("stranger", stranger)] {
+            let session = SessionId::new().to_string();
+            let err = capture_as(&state, &cwd, &session, Some(user))
+                .await
+                .expect_err("{who} must not be able to capture");
+            assert!(
+                err.downcast_ref::<CaptureNotAuthorized>().is_some(),
+                "{who}: the refusal must be the terminal kind, not a generic failure: {err}"
+            );
+            let stored = state
+                .reader
+                .observations_for_session(session.parse().unwrap())
+                .await
+                .unwrap();
+            assert!(stored.is_empty(), "{who} stored an observation anyway");
+        }
+
+        // Counted where an operator looks, and not confused with a policy drop.
+        let snap = state.ingest_metrics.snapshot();
+        assert_eq!(
+            snap.dropped_unauthorized, 0,
+            "the router records it, not this layer"
+        );
+
+        // A writer's capture lands, exactly as before.
+        let session = SessionId::new().to_string();
+        capture_as(&state, &cwd, &session, Some(writer))
+            .await
+            .expect("a writer may capture");
+        let stored = state
+            .reader
+            .observations_for_session(session.parse().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1, "the writer's capture must be stored");
+    }
+
+    /// An unauthorized batch item is CONSUMED, never left to be retried.
+    ///
+    /// This is the half that could have become a retry loop. The batch ack
+    /// tells the client which items to drop from its spool; reporting an
+    /// unauthorized item as not-accepted would leave it there to be re-sent
+    /// until its attempt budget ran out, and every attempt would be refused
+    /// for the same reason. It also stalls every item behind it. So it is
+    /// acked like any other policy drop, and simply not stored.
+    #[tokio::test]
+    async fn an_unauthorized_batch_item_is_consumed_rather_than_retried() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let cwd = tmp.path().to_path_buf();
+
+        let probe = SessionId::new().to_string();
+        capture_as(&state, &cwd, &probe, None).await.unwrap();
+        let landed = state
+            .reader
+            .observations_for_session(probe.parse().unwrap())
+            .await
+            .unwrap()[0]
+            .project_id;
+        let reader = user_holding(
+            &state,
+            "ray",
+            landed,
+            Some(ai_memory_store::GrantRole::Reader),
+        )
+        .await;
+
+        let session = SessionId::new().to_string();
+        let items = vec![HookBatchItem {
+            url: "http://h/hook?event=user-prompt-submit&agent=claude-code".into(),
+            body: serde_json::json!({
+                "session_id": session,
+                "cwd": cwd.to_string_lossy(),
+                "prompt": "hello",
+            }),
+        }];
+        let before = state.ingest_metrics.snapshot().dropped_unauthorized;
+        let response = handle_hook_batch(
+            State(Arc::new(state.clone())),
+            None,
+            Some(axum::Extension(ai_memory_core::AuthLevel::User)),
+            Some(axum::Extension(ai_memory_core::AuthorizedViewer(reader))),
+            HeaderMap::new(),
+            Json(items),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            ack["accepted"], 1,
+            "the client must be told to drop it, or it will re-send it forever: {ack}"
+        );
+
+        let stored = state
+            .reader
+            .observations_for_session(session.parse().unwrap())
+            .await
+            .unwrap();
+        assert!(stored.is_empty(), "an acked item must still not be stored");
+        assert_eq!(
+            state.ingest_metrics.snapshot().dropped_unauthorized,
+            before + 1,
+            "the drop must be visible to an operator"
+        );
+    }
+
+    /// With authorization off, captures behave exactly as they always have.
+    ///
+    /// `None` is what the gated `AuthorizedViewer` marker yields on every
+    /// install that has not switched authorization on, which is all of them
+    /// until an operator does.
+    #[tokio::test]
+    async fn a_capture_with_no_viewer_is_untouched_by_the_check() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let session = SessionId::new().to_string();
+        capture_as(&state, tmp.path(), &session, None)
+            .await
+            .expect("authorization off must not change capture");
+        let stored = state
+            .reader
+            .observations_for_session(session.parse().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+    }
+
+    /// A capture, with the viewer it is authenticated as.
+    async fn capture_as(
+        state: &HookState,
+        cwd: &std::path::Path,
+        session: &str,
+        viewer: Option<ai_memory_core::UserId>,
+    ) -> anyhow::Result<()> {
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt-submit".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": session,
+                "cwd": cwd.to_string_lossy(),
+                "prompt": "hello",
+            }),
+        );
+        process_authorized(
+            state,
+            env,
+            None,
+            ai_memory_core::AuthLevel::User,
+            Vec::new(),
+            viewer,
+        )
+        .await
+    }
+
+    /// A user holding `role` on the capture fixture's repository.
+    ///
+    /// Uses the real grant API rather than raw SQL, so the test exercises the
+    /// same path an operator's `ai-memory grant` call takes.
+    async fn user_holding(
+        state: &HookState,
+        username: &str,
+        repository: ProjectId,
+        role: Option<ai_memory_store::GrantRole>,
+    ) -> ai_memory_core::UserId {
+        let id = state
+            .writer
+            .create_human_user(
+                ai_memory_core::NewUser {
+                    username: username.to_owned(),
+                    name: None,
+                    email: None,
+                },
+                ai_memory_core::UserRole::User,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        if let Some(role) = role {
+            state
+                .writer
+                .grant_memory(id, repository, role, None)
+                .await
+                .unwrap();
+        }
+        id
+    }
+
     async fn make_state(tmp: &TempDir) -> HookState {
         let store = Store::open(tmp.path()).unwrap();
         let ws = store
@@ -5068,6 +5377,7 @@ mod tests {
                 }),
                 None,
                 None,
+                None,
                 HeaderMap::new(),
                 Json(serde_json::json!({ "session_id": sid })),
             )
@@ -5104,6 +5414,7 @@ mod tests {
             }),
             None,
             None,
+            None,
             HeaderMap::new(),
             Json(serde_json::json!({})),
         )
@@ -5132,6 +5443,7 @@ mod tests {
             Query(query.clone()),
             None,
             None,
+            None,
             HeaderMap::new(),
             Json(body.clone()),
         )
@@ -5143,6 +5455,7 @@ mod tests {
         let second = handle_hook(
             State(state),
             Query(query),
+            None,
             None,
             None,
             HeaderMap::new(),
@@ -5174,6 +5487,7 @@ mod tests {
             State(Arc::new(state)),
             None,
             None,
+            None,
             HeaderMap::new(),
             Json(items),
         )
@@ -5200,6 +5514,7 @@ mod tests {
 
         let response = handle_hook_batch(
             State(Arc::new(state)),
+            None,
             None,
             None,
             HeaderMap::new(),
@@ -5237,6 +5552,7 @@ mod tests {
             State(Arc::new(state)),
             None,
             None,
+            None,
             HeaderMap::new(),
             Json(vec![HookBatchItem {
                 url: "http://h/hook?event=session-start&agent=claude-code".into(),
@@ -5263,6 +5579,7 @@ mod tests {
 
         let response = handle_hook_batch(
             State(Arc::new(state)),
+            None,
             None,
             None,
             HeaderMap::new(),
@@ -5292,6 +5609,7 @@ mod tests {
 
         let response = handle_hook_batch(
             State(Arc::new(state)),
+            None,
             None,
             None,
             HeaderMap::new(),
@@ -5349,6 +5667,7 @@ mod tests {
             }),
             None,
             None,
+            None,
             HeaderMap::new(),
             Json(serde_json::json!({ "prompt": "missing session fails" })),
         )
@@ -5380,6 +5699,7 @@ mod tests {
                 agent: Some("claude-code".into()),
                 ..Default::default()
             }),
+            None,
             None,
             None,
             HeaderMap::new(),
@@ -5415,6 +5735,7 @@ mod tests {
             .collect::<Vec<_>>();
         let response = handle_hook_batch(
             State(Arc::new(state)),
+            None,
             None,
             None,
             HeaderMap::new(),
@@ -5478,6 +5799,7 @@ mod tests {
 
         let response = handle_hook_batch(
             State(state.clone()),
+            None,
             None,
             None,
             HeaderMap::new(),
@@ -5569,6 +5891,7 @@ mod tests {
             State(state.clone()),
             None,
             None,
+            None,
             HeaderMap::new(),
             Json(items),
         )
@@ -5602,6 +5925,7 @@ mod tests {
         let items = vec![opted_in_stop_item("cap-off", "should not persist")];
         let response = handle_hook_batch(
             State(state.clone()),
+            None,
             None,
             None,
             HeaderMap::new(),
@@ -5663,6 +5987,7 @@ mod tests {
 
         let response = handle_hook_batch(
             State(state.clone()),
+            None,
             None,
             None,
             HeaderMap::new(),
@@ -5732,6 +6057,7 @@ mod tests {
             State(state.clone()),
             None,
             None,
+            None,
             HeaderMap::new(),
             Json(items),
         )
@@ -5786,6 +6112,7 @@ mod tests {
 
         let response = handle_hook_batch(
             State(state.clone()),
+            None,
             None,
             None,
             HeaderMap::new(),
@@ -5848,6 +6175,7 @@ mod tests {
 
         let response = handle_hook_batch(
             State(state.clone()),
+            None,
             None,
             None,
             HeaderMap::new(),
@@ -5994,6 +6322,7 @@ mod tests {
             State(Arc::new(state)),
             None,
             None,
+            None,
             HeaderMap::new(),
             Json(vec![HookBatchItem {
                 url: "http://h/hook?event=session-start&agent=claude-code".into(),
@@ -6015,6 +6344,7 @@ mod tests {
 
         let response = handle_hook_batch(
             State(Arc::new(state)),
+            None,
             None,
             None,
             HeaderMap::new(),
@@ -6052,6 +6382,7 @@ mod tests {
             State(Arc::new(state)),
             None,
             None,
+            None,
             HeaderMap::new(),
             Json(vec![
                 HookBatchItem {
@@ -6086,6 +6417,7 @@ mod tests {
             State(Arc::new(state)),
             None,
             None,
+            None,
             HeaderMap::new(),
             Json(vec![HookBatchItem {
                 url: "http://h/hook?event=pre-tool-use&agent=grok&drop_subagent=1".into(),
@@ -6115,6 +6447,7 @@ mod tests {
 
         let response = handle_hook_batch(
             State(Arc::new(state)),
+            None,
             None,
             None,
             HeaderMap::new(),
@@ -6158,6 +6491,7 @@ mod tests {
             State(Arc::new(state)),
             None,
             None,
+            None,
             HeaderMap::new(),
             Json(items),
         )
@@ -6190,6 +6524,7 @@ mod tests {
 
         let response = handle_hook_batch(
             State(Arc::new(state)),
+            None,
             None,
             None,
             HeaderMap::new(),
@@ -7222,6 +7557,7 @@ mod tests {
             bob,
             ai_memory_core::AuthLevel::Anonymous,
             Vec::new(),
+            None,
         )
         .await
         .unwrap_err();
@@ -7307,6 +7643,7 @@ mod tests {
             bob,
             ai_memory_core::AuthLevel::User,
             Vec::new(),
+            None,
         )
         .await
         .unwrap_err();
@@ -7403,6 +7740,7 @@ mod tests {
             bob.clone(),
             ai_memory_core::AuthLevel::User,
             Vec::new(),
+            None,
         )
         .await
         .unwrap_err();
@@ -7482,6 +7820,7 @@ mod tests {
             bob,
             ai_memory_core::AuthLevel::User,
             Vec::new(),
+            None,
         )
         .await
         .unwrap_err();
@@ -7555,6 +7894,7 @@ mod tests {
             Some(IdentityKey::User("root".into())),
             ai_memory_core::AuthLevel::Root,
             Vec::new(),
+            None,
         )
         .await
         .unwrap();
@@ -7578,6 +7918,7 @@ mod tests {
             Some(IdentityKey::User("root".into())),
             ai_memory_core::AuthLevel::Root,
             Vec::new(),
+            None,
         )
         .await
         .unwrap_err();
@@ -7593,6 +7934,7 @@ mod tests {
             Some(IdentityKey::User("bob".into())),
             ai_memory_core::AuthLevel::User,
             Vec::new(),
+            None,
         )
         .await
         .unwrap_err();
@@ -7608,6 +7950,7 @@ mod tests {
             Some(IdentityKey::User("root".into())),
             ai_memory_core::AuthLevel::Root,
             Vec::new(),
+            None,
         )
         .await
         .unwrap_err();
@@ -7659,6 +8002,7 @@ mod tests {
                 IdentityKey::User("bob".into()).to_actor_context(),
             )),
             Some(axum::Extension(ai_memory_core::AuthLevel::User)),
+            None,
             HeaderMap::new(),
             Json(items),
         )
@@ -7715,6 +8059,7 @@ mod tests {
             None,
             ai_memory_core::AuthLevel::Anonymous,
             Vec::new(),
+            None,
         )
         .await
         .unwrap();
@@ -7762,6 +8107,7 @@ mod tests {
                 IdentityKey::User("bob".into()).to_actor_context(),
             )),
             Some(axum::Extension(ai_memory_core::AuthLevel::User)),
+            None,
             HeaderMap::new(),
             Json(serde_json::json!({"session_id":"async-owned", "prompt":"foreign"})),
         )
@@ -8709,6 +9055,7 @@ mod tests {
                 None,
                 ai_memory_core::AuthLevel::Anonymous,
                 Vec::new(),
+                None,
             )
             .await
         });
@@ -8726,6 +9073,7 @@ mod tests {
                 None,
                 ai_memory_core::AuthLevel::Anonymous,
                 Vec::new(),
+                None,
             )
             .await
         });
@@ -8982,6 +9330,7 @@ mod tests {
                 State(Arc::new(state.clone())),
                 None,
                 level.map(axum::Extension),
+                None,
                 headers,
                 Json(items),
             )
@@ -12597,6 +12946,7 @@ mod tests {
             State(state.clone()),
             None,
             None,
+            None,
             HeaderMap::new(),
             Json(vec![
                 HookBatchItem {
@@ -12655,6 +13005,7 @@ mod tests {
         let state = Arc::new(state);
         let response = handle_hook_batch(
             State(state.clone()),
+            None,
             None,
             None,
             HeaderMap::new(),
