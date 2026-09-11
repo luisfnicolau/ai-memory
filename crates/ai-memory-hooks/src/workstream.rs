@@ -214,6 +214,9 @@ async fn prepare_run(
     .await
     {
         Ok(scope) => scope,
+        Err(failure) if failure.is_forbidden() => {
+            return error(StatusCode::FORBIDDEN, failure.to_string());
+        }
         Err(failure) => return error(StatusCode::BAD_REQUEST, failure.to_string()),
     };
     let selection = match (request.workstream, request.new_workstream) {
@@ -435,6 +438,9 @@ async fn list_recent_workstreams(
     .await
     {
         Ok(scope) => scope,
+        Err(failure) if failure.is_forbidden() => {
+            return error(StatusCode::FORBIDDEN, failure.to_string());
+        }
         Err(failure) if failure.is_not_found() => {
             return error(StatusCode::NOT_FOUND, failure.to_string());
         }
@@ -550,6 +556,9 @@ async fn rename_workstream(
     .await
     {
         Ok(scope) => scope,
+        Err(failure) if failure.is_forbidden() => {
+            return error(StatusCode::FORBIDDEN, failure.to_string());
+        }
         Err(failure) if failure.is_not_found() => {
             return error(StatusCode::NOT_FOUND, failure.to_string());
         }

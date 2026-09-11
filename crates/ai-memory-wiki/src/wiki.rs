@@ -3679,7 +3679,7 @@ mod tests {
         // FTS5 finds it via the store reader.
         let hits = store
             .reader
-            .search_pages("karpathy".into(), 5)
+            .search_pages("karpathy".into(), 5, None)
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
@@ -3964,7 +3964,7 @@ mod tests {
         // MCP query path never surface the raw secret either).
         let hits = store
             .reader
-            .search_pages("REDACTED".into(), 5)
+            .search_pages("REDACTED".into(), 5, None)
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
@@ -4044,7 +4044,11 @@ mod tests {
         }
         let counts = store.reader.status_counts().await.unwrap();
         assert_eq!(counts.pages_latest, 5);
-        let hits = store.reader.search_pages("batch".into(), 10).await.unwrap();
+        let hits = store
+            .reader
+            .search_pages("batch".into(), 10, None)
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 5);
     }
 
@@ -4215,7 +4219,7 @@ mod tests {
 
         let hits = store
             .reader
-            .search_pages("REDACTED".into(), 5)
+            .search_pages("REDACTED".into(), 5, None)
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
@@ -4948,7 +4952,7 @@ mod tests {
         );
         let hits = s2
             .reader
-            .search_pages("uniquetoken".into(), 5)
+            .search_pages("uniquetoken".into(), 5, None)
             .await
             .unwrap();
         assert_eq!(
@@ -5409,7 +5413,7 @@ mod tests {
         assert!(
             store
                 .reader
-                .search_pages("consolidated".into(), 10)
+                .search_pages("consolidated".into(), 10, None)
                 .await
                 .unwrap()
                 .is_empty()
@@ -5458,7 +5462,7 @@ mod tests {
         assert!(
             !store
                 .reader
-                .search_pages("kept".into(), 10)
+                .search_pages("kept".into(), 10, None)
                 .await
                 .unwrap()
                 .is_empty(),

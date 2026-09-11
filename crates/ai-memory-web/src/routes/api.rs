@@ -173,9 +173,13 @@ async fn pages_handler(
 
 async fn page_handler(
     State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     headers: axum::http::HeaderMap,
     Path((workspace, project, path)): Path<(String, String, String)>,
 ) -> Result<Response, Response> {
+    super::authorize_read(&state, viewer, &workspace, &project)
+        .await
+        .map_err(scope_error_response)?;
     let meta = state
         .reader
         .page_meta(&workspace, &project, &path)
@@ -322,7 +326,7 @@ async fn search_with_request(
         ));
     }
     let hits = match scoped_search_mode(state, &request, viewer).await? {
-        SearchMode::Global => state.reader.search_pages(term, limit).await,
+        SearchMode::Global => state.reader.search_pages(term, limit, viewer).await,
         SearchMode::Scoped(scopes) => search_scopes(state, scopes, term, limit).await,
     }
     .map_err(internal_error)?;
@@ -1090,6 +1094,8 @@ fn not_found(message: impl Into<String>) -> Response {
 fn scope_error_response(err: ScopeResolutionError) -> Response {
     if err.is_bad_request() {
         json_error(StatusCode::BAD_REQUEST, err.to_string())
+    } else if err.is_forbidden() {
+        json_error(StatusCode::FORBIDDEN, err.to_string())
     } else if err.is_not_found() {
         json_error(StatusCode::NOT_FOUND, err.to_string())
     } else {

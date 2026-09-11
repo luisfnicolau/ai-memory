@@ -58,6 +58,50 @@ fn now_us() -> i64 {
     Timestamp::now().as_microsecond()
 }
 
+/// Restrict `project_column` to the repositories `viewer` may read (#708).
+///
+/// Returns a fragment to append to a `WHERE` clause and the values it binds,
+/// numbered from `?{first_param}`. For `None` the fragment is empty and binds
+/// nothing, so a query built with no viewer is exactly the query it was before
+/// authorization existed — which is what an open install, an install that has
+/// not switched authorization on, and the root operator all need.
+///
+/// "May read" is any active grant. `reader` is the lowest level, so every
+/// grant covers it — the same answer `ai_memory_auth::decide` gives for
+/// `GrantRole::Reader`, and a test pins the two together. The global
+/// preferences scope is always readable: it is shared by construction (see
+/// `lookup_global_scope`).
+///
+/// This belongs in the query, before `LIMIT`, not applied to the rows after.
+/// Filtering afterwards hands a user three results out of ten because seven
+/// were somebody else's: search that quietly gets worse, and a count that
+/// tells them how much is being hidden.
+fn readable_repository_filter(
+    project_column: &str,
+    viewer: Option<UserId>,
+    first_param: usize,
+) -> (String, Vec<Value>) {
+    let Some(viewer) = viewer else {
+        return (String::new(), Vec::new());
+    };
+    let (user, workspace, project) = (first_param, first_param + 1, first_param + 2);
+    // Aliased so the subqueries cannot bind to a `projects` / `workspaces`
+    // already joined by the query this is appended to.
+    let fragment = format!(
+        " AND ({project_column} IN (SELECT mg.repository_id FROM memory_grant mg \
+                                    WHERE mg.user_id = ?{user} AND mg.revoked_at IS NULL) \
+               OR {project_column} IN (SELECT gp.id FROM projects gp \
+                                       JOIN workspaces gw ON gw.id = gp.workspace_id \
+                                       WHERE gw.name = ?{workspace} AND gp.name = ?{project}))"
+    );
+    let bound = vec![
+        Value::Blob(viewer.as_bytes().to_vec()),
+        Value::Text(ai_memory_core::DEFAULT_WORKSPACE_NAME.to_owned()),
+        Value::Text(ai_memory_core::GLOBAL_SCOPE_PROJECT.to_owned()),
+    ];
+    (fragment, bound)
+}
+
 fn page_kind_expr(path_column: &str, frontmatter_column: &str) -> String {
     format!(
         "COALESCE( \
@@ -1643,15 +1687,25 @@ impl ReaderPool {
     /// Run a full-text search against the FTS5 index, apply the bounded page
     /// authority adjustment, and return the top `is_latest = 1` matches.
     ///
+    /// `viewer` restricts the hits to repositories that user may read — see
+    /// [`readable_repository_filter`]. `None` searches every repository.
+    ///
     /// # Errors
     /// Propagates any SQL or pool error.
-    pub async fn search_pages(&self, query: String, limit: usize) -> StoreResult<Vec<PageHit>> {
+    pub async fn search_pages(
+        &self,
+        query: String,
+        limit: usize,
+        viewer: Option<UserId>,
+    ) -> StoreResult<Vec<PageHit>> {
         let fts_query = normalize_fts_query(&query);
         if fts_query.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("pages.path", "pages.frontmatter_json");
+            let (visible, visible_params) =
+                readable_repository_filter("pages.project_id", viewer, 4);
             let sql = format!(
                 "SELECT pages.id, pages.path, pages.title, \
                         snippet(pages_fts, 1, '<mark>', '</mark>', '…', 24) AS snip, \
@@ -1659,38 +1713,41 @@ impl ReaderPool {
                         pages.frontmatter_json, {kind_expr} AS kind \
                  FROM pages_fts \
                  JOIN pages ON pages.rowid = pages_fts.rowid \
-                 WHERE pages_fts MATCH ?1 AND pages.is_latest = 1{not_expired} \
+                 WHERE pages_fts MATCH ?1 AND pages.is_latest = 1{not_expired}{visible} \
                  ORDER BY pages_fts.rank \
                  LIMIT ?2",
                 not_expired = not_expired("pages", "?3"),
             );
             let mut stmt = conn.prepare(&sql)?;
             #[allow(clippy::cast_possible_wrap)]
-            let rows = stmt.query_map(
-                params![fts_query, authority_candidate_limit(limit) as i64, now_us()],
-                |row| {
-                    let id_bytes: Vec<u8> = row.get(0)?;
-                    let path: String = row.get(1)?;
-                    let title: String = row.get(2)?;
-                    let snippet: String = row.get(3)?;
-                    let rank: f64 = row.get(4)?;
-                    let tier: String = row.get(5)?;
-                    let pinned = row.get::<_, i64>(6)? != 0;
-                    let frontmatter_json: String = row.get(7)?;
-                    let kind: String = row.get(8)?;
-                    Ok((
-                        id_bytes,
-                        path,
-                        title,
-                        snippet,
-                        rank,
-                        tier,
-                        pinned,
-                        frontmatter_json,
-                        kind,
-                    ))
-                },
-            )?;
+            let mut bound = vec![
+                Value::Text(fts_query),
+                Value::Integer(authority_candidate_limit(limit) as i64),
+                Value::Integer(now_us()),
+            ];
+            bound.extend(visible_params);
+            let rows = stmt.query_map(params_from_iter(bound.iter()), |row| {
+                let id_bytes: Vec<u8> = row.get(0)?;
+                let path: String = row.get(1)?;
+                let title: String = row.get(2)?;
+                let snippet: String = row.get(3)?;
+                let rank: f64 = row.get(4)?;
+                let tier: String = row.get(5)?;
+                let pinned = row.get::<_, i64>(6)? != 0;
+                let frontmatter_json: String = row.get(7)?;
+                let kind: String = row.get(8)?;
+                Ok((
+                    id_bytes,
+                    path,
+                    title,
+                    snippet,
+                    rank,
+                    tier,
+                    pinned,
+                    frontmatter_json,
+                    kind,
+                ))
+            })?;
 
             let mut candidates = Vec::new();
             for row in rows {
@@ -1719,6 +1776,9 @@ impl ReaderPool {
     /// to one SQLite query instead of one search query plus a metadata lookup
     /// per hit.
     ///
+    /// `viewer` restricts the hits to repositories that user may read — see
+    /// [`readable_repository_filter`]. `None` searches every repository.
+    ///
     /// # Errors
     /// Propagates any SQL or pool error.
     pub async fn search_pages_with_meta(
@@ -1726,6 +1786,7 @@ impl ReaderPool {
         query: String,
         limit: usize,
         expiry_cutoff_us: Option<i64>,
+        viewer: Option<UserId>,
     ) -> StoreResult<Vec<PageHitWithMeta>> {
         let fts_query = normalize_fts_query(&query);
         if fts_query.is_empty() || limit == 0 {
@@ -1734,6 +1795,8 @@ impl ReaderPool {
         let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("pages.path", "pages.frontmatter_json");
+            let (visible, visible_params) =
+                readable_repository_filter("pages.project_id", viewer, 4);
             let sql = format!(
                 "SELECT workspaces.name, projects.name, pages.path, pages.title, \
                         snippet(pages_fts, 1, '<mark>', '</mark>', '…', 24) AS snip, \
@@ -1743,40 +1806,43 @@ impl ReaderPool {
                  JOIN pages ON pages.rowid = pages_fts.rowid \
                  JOIN projects ON projects.id = pages.project_id \
                  JOIN workspaces ON workspaces.id = pages.workspace_id \
-                 WHERE pages_fts MATCH ?1 AND pages.is_latest = 1{not_expired} \
+                 WHERE pages_fts MATCH ?1 AND pages.is_latest = 1{not_expired}{visible} \
                  ORDER BY pages_fts.rank \
                  LIMIT ?2",
                 not_expired = not_expired("pages", "?3"),
             );
             let mut stmt = conn.prepare(&sql)?;
             #[allow(clippy::cast_possible_wrap)]
-            let rows = stmt.query_map(
-                params![fts_query, authority_candidate_limit(limit) as i64, cutoff],
-                |row| {
-                    let workspace_name: String = row.get(0)?;
-                    let project_name: String = row.get(1)?;
-                    let path: String = row.get(2)?;
-                    let title: String = row.get(3)?;
-                    let snippet: String = row.get(4)?;
-                    let rank: f64 = row.get(5)?;
-                    let tier: String = row.get(6)?;
-                    let pinned = row.get::<_, i64>(7)? != 0;
-                    let frontmatter_json: String = row.get(8)?;
-                    let kind: String = row.get(9)?;
-                    Ok((
-                        workspace_name,
-                        project_name,
-                        path,
-                        title,
-                        snippet,
-                        rank,
-                        tier,
-                        pinned,
-                        frontmatter_json,
-                        kind,
-                    ))
-                },
-            )?;
+            let mut bound = vec![
+                Value::Text(fts_query),
+                Value::Integer(authority_candidate_limit(limit) as i64),
+                Value::Integer(cutoff),
+            ];
+            bound.extend(visible_params);
+            let rows = stmt.query_map(params_from_iter(bound.iter()), |row| {
+                let workspace_name: String = row.get(0)?;
+                let project_name: String = row.get(1)?;
+                let path: String = row.get(2)?;
+                let title: String = row.get(3)?;
+                let snippet: String = row.get(4)?;
+                let rank: f64 = row.get(5)?;
+                let tier: String = row.get(6)?;
+                let pinned = row.get::<_, i64>(7)? != 0;
+                let frontmatter_json: String = row.get(8)?;
+                let kind: String = row.get(9)?;
+                Ok((
+                    workspace_name,
+                    project_name,
+                    path,
+                    title,
+                    snippet,
+                    rank,
+                    tier,
+                    pinned,
+                    frontmatter_json,
+                    kind,
+                ))
+            })?;
 
             let mut candidates = Vec::new();
             for row in rows {
@@ -2357,10 +2423,19 @@ impl ReaderPool {
     /// REAL) — larger still means "ranks first", callers must not read it
     /// as an FTS rank.
     ///
+    /// `viewer` restricts the pages to repositories that user may read — see
+    /// [`readable_repository_filter`]. `None` lists every repository.
+    ///
     /// # Errors
     /// Propagates any SQL or pool error.
-    pub async fn recent_pages_global(&self, limit: usize) -> StoreResult<Vec<PageHitWithMeta>> {
+    pub async fn recent_pages_global(
+        &self,
+        limit: usize,
+        viewer: Option<UserId>,
+    ) -> StoreResult<Vec<PageHitWithMeta>> {
         self.with_conn(move |conn| {
+            let (visible, visible_params) =
+                readable_repository_filter("pages.project_id", viewer, 3);
             let sql = format!(
                 "SELECT workspaces.name, projects.name, pages.path, pages.title, \
                         {descriptor} AS snip, \
@@ -2368,7 +2443,7 @@ impl ReaderPool {
                  FROM pages \
                  JOIN projects ON projects.id = pages.project_id \
                  JOIN workspaces ON workspaces.id = pages.workspace_id \
-                 WHERE pages.is_latest = 1{not_expired} \
+                 WHERE pages.is_latest = 1{not_expired}{visible} \
                  ORDER BY pages.updated_at DESC \
                  LIMIT ?1",
                 descriptor = page_descriptor_expr("pages.body", "pages.frontmatter_json"),
@@ -2376,7 +2451,9 @@ impl ReaderPool {
             );
             let mut stmt = conn.prepare_cached(&sql)?;
             #[allow(clippy::cast_possible_wrap)]
-            let rows = stmt.query_map(params![limit as i64, now_us()], |row| {
+            let mut bound = vec![Value::Integer(limit as i64), Value::Integer(now_us())];
+            bound.extend(visible_params);
+            let rows = stmt.query_map(params_from_iter(bound.iter()), |row| {
                 let workspace_name: String = row.get(0)?;
                 let project_name: String = row.get(1)?;
                 let path: String = row.get(2)?;

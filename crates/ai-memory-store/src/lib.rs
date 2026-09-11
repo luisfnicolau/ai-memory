@@ -2216,7 +2216,11 @@ mod tests {
             .await
             .unwrap();
 
-        let hits = store.reader.search_pages("quick".into(), 10).await.unwrap();
+        let hits = store
+            .reader
+            .search_pages("quick".into(), 10, None)
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path.as_str(), "alpha.md");
         assert!(hits[0].snippet.contains("<mark>quick</mark>"));
@@ -2238,7 +2242,11 @@ mod tests {
         assert_eq!(counts.pages_latest, 1);
         assert_eq!(counts.pages_all, 2);
 
-        let hits = store.reader.search_pages("quick".into(), 10).await.unwrap();
+        let hits = store
+            .reader
+            .search_pages("quick".into(), 10, None)
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert!(
             hits[0].snippet.contains("different"),
@@ -2334,7 +2342,7 @@ mod tests {
 
         let global = store
             .reader
-            .search_pages_with_meta(query.into(), 10, None)
+            .search_pages_with_meta(query.into(), 10, None, None)
             .await
             .unwrap();
         assert_eq!(global[0].path.as_str(), "decisions/embedding-policy.md");
@@ -2394,7 +2402,7 @@ mod tests {
 
         let hits = store
             .reader
-            .search_pages("pick: handoff bootstrap".into(), 10)
+            .search_pages("pick: handoff bootstrap".into(), 10, None)
             .await
             .unwrap();
         assert!(
@@ -2431,7 +2439,7 @@ mod tests {
 
         let hits = store
             .reader
-            .search_pages("descricao sessao".into(), 10)
+            .search_pages("descricao sessao".into(), 10, None)
             .await
             .unwrap();
         assert!(
@@ -2462,7 +2470,7 @@ mod tests {
 
         let hits = store
             .reader
-            .search_pages("quick OR slow".into(), 10)
+            .search_pages("quick OR slow".into(), 10, None)
             .await
             .unwrap();
         assert!(!hits.is_empty(), "OR must remain an FTS5 operator");

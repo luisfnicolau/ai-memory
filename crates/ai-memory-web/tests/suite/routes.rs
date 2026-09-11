@@ -3156,3 +3156,129 @@ async fn namespace_path_lists_its_pages() {
         .unwrap();
     assert_eq!(empty.status(), StatusCode::NOT_FOUND);
 }
+
+/// #708 on the web surface. The page routes went straight from a URL to the
+/// page body without resolving a scope, and global search had no scope to
+/// resolve, so the guard never saw either: bob could open alice's page in a
+/// browser and find it from the search box.
+#[tokio::test]
+async fn web_reads_honour_grants_once_authorization_is_on() {
+    use ai_memory_auth::GrantRole;
+    use ai_memory_core::{AuthorizedViewer, NewUser, UserId, UserRole};
+
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let client = store
+        .writer
+        .get_or_create_project(ws, "alice-client-work", None)
+        .await
+        .unwrap();
+    wiki.write_page(wiki_req(
+        ws,
+        client,
+        "secrets/rates.md",
+        "# Rates\n\nDay rate is confidential.",
+    ))
+    .await
+    .unwrap();
+    let human = |name: &'static str| {
+        let writer = store.writer.clone();
+        async move {
+            writer
+                .create_human_user(
+                    NewUser {
+                        username: name.into(),
+                        name: None,
+                        email: None,
+                    },
+                    UserRole::User,
+                    None,
+                    false,
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let alice = human("alice").await;
+    let bob = human("bob").await;
+    store
+        .writer
+        .grant_memory(alice, client, GrantRole::Reader, None)
+        .await
+        .unwrap();
+
+    let api = api_router(store.reader.clone(), wiki.clone());
+    let web = router(store.reader.clone(), wiki.clone());
+    // `viewer` is what the auth middleware stamps when `[auth].authorization`
+    // is on; `None` is the switch off (or root).
+    let get = |app: axum::Router, uri: &'static str, viewer: Option<UserId>| async move {
+        let mut req = Request::builder().uri(uri);
+        if let Some(viewer) = viewer {
+            req = req.extension(AuthorizedViewer(viewer));
+        }
+        let resp = app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    };
+
+    // Opening the page, through the API and through the HTML wiki. Bob is
+    // refused with a 403 that says so — not a 404 that sends him looking for
+    // a typo, and not the 500 a refusal used to fall through to.
+    for (app, uri) in [
+        (
+            &api,
+            "/workspaces/default/projects/alice-client-work/pages/secrets/rates.md",
+        ),
+        (&web, "/w/default/alice-client-work/p/secrets/rates.md"),
+        (&web, "/w/default/alice-client-work"),
+    ] {
+        let (status, body) = get(app.clone(), uri, Some(bob)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
+        assert!(
+            body.contains("not authorized for alice-client-work"),
+            "{uri}: {body}"
+        );
+        assert!(
+            !body.contains("confidential"),
+            "{uri} leaked the body: {body}"
+        );
+
+        assert_eq!(
+            get(app.clone(), uri, Some(alice)).await.0,
+            StatusCode::OK,
+            "{uri}"
+        );
+        assert_eq!(get(app.clone(), uri, None).await.0, StatusCode::OK, "{uri}");
+    }
+
+    // Finding it, through the API's global search and the wiki search box.
+    for (app, uri) in [
+        (&api, "/search?q=confidential"),
+        (&web, "/search?q=confidential"),
+    ] {
+        let (status, body) = get(app.clone(), uri, Some(bob)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(
+            !body.contains("secrets/rates.md"),
+            "{uri} surfaced it to bob: {body}"
+        );
+
+        let (_, body) = get(app.clone(), uri, Some(alice)).await;
+        assert!(
+            body.contains("secrets/rates.md"),
+            "{uri} hid it from alice: {body}"
+        );
+        let (_, body) = get(app.clone(), uri, None).await;
+        assert!(
+            body.contains("secrets/rates.md"),
+            "{uri} with authorization off: {body}"
+        );
+    }
+}

@@ -425,7 +425,7 @@ async fn measure_recall(
         } else {
             store
                 .reader
-                .search_pages((*query).to_string(), 5)
+                .search_pages((*query).to_string(), 5, None)
                 .await
                 .expect("search")
         };

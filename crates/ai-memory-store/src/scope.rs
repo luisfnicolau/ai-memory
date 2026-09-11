@@ -134,6 +134,17 @@ impl ScopeResolutionError {
         )
     }
 
+    /// True when the caller is authenticated but not authorized for the
+    /// repository (#708).
+    ///
+    /// Surfaces map this to 403. Before this existed it fell through to their
+    /// catch-all 500, which told a user refused by design that the server was
+    /// broken — the one reading of a denial more misleading than "not found".
+    #[must_use]
+    pub fn is_forbidden(&self) -> bool {
+        matches!(self, ScopeResolutionError::NotAuthorized { .. })
+    }
+
     /// True when the caller named a scope that does not exist.
     #[must_use]
     pub fn is_not_found(&self) -> bool {

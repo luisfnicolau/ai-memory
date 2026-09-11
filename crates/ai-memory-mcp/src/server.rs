@@ -1981,6 +1981,7 @@ impl AiMemoryServer {
                     args.query.clone(),
                     limit,
                     include_expired.then_some(i64::MIN),
+                    Self::viewer_from_parts(Some(&parts)),
                 )
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -2287,7 +2288,7 @@ impl AiMemoryServer {
         if !explicit_scoping && self.active_project.default_global_for(&aps_actor) {
             let global_hits = self
                 .reader
-                .recent_pages_global(limit)
+                .recent_pages_global(limit, Self::viewer_from_parts(Some(&parts)))
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
             return ok_json(&MemoryRecentResponse {
@@ -9749,6 +9750,137 @@ mod tests {
         read_as(None)
             .await
             .expect("with authorization off, an existing install must be unchanged");
+    }
+
+    /// The other half of #708: bob could not open alice's page, but he could
+    /// still find it. `global` searches and the `default_global` recent
+    /// listing never resolve a scope, so the resolver guard never saw them.
+    #[tokio::test]
+    async fn bob_cannot_find_alices_page_by_searching_once_authorization_is_on() {
+        let (_tmp, store, server, ws, _scratch) = setup_server().await;
+        let client = store
+            .writer
+            .get_or_create_project(ws, "alice-client-work", None)
+            .await
+            .unwrap();
+        let human = |name: &'static str| {
+            let writer = store.writer.clone();
+            async move {
+                writer
+                    .create_human_user(
+                        NewUser {
+                            username: name.into(),
+                            name: None,
+                            email: None,
+                        },
+                        ai_memory_core::UserRole::User,
+                        None,
+                        false,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let alice = human("alice").await;
+        let bob = human("bob").await;
+        grant_writer(store.db_path(), alice, client);
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: client,
+                path: PagePath::new("secrets/rates.md").unwrap(),
+                title: "Rates".into(),
+                body: "Day rate is confidential.".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+            })
+            .await
+            .unwrap();
+        // `memory_recent` only goes global for a repo that opted into
+        // `[recall] default_global`; opt the test actor in.
+        server
+            .active_project
+            .set_for(&ai_memory_core::ActorKey::default(), ws, client, true);
+
+        // `authorized` is whether the middleware stamped an AuthorizedViewer,
+        // i.e. whether `[auth].authorization` is on.
+        let as_user = |user: ai_memory_core::UserId, authorized: bool| {
+            let mut parts = test_parts_default();
+            parts.extensions.insert(AuthLevel::User);
+            parts.extensions.insert(user);
+            if authorized {
+                parts
+                    .extensions
+                    .insert(ai_memory_core::AuthorizedViewer(user));
+            }
+            parts
+        };
+        let text = |result: CallToolResult| {
+            result
+                .content
+                .first()
+                .and_then(|c| c.as_text())
+                .map(|t| t.text.clone())
+                .unwrap()
+        };
+        let found_by_query = |user, authorized| {
+            let server = &server;
+            async move {
+                let result = server
+                    .memory_query(
+                        Parameters(QueryArgs {
+                            query: "confidential".into(),
+                            limit: Some(10),
+                            project: None,
+                            workspace: None,
+                            scopes: Vec::new(),
+                            global: Some(true),
+                            include_expired: None,
+                            explain: None,
+                            as_of: None,
+                        }),
+                        OptionalParts(as_user(user, authorized)),
+                    )
+                    .await
+                    .unwrap();
+                text(result).contains("secrets/rates.md")
+            }
+        };
+        let found_by_recent = |user, authorized| {
+            let server = &server;
+            async move {
+                let result = server
+                    .memory_recent(
+                        Parameters(RecentArgs {
+                            limit: Some(10),
+                            project: None,
+                            workspace: None,
+                        }),
+                        OptionalParts(as_user(user, authorized)),
+                    )
+                    .await
+                    .unwrap();
+                text(result).contains("secrets/rates.md")
+            }
+        };
+
+        // Authorization on: bob holds nothing on alice's repository, so a
+        // global search and the global recent listing do not surface it...
+        assert!(!found_by_query(bob, true).await, "bob found it by search");
+        assert!(!found_by_recent(bob, true).await, "bob found it in recent");
+        // ...while alice, who holds a grant, still finds her own page.
+        assert!(found_by_query(alice, true).await);
+        assert!(found_by_recent(alice, true).await);
+
+        // Authorization off: no viewer is stamped and nothing changes.
+        assert!(found_by_query(bob, false).await);
+        assert!(found_by_recent(bob, false).await);
     }
 
     fn parts_with_level(level: ai_memory_core::AuthLevel) -> axum::http::request::Parts {

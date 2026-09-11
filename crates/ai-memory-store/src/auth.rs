@@ -598,6 +598,196 @@ mod tests {
         assert!(r.any_grant_exists().await.unwrap());
     }
 
+    async fn page(store: &Store, repository: ProjectId, path: &str, body: &str) {
+        let workspace = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(ai_memory_core::NewPage {
+                workspace_id: workspace,
+                project_id: repository,
+                path: ai_memory_core::PagePath::new(path).unwrap(),
+                title: path.to_owned(),
+                body: body.to_owned(),
+                tier: ai_memory_core::Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+            })
+            .await
+            .unwrap();
+    }
+
+    fn paths<T>(hits: &[T], path: impl Fn(&T) -> &str) -> Vec<String> {
+        let mut out: Vec<String> = hits.iter().map(|h| path(h).to_owned()).collect();
+        out.sort();
+        out
+    }
+
+    /// The search filter is written in SQL as "any active grant"; the guard
+    /// on every other path is `decide(.., GrantRole::Reader)`. They agree only
+    /// because reader is the lowest level. This pins that, so adding a level
+    /// below reader breaks a test rather than quietly widening search.
+    #[test]
+    fn every_grant_level_can_read_which_is_what_the_search_filter_assumes() {
+        for role in [GrantRole::Reader, GrantRole::Writer, GrantRole::Admin] {
+            assert!(role.covers(GrantRole::Reader), "{role:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn search_finds_only_what_the_viewer_may_read() {
+        let f = fixture().await;
+        let r = &f.store.reader;
+        page(
+            &f.store,
+            f.client,
+            "secrets/rates.md",
+            "confidential day rate",
+        )
+        .await;
+        page(&f.store, f.personal, "notes/rates.md", "personal day rate").await;
+        let global = crate::create_global_scope(&f.store.writer).await.unwrap();
+        page(
+            &f.store,
+            global.project_id,
+            "prefs/rates.md",
+            "shared day rate",
+        )
+        .await;
+        f.store
+            .writer
+            .grant_memory(f.alice, f.client, GrantRole::Reader, None)
+            .await
+            .unwrap();
+
+        let as_viewer = |viewer| async move {
+            (
+                paths(
+                    &r.search_pages("rate".into(), 10, viewer).await.unwrap(),
+                    |h| h.path.as_str(),
+                ),
+                paths(
+                    &r.search_pages_with_meta("rate".into(), 10, None, viewer)
+                        .await
+                        .unwrap(),
+                    |h| h.path.as_str(),
+                ),
+                paths(&r.recent_pages_global(10, viewer).await.unwrap(), |h| {
+                    h.path.as_str()
+                }),
+            )
+        };
+
+        // Alice holds a grant on the client project: she finds it, plus the
+        // shared global scope, and nothing from the project she was never
+        // given.
+        let alice = vec!["prefs/rates.md".to_owned(), "secrets/rates.md".to_owned()];
+        assert_eq!(
+            as_viewer(Some(f.alice)).await,
+            (alice.clone(), alice.clone(), alice)
+        );
+
+        // Bob holds nothing: only the global scope, which is shared by design.
+        let bob = vec!["prefs/rates.md".to_owned()];
+        assert_eq!(
+            as_viewer(Some(f.bob)).await,
+            (bob.clone(), bob.clone(), bob)
+        );
+
+        // No viewer — authorization off, or root — sees everything, as before.
+        let all = vec![
+            "notes/rates.md".to_owned(),
+            "prefs/rates.md".to_owned(),
+            "secrets/rates.md".to_owned(),
+        ];
+        assert_eq!(as_viewer(None).await, (all.clone(), all.clone(), all));
+
+        // A revoked grant hides the repository again.
+        f.store
+            .writer
+            .revoke_memory(f.alice, f.client, None)
+            .await
+            .unwrap();
+        let revoked = vec!["prefs/rates.md".to_owned()];
+        assert_eq!(
+            as_viewer(Some(f.alice)).await,
+            (revoked.clone(), revoked.clone(), revoked)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_limit_counts_only_what_the_viewer_may_see() {
+        // Filtering after LIMIT would hand bob a short page: of the first ten
+        // matches, most are alice's. Filtering in the query fills his limit
+        // from what he can read, and does not tell him how much was hidden.
+        //
+        // The hidden pages are built to win every ordering these queries use —
+        // more of them than the 40 candidates a limit of 10 over-fetches,
+        // ranked higher (the needle repeated) and written more recently — so a
+        // filter applied after the LIMIT would leave bob with nothing at all.
+        let f = fixture().await;
+        let r = &f.store.reader;
+        for n in 0..12 {
+            page(
+                &f.store,
+                f.personal,
+                &format!("visible/{n:02}.md"),
+                "needle visible",
+            )
+            .await;
+        }
+        for n in 0..60 {
+            page(
+                &f.store,
+                f.client,
+                &format!("hidden/{n:02}.md"),
+                "needle needle needle needle hidden",
+            )
+            .await;
+        }
+        // Without a viewer the hidden pages crowd out every visible one, which
+        // is what makes the assertions below mean something.
+        let unfiltered = r.search_pages("needle".into(), 10, None).await.unwrap();
+        assert!(
+            unfiltered
+                .iter()
+                .all(|h| h.path.as_str().starts_with("hidden/"))
+        );
+        let unfiltered = r.recent_pages_global(10, None).await.unwrap();
+        assert!(unfiltered.iter().all(|h| h.project_name == "client-work"));
+
+        f.store
+            .writer
+            .grant_memory(f.bob, f.personal, GrantRole::Reader, None)
+            .await
+            .unwrap();
+
+        let hits = r
+            .search_pages("needle".into(), 10, Some(f.bob))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 10);
+        assert!(hits.iter().all(|h| h.path.as_str().starts_with("visible/")));
+
+        let hits = r
+            .search_pages_with_meta("needle".into(), 10, None, Some(f.bob))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 10);
+        assert!(hits.iter().all(|h| h.project_name == "personal"));
+
+        let hits = r.recent_pages_global(10, Some(f.bob)).await.unwrap();
+        assert_eq!(hits.len(), 10);
+        assert!(hits.iter().all(|h| h.project_name == "personal"));
+    }
+
     #[tokio::test]
     async fn the_listing_shows_names_and_only_what_is_in_force() {
         let f = fixture().await;

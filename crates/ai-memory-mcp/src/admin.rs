@@ -1467,7 +1467,7 @@ async fn handle_search(
                 })),
             );
         }
-        _ => state.reader.search_pages(query.q, limit).await,
+        _ => state.reader.search_pages(query.q, limit, OPERATOR).await,
     };
     match search_result {
         Ok(hits) => (
@@ -1726,6 +1726,8 @@ async fn lookup_ws_no_create(
 fn scope_err(err: ScopeResolutionError) -> (StatusCode, Json<serde_json::Value>) {
     let status = if err.is_bad_request() {
         StatusCode::BAD_REQUEST
+    } else if err.is_forbidden() {
+        StatusCode::FORBIDDEN
     } else if err.is_not_found() {
         StatusCode::NOT_FOUND
     } else {
