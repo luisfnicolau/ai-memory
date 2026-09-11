@@ -1192,4 +1192,177 @@ mod tests {
         assert_eq!(listing[0].workspace, "elsewhere");
         assert_eq!(listing[0].repository, "client-renamed");
     }
+
+    /// Both forms of "may read" are built from one SQL template, but they
+    /// reach it by different routes — bound parameters and spliced literals —
+    /// and a quoting or numbering slip in either would silently widen or
+    /// narrow one set of surfaces. This runs both against the same data.
+    #[tokio::test]
+    async fn the_spliced_predicate_and_the_bound_filter_admit_the_same_repositories() {
+        let f = fixture().await;
+        let w = &f.store.writer;
+        let global = crate::create_global_scope(w).await.unwrap();
+        w.grant_memory(f.alice, f.client, GrantRole::Reader, None)
+            .await
+            .unwrap();
+        w.grant_memory(f.bob, f.personal, GrantRole::Writer, None)
+            .await
+            .unwrap();
+        w.revoke_memory(f.bob, f.personal, None).await.unwrap();
+
+        let conn = Connection::open(f.store.db_path()).unwrap();
+        let ids = |sql: String, binds: Vec<rusqlite::types::Value>| -> Vec<ProjectId> {
+            let mut stmt = conn.prepare(&sql).unwrap();
+            let mut out: Vec<ProjectId> = stmt
+                .query_map(rusqlite::params_from_iter(binds.iter()), |row| {
+                    row.get::<_, Vec<u8>>(0)
+                })
+                .unwrap()
+                .map(|id| ProjectId::from_slice(&id.unwrap()).unwrap())
+                .collect();
+            out.sort_by_key(|id| *id.as_bytes());
+            out
+        };
+        let sorted = |mut v: Vec<ProjectId>| {
+            v.sort_by_key(|id| *id.as_bytes());
+            v
+        };
+        for (viewer, expected) in [
+            (f.alice, sorted(vec![f.client, global.project_id])),
+            // bob's only grant was revoked: the shared scope is all that is left.
+            (f.bob, vec![global.project_id]),
+        ] {
+            let (bound, binds) =
+                crate::reader::readable_repository_filter("projects.id", Some(viewer), 1);
+            let spliced = crate::reader::readable_repository_predicate("projects.id", Some(viewer));
+            let via_binds = ids(format!("SELECT id FROM projects WHERE 1 = 1{bound}"), binds);
+            let via_splice = ids(
+                format!("SELECT id FROM projects WHERE 1 = 1{spliced}"),
+                Vec::new(),
+            );
+            assert_eq!(via_binds, expected, "bound filter");
+            assert_eq!(via_splice, via_binds, "the two forms disagree");
+        }
+        assert!(
+            crate::reader::readable_repository_predicate("projects.id", None).is_empty(),
+            "no viewer must leave the query exactly as it was"
+        );
+    }
+
+    fn unowned_handoff(
+        workspace_id: ai_memory_core::WorkspaceId,
+        project_id: ProjectId,
+        summary: &str,
+    ) -> ai_memory_core::NewHandoff {
+        ai_memory_core::NewHandoff {
+            workspace_id,
+            project_id,
+            from_session_id: None,
+            from_agent: ai_memory_core::AgentKind::ClaudeCode,
+            to_agent: None,
+            cwd: None,
+            summary: summary.into(),
+            open_questions: Vec::new(),
+            next_steps: Vec::new(),
+            files_touched: Vec::new(),
+            owner_user: None,
+        }
+    }
+
+    /// An unowned handoff is visible to everyone who can see its repository —
+    /// which is exactly why it must not reach someone who cannot. The query
+    /// keeps its `LIMIT 1`, so a newer handoff in a hidden repository must not
+    /// shadow an older one the viewer is entitled to either.
+    #[tokio::test]
+    async fn the_workspace_handoff_comes_only_from_readable_repositories() {
+        let f = fixture().await;
+        let w = &f.store.writer;
+        w.grant_memory(f.alice, f.client, GrantRole::Reader, None)
+            .await
+            .unwrap();
+        w.grant_memory(f.bob, f.personal, GrantRole::Reader, None)
+            .await
+            .unwrap();
+        w.insert_handoff(unowned_handoff(f.ws, f.personal, "bob's older baton"))
+            .await
+            .unwrap();
+        w.insert_handoff(unowned_handoff(f.ws, f.client, "alice's client baton"))
+            .await
+            .unwrap();
+        let latest = |viewer| {
+            let reader = f.store.reader.clone();
+            let ws = f.ws;
+            async move {
+                reader
+                    .latest_open_handoff_for_workspace(ws, ai_memory_core::OwnerFilter::Any, viewer)
+                    .await
+                    .unwrap()
+                    .map(|h| h.content.summary)
+            }
+        };
+        assert_eq!(
+            latest(Some(f.alice)).await.as_deref(),
+            Some("alice's client baton")
+        );
+        assert_eq!(
+            latest(Some(f.bob)).await.as_deref(),
+            Some("bob's older baton"),
+            "the newer, hidden handoff shadowed the one bob may read"
+        );
+        assert_eq!(
+            latest(None).await.as_deref(),
+            Some("alice's client baton"),
+            "authorization off is unchanged"
+        );
+    }
+
+    /// Health's duplicate list compares titles through an inner query. If only
+    /// the outer query were filtered, a hidden page sharing a title would still
+    /// make the visible one show up as a duplicate — confirming, by its
+    /// presence, a page the viewer cannot see.
+    #[tokio::test]
+    async fn a_hidden_page_does_not_make_a_visible_one_a_duplicate() {
+        let f = fixture().await;
+        f.store
+            .writer
+            .grant_memory(f.alice, f.client, GrantRole::Reader, None)
+            .await
+            .unwrap();
+        for repo in [f.client, f.personal] {
+            f.store
+                .writer
+                .upsert_page(ai_memory_core::NewPage {
+                    workspace_id: f.ws,
+                    project_id: repo,
+                    path: ai_memory_core::PagePath::new("notes/plan.md").unwrap(),
+                    title: "Plan".into(),
+                    body: "same title in two repositories".into(),
+                    tier: ai_memory_core::Tier::Semantic,
+                    frontmatter_json: serde_json::json!({}),
+                    pinned: false,
+                    links: Vec::new(),
+                    author_id: None,
+                    expires_at: None,
+                    entities: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+        let r = &f.store.reader;
+        let (_, dups, _) = r
+            .memory_health_for_workspace(f.ws, Some(f.alice))
+            .await
+            .unwrap();
+        assert_eq!(dups, 0, "alice's count includes a page she cannot see");
+        let detail = r
+            .health_detail_for_workspace(f.ws, 10, Some(f.alice))
+            .await
+            .unwrap();
+        assert!(detail.duplicates.is_empty(), "{:?}", detail.duplicates);
+
+        let (_, dups, _) = r.memory_health_for_workspace(f.ws, None).await.unwrap();
+        assert_eq!(dups, 1, "authorization off still sees the pair");
+        let detail = r.health_detail_for_workspace(f.ws, 10, None).await.unwrap();
+        assert_eq!(detail.duplicates.len(), 2);
+    }
 }

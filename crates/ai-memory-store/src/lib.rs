@@ -1920,7 +1920,7 @@ mod tests {
         store.writer.upsert_page(dep).await.unwrap();
 
         // Graph: exactly one resolved cross-project edge, app -> infra.
-        let edges = store.reader.cross_project_edges(None).await.unwrap();
+        let edges = store.reader.cross_project_edges(None, None).await.unwrap();
         assert_eq!(edges.len(), 1, "one resolved cross-project edge");
         assert_eq!(edges[0].from_project, "app");
         assert_eq!(edges[0].to_project, "infra");
@@ -4304,7 +4304,7 @@ mod tests {
             .await
             .unwrap();
 
-        let summaries = store.reader.list_projects_with_stats().await.unwrap();
+        let summaries = store.reader.list_projects_with_stats(None).await.unwrap();
         assert_eq!(summaries.len(), 1);
         let s = &summaries[0];
         assert_eq!(s.workspace_name, "default");
@@ -4440,7 +4440,7 @@ mod tests {
         assert_briefing_kinds(
             &store
                 .reader
-                .briefing_for_workspace(ws, 100, ai_memory_core::OwnerFilter::Any)
+                .briefing_for_workspace(ws, 100, ai_memory_core::OwnerFilter::Any, None)
                 .await
                 .unwrap()
                 .recent_pages,
@@ -4494,13 +4494,13 @@ mod tests {
 
         let source_links = store
             .reader
-            .page_links(ws, proj, "notes/source.md".into())
+            .page_links(ws, proj, "notes/source.md".into(), None)
             .await
             .unwrap();
         assert_eq!(source_links.links[0].kind, "session");
         let target_links = store
             .reader
-            .page_links(ws, proj, "sessions/session.md".into())
+            .page_links(ws, proj, "sessions/session.md".into(), None)
             .await
             .unwrap();
         assert_eq!(target_links.backlinks[0].kind, "note");

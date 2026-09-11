@@ -101,10 +101,13 @@ fn with_no_store(resp: Response) -> Response {
     resp
 }
 
-async fn workspaces_handler(State(state): State<Arc<WebState>>) -> Result<Response, Response> {
+async fn workspaces_handler(
+    State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
+) -> Result<Response, Response> {
     let workspaces = state
         .reader
-        .list_workspaces_with_stats()
+        .list_workspaces_with_stats(viewer_of(viewer))
         .await
         .map_err(internal_error)?;
     Ok(with_cache(
@@ -117,11 +120,15 @@ async fn workspaces_handler(State(state): State<Arc<WebState>>) -> Result<Respon
 /// in different projects, each carrying both endpoints' workspace/project/
 /// path. The UI builds nodes from the endpoints (and may aggregate to a
 /// project-level dependency graph). Global for now; project scoping is a
-/// follow-up query param.
-async fn graph_handler(State(state): State<Arc<WebState>>) -> Result<Response, Response> {
+/// follow-up query param. With authorization on, only edges whose both ends
+/// the viewer may read (#708).
+async fn graph_handler(
+    State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
+) -> Result<Response, Response> {
     let edges = state
         .reader
-        .cross_project_edges(None)
+        .cross_project_edges(None, viewer_of(viewer))
         .await
         .map_err(internal_error)?;
     Ok(with_cache(
@@ -132,8 +139,10 @@ async fn graph_handler(State(state): State<Arc<WebState>>) -> Result<Response, R
 
 async fn projects_handler(
     State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     Query(query): Query<ProjectListQuery>,
 ) -> Result<Response, Response> {
+    let viewer = viewer_of(viewer);
     let workspace = query
         .workspace
         .as_deref()
@@ -142,10 +151,10 @@ async fn projects_handler(
     let projects = if let Some(workspace) = workspace {
         state
             .reader
-            .list_projects_with_stats_for_workspace(workspace.to_owned())
+            .list_projects_with_stats_for_workspace(workspace.to_owned(), viewer)
             .await
     } else {
-        state.reader.list_projects_with_stats().await
+        state.reader.list_projects_with_stats(viewer).await
     }
     .map_err(internal_error)?;
     Ok(with_cache(
@@ -241,7 +250,12 @@ async fn page_handler(
 
     let links = state
         .reader
-        .page_links(meta.workspace_id, meta.project_id, meta.path.clone())
+        .page_links(
+            meta.workspace_id,
+            meta.project_id,
+            meta.path.clone(),
+            viewer_of(viewer),
+        )
         .await
         .map_err(internal_error)?;
 
@@ -483,16 +497,39 @@ async fn briefing_handler(
 
 async fn overview_handler(
     State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Path(workspace): Path<String>,
     Query(query): Query<LimitQuery>,
 ) -> Result<Response, Response> {
+    let viewer = viewer_of(viewer);
     let workspace_id = state
         .reader
         .find_workspace(workspace.clone())
         .await
         .map_err(internal_error)?
         .ok_or_else(|| not_found(format!("workspace '{workspace}' not found")))?;
+
+    // Every aggregate below is narrowed to the repositories the viewer may
+    // read (#708). A workspace holding none of them is refused rather than
+    // answered with an overview of zeros: an empty result would read as
+    // "nothing is happening here", which is the one thing authorization must
+    // never look like. The name was typed by the caller, so saying it exists
+    // tells them nothing the project routes would not.
+    if viewer.is_some()
+        && state
+            .reader
+            .list_projects_with_stats_for_workspace(workspace.clone(), viewer)
+            .await
+            .map_err(internal_error)?
+            .is_empty()
+    {
+        return Err(scope_error_response(ScopeResolutionError::NotAuthorized {
+            repository: workspace,
+            held: None,
+            required: ai_memory_auth::GrantRole::Reader,
+        }));
+    }
 
     // Scoped to the requesting actor, like the briefing below and like
     // `project_overview_handler`: an identified caller sees their own baton plus
@@ -505,7 +542,7 @@ async fn overview_handler(
     let owner_filter = owner_filter_for(actor);
     let handoff = match state
         .reader
-        .latest_open_handoff_for_workspace(workspace_id, owner_filter.clone())
+        .latest_open_handoff_for_workspace(workspace_id, owner_filter.clone(), viewer)
         .await
         .map_err(internal_error)?
     {
@@ -530,18 +567,23 @@ async fn overview_handler(
 
     let briefing = state
         .reader
-        .briefing_for_workspace(workspace_id, query.limit.clamp(1, 100), owner_filter)
+        .briefing_for_workspace(
+            workspace_id,
+            query.limit.clamp(1, 100),
+            owner_filter,
+            viewer,
+        )
         .await
         .map_err(internal_error)?;
 
     let (stale, duplicates, orphans) = state
         .reader
-        .memory_health_for_workspace(workspace_id)
+        .memory_health_for_workspace(workspace_id, viewer)
         .await
         .map_err(internal_error)?;
     let detail = state
         .reader
-        .health_detail_for_workspace(workspace_id, query.limit.clamp(1, 100))
+        .health_detail_for_workspace(workspace_id, query.limit.clamp(1, 100), viewer)
         .await
         .map_err(internal_error)?;
     let health = ApiHealth {

@@ -76,7 +76,7 @@ fn now_us() -> i64 {
 /// Filtering afterwards hands a user three results out of ten because seven
 /// were somebody else's: search that quietly gets worse, and a count that
 /// tells them how much is being hidden.
-fn readable_repository_filter(
+pub(crate) fn readable_repository_filter(
     project_column: &str,
     viewer: Option<UserId>,
     first_param: usize,
@@ -85,14 +85,11 @@ fn readable_repository_filter(
         return (String::new(), Vec::new());
     };
     let (user, workspace, project) = (first_param, first_param + 1, first_param + 2);
-    // Aliased so the subqueries cannot bind to a `projects` / `workspaces`
-    // already joined by the query this is appended to.
-    let fragment = format!(
-        " AND ({project_column} IN (SELECT mg.repository_id FROM memory_grant mg \
-                                    WHERE mg.user_id = ?{user} AND mg.revoked_at IS NULL) \
-               OR {project_column} IN (SELECT gp.id FROM projects gp \
-                                       JOIN workspaces gw ON gw.id = gp.workspace_id \
-                                       WHERE gw.name = ?{workspace} AND gp.name = ?{project}))"
+    let fragment = readable_repository_sql(
+        project_column,
+        &format!("?{user}"),
+        &format!("?{workspace}"),
+        &format!("?{project}"),
     );
     let bound = vec![
         Value::Blob(viewer.as_bytes().to_vec()),
@@ -100,6 +97,67 @@ fn readable_repository_filter(
         Value::Text(ai_memory_core::GLOBAL_SCOPE_PROJECT.to_owned()),
     ];
     (fragment, bound)
+}
+
+/// [`readable_repository_filter`] with its three values written into the SQL
+/// instead of bound.
+///
+/// For statements that cannot take extra parameters without renumbering the
+/// ones they already have: the workspace briefing alone runs a dozen, mixing
+/// numbered and anonymous placeholders, and threading three more binds through
+/// each would rewrite upstream SQL for no gain in safety. Splicing a fragment
+/// in, the way [`not_expired`] already is, leaves them untouched.
+///
+/// Nothing here comes from a caller. The user id is a 16-byte UUID the store
+/// generated, rendered as a hex blob literal, and the other two values are
+/// compile-time constants, quoted defensively all the same. Both helpers build
+/// from [`readable_repository_sql`], so they cannot disagree about who may
+/// read what.
+///
+/// The cost is one distinct SQL string per user, so a `prepare_cached`
+/// statement using this caches one entry per viewer. The cache is a bounded
+/// LRU and the callers are operator views, not the per-call agent path; a hot
+/// query should take [`readable_repository_filter`] instead.
+pub(crate) fn readable_repository_predicate(
+    project_column: &str,
+    viewer: Option<UserId>,
+) -> String {
+    let Some(viewer) = viewer else {
+        return String::new();
+    };
+    let hex: String = viewer
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let text = |value: &str| format!("'{}'", value.replace('\'', "''"));
+    readable_repository_sql(
+        project_column,
+        &format!("X'{hex}'"),
+        &text(ai_memory_core::DEFAULT_WORKSPACE_NAME),
+        &text(ai_memory_core::GLOBAL_SCOPE_PROJECT),
+    )
+}
+
+/// The one definition of "a repository this user may read", as SQL.
+///
+/// Callers supply how the user id and the global scope's workspace and project
+/// names are referenced — placeholders or literals — and nothing else.
+fn readable_repository_sql(
+    project_column: &str,
+    user: &str,
+    workspace: &str,
+    project: &str,
+) -> String {
+    // Aliased so the subqueries cannot bind to a `projects` / `workspaces`
+    // already joined by the query this is appended to.
+    format!(
+        " AND ({project_column} IN (SELECT mg.repository_id FROM memory_grant mg \
+                                    WHERE mg.user_id = {user} AND mg.revoked_at IS NULL) \
+               OR {project_column} IN (SELECT gp.id FROM projects gp \
+                                       JOIN workspaces gw ON gw.id = gp.workspace_id \
+                                       WHERE gw.name = {workspace} AND gp.name = {project}))"
+    )
 }
 
 fn page_kind_expr(path_column: &str, frontmatter_column: &str) -> String {
@@ -1640,6 +1698,49 @@ impl ReaderPool {
         })
         .await
         .map_err(|e| StoreError::PoolPanic(e.to_string()))?
+    }
+
+    /// The repository a managed run belongs to, or `None` when no such run
+    /// exists.
+    ///
+    /// The workstream routes take a run id in the URL rather than a
+    /// workspace/project pair, so they never pass through scope resolution and
+    /// the grant check with it. This is what they authorize against.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn managed_run_scope(
+        &self,
+        run_id: ai_memory_core::ManagedRunId,
+    ) -> StoreResult<Option<(WorkspaceId, ProjectId)>> {
+        self.with_conn(move |conn| {
+            scope_row(
+                conn,
+                "SELECT w.workspace_id, w.project_id FROM managed_runs r \
+                 JOIN workstreams w ON w.id = r.workstream_id WHERE r.id = ?1",
+                run_id.as_bytes(),
+            )
+        })
+        .await
+    }
+
+    /// The repository a workstream belongs to, or `None` when it does not
+    /// exist. See [`Self::managed_run_scope`] for why the routes need it.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn workstream_scope(
+        &self,
+        workstream_id: ai_memory_core::WorkstreamId,
+    ) -> StoreResult<Option<(WorkspaceId, ProjectId)>> {
+        self.with_conn(move |conn| {
+            scope_row(
+                conn,
+                "SELECT workspace_id, project_id FROM workstreams WHERE id = ?1",
+                workstream_id.as_bytes(),
+            )
+        })
+        .await
     }
 
     /// Return the current state of one `ai-memory run` invocation.
@@ -5794,13 +5895,22 @@ impl ReaderPool {
     /// Return the latest open handoff for the workspace, aggregating
     /// across all of its projects (no project filter).
     ///
+    /// `viewer` confines "all of its projects" to those that user may read. A
+    /// handoff with no owner is visible to everyone who can see its
+    /// repository, which is exactly why it must not be visible to someone who
+    /// cannot: its summary, next steps and project name are the repository's
+    /// content. Filtered in SQL for the same reason as the owner predicate —
+    /// the query keeps its `LIMIT 1`.
+    ///
     /// # Errors
     /// Propagates any SQL or pool error.
     pub async fn latest_open_handoff_for_workspace(
         &self,
         workspace_id: WorkspaceId,
         owner_filter: OwnerFilter,
+        viewer: Option<UserId>,
     ) -> StoreResult<Option<Handoff>> {
+        let visible = readable_repository_predicate("project_id", viewer);
         self.with_conn(move |conn| {
             // The owner predicate is pushed into SQL (rather than filtered after
             // the fact like the project-scoped lookup) because this query keeps
@@ -5818,7 +5928,7 @@ impl ReaderPool {
                         created_at, accepted_by, accepted_at, accepted_by_session, \
                         owner_user, accepted_by_user \
                  FROM handoffs \
-                 WHERE workspace_id = ?1 AND state = 'open'{owner_clause} \
+                 WHERE workspace_id = ?1 AND state = 'open'{owner_clause}{visible} \
                  ORDER BY created_at DESC LIMIT 1"
             );
             let row_opt = match &owner_filter {
@@ -5890,6 +6000,12 @@ impl ReaderPool {
     /// Mirrors [`ReaderPool::briefing_for_project`] but scopes every query
     /// to the workspace only (no `project_id` filter).
     ///
+    /// `viewer` narrows "all projects" to the ones that user may read (#708):
+    /// every count, window, rule, slot and recent page below is taken over
+    /// those alone, so an aggregate cannot be used to learn how much is
+    /// happening in repositories they cannot open. `None` aggregates the whole
+    /// workspace, as before.
+    ///
     /// # Errors
     /// Propagates any SQL or pool error.
     pub async fn briefing_for_workspace(
@@ -5897,27 +6013,34 @@ impl ReaderPool {
         workspace_id: WorkspaceId,
         recent_pages_limit: usize,
         owner_filter: OwnerFilter,
+        viewer: Option<UserId>,
     ) -> StoreResult<BriefingSnapshot> {
         self.briefing_for_workspace_with_slot_visibility(
             workspace_id,
             recent_pages_limit,
             owner_filter,
             &ai_memory_core::SlotVisibility::All,
+            viewer,
         )
         .await
     }
 
     /// Assemble a workspace briefing while filtering operator-owned slots.
+    /// `viewer` as for [`Self::briefing_for_workspace`].
     pub async fn briefing_for_workspace_with_slot_visibility(
         &self,
         workspace_id: WorkspaceId,
         recent_pages_limit: usize,
         owner_filter: OwnerFilter,
         slot_visibility: &ai_memory_core::SlotVisibility,
+        viewer: Option<UserId>,
     ) -> StoreResult<BriefingSnapshot> {
         let recent_limit = recent_pages_limit.clamp(1, 100) as i64;
         let slot_visibility = slot_visibility.clone();
         let (recent_slot_sql, recent_glob) = slot_exclusion_sql(&slot_visibility, 4);
+        // Spliced rather than bound: this function runs a dozen statements
+        // with their own parameter numbering. See `readable_repository_predicate`.
+        let visible = readable_repository_predicate("project_id", viewer);
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("path", "frontmatter_json");
             let now_us = jiff::Timestamp::now().as_microsecond();
@@ -5928,32 +6051,38 @@ impl ReaderPool {
             let counts = StatusCounts {
                 pages_latest: count_workspace(
                     conn,
-                    "SELECT COUNT(*) FROM pages WHERE workspace_id = ?1 AND is_latest = 1",
+                    &format!(
+                        "SELECT COUNT(*) FROM pages WHERE workspace_id = ?1 AND is_latest = 1{visible}"
+                    ),
                     workspace_id,
                 )?,
                 pages_all: count_workspace(
                     conn,
-                    "SELECT COUNT(*) FROM pages WHERE workspace_id = ?1",
+                    &format!("SELECT COUNT(*) FROM pages WHERE workspace_id = ?1{visible}"),
                     workspace_id,
                 )?,
                 sessions: count_workspace(
                     conn,
-                    "SELECT COUNT(*) FROM sessions WHERE workspace_id = ?1",
+                    &format!("SELECT COUNT(*) FROM sessions WHERE workspace_id = ?1{visible}"),
                     workspace_id,
                 )?,
                 observations: count_workspace(
                     conn,
-                    "SELECT COUNT(*) FROM observations WHERE workspace_id = ?1",
+                    &format!("SELECT COUNT(*) FROM observations WHERE workspace_id = ?1{visible}"),
                     workspace_id,
                 )?,
             };
 
-            let activity_7d = window_activity_workspace(conn, 7, cutoff_7d, workspace_id)?;
-            let activity_30d = window_activity_workspace(conn, 30, cutoff_30d, workspace_id)?;
+            let activity_7d =
+                window_activity_workspace(conn, 7, cutoff_7d, workspace_id, &visible)?;
+            let activity_30d =
+                window_activity_workspace(conn, 30, cutoff_30d, workspace_id, &visible)?;
 
             let last_observation_at: Option<i64> = conn
                 .query_row(
-                    "SELECT MAX(created_at) FROM observations WHERE workspace_id = ?1",
+                    &format!(
+                        "SELECT MAX(created_at) FROM observations WHERE workspace_id = ?1{visible}"
+                    ),
                     params![workspace_id.as_bytes()],
                     |row| row.get::<_, Option<i64>>(0),
                 )
@@ -5972,7 +6101,7 @@ impl ReaderPool {
                 conn,
                 &format!(
                     "SELECT COUNT(*) FROM handoffs \
-                     WHERE workspace_id = ?1 AND state = 'open'{owner_clause}"
+                     WHERE workspace_id = ?1 AND state = 'open'{owner_clause}{visible}"
                 ),
                 &owner_binds,
             )?;
@@ -5981,7 +6110,7 @@ impl ReaderPool {
                 "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
-                  WHERE workspace_id = ?1 AND is_latest = 1 AND path GLOB '_rules/*'{not_expired} \
+                  WHERE workspace_id = ?1 AND is_latest = 1 AND path GLOB '_rules/*'{not_expired}{visible} \
                   ORDER BY updated_at DESC",
                 not_expired = not_expired("pages", "?2"),
             ))?;
@@ -5998,7 +6127,7 @@ impl ReaderPool {
                 "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
-                  WHERE workspace_id = ?1 AND is_latest = 1 AND path GLOB '_slots/*'{not_expired} \
+                  WHERE workspace_id = ?1 AND is_latest = 1 AND path GLOB '_slots/*'{not_expired}{visible} \
                   ORDER BY path ASC",
                 not_expired = not_expired("pages", "?2"),
             ))?;
@@ -6015,7 +6144,7 @@ impl ReaderPool {
                 "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
-                 WHERE workspace_id = ?1 AND is_latest = 1 AND ({recent_slot_sql}){not_expired} \
+                 WHERE workspace_id = ?1 AND is_latest = 1 AND ({recent_slot_sql}){not_expired}{visible} \
                  ORDER BY updated_at DESC \
                  LIMIT ?2",
                 not_expired = not_expired("pages", "?3"),
@@ -6061,13 +6190,17 @@ impl ReaderPool {
     /// - `duplicates`: extra latest pages that share a title.
     /// - `orphans`: latest pages with no inbound or outbound links.
     ///
+    /// `viewer` counts only repositories that user may read; `None` counts
+    /// the whole workspace.
+    ///
     /// # Errors
     /// Propagates any SQL or pool error.
     pub async fn memory_health_for_workspace(
         &self,
         workspace_id: WorkspaceId,
+        viewer: Option<UserId>,
     ) -> StoreResult<(u64, u64, u64)> {
-        self.memory_health_scoped(workspace_id, None).await
+        self.memory_health_scoped(workspace_id, None, viewer).await
     }
 
     /// Per-project variant of [`ReaderPool::memory_health_for_workspace`]:
@@ -6080,7 +6213,8 @@ impl ReaderPool {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
     ) -> StoreResult<(u64, u64, u64)> {
-        self.memory_health_scoped(workspace_id, Some(project_id))
+        // A single project is already authorized by whoever resolved it.
+        self.memory_health_scoped(workspace_id, Some(project_id), None)
             .await
     }
 
@@ -6088,6 +6222,7 @@ impl ReaderPool {
         &self,
         workspace_id: WorkspaceId,
         project_id: Option<ProjectId>,
+        viewer: Option<UserId>,
     ) -> StoreResult<(u64, u64, u64)> {
         self.with_conn(move |conn| {
             let now_us = jiff::Timestamp::now().as_microsecond();
@@ -6095,17 +6230,27 @@ impl ReaderPool {
             let proj = project_id.map(|p| Value::Blob(p.as_bytes().to_vec()));
             let ws = || Value::Blob(workspace_id.as_bytes().to_vec());
             // Optional project filter, anonymous-`?` style. The orphan query
-            // aliases pages as `p`, so it needs its own qualified clause.
-            let clause = if proj.is_some() {
-                " AND project_id = ?"
-            } else {
-                ""
-            };
-            let clause_p = if proj.is_some() {
-                " AND p.project_id = ?"
-            } else {
-                ""
-            };
+            // aliases pages as `p`, so it needs its own qualified clause. The
+            // readable-repository predicate binds nothing, so it can follow
+            // either without disturbing the anonymous parameter order.
+            let clause = format!(
+                "{}{}",
+                if proj.is_some() {
+                    " AND project_id = ?"
+                } else {
+                    ""
+                },
+                readable_repository_predicate("project_id", viewer),
+            );
+            let clause_p = format!(
+                "{}{}",
+                if proj.is_some() {
+                    " AND p.project_id = ?"
+                } else {
+                    ""
+                },
+                readable_repository_predicate("p.project_id", viewer),
+            );
 
             let stale: i64 = conn
                 .query_row(
@@ -6165,7 +6310,8 @@ impl ReaderPool {
     /// Drill-down lists behind [`ReaderPool::memory_health_for_workspace`]'s
     /// counters: the actual stale / duplicate / orphan pages, each capped at
     /// `limit`. Definitions mirror the counters exactly so the lists explain
-    /// the headline numbers.
+    /// the headline numbers — including `viewer`, which lists only pages in
+    /// repositories that user may read, before the `LIMIT`.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -6173,8 +6319,10 @@ impl ReaderPool {
         &self,
         workspace_id: WorkspaceId,
         limit: usize,
+        viewer: Option<UserId>,
     ) -> StoreResult<HealthDetail> {
-        self.health_detail_scoped(workspace_id, None, limit).await
+        self.health_detail_scoped(workspace_id, None, limit, viewer)
+            .await
     }
 
     /// Per-project variant of [`ReaderPool::health_detail_for_workspace`].
@@ -6187,7 +6335,8 @@ impl ReaderPool {
         project_id: ProjectId,
         limit: usize,
     ) -> StoreResult<HealthDetail> {
-        self.health_detail_scoped(workspace_id, Some(project_id), limit)
+        // A single project is already authorized by whoever resolved it.
+        self.health_detail_scoped(workspace_id, Some(project_id), limit, None)
             .await
     }
 
@@ -6196,6 +6345,7 @@ impl ReaderPool {
         workspace_id: WorkspaceId,
         project_id: Option<ProjectId>,
         limit: usize,
+        viewer: Option<UserId>,
     ) -> StoreResult<HealthDetail> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         self.with_conn(move |conn| {
@@ -6203,16 +6353,27 @@ impl ReaderPool {
             let cutoff_30d = now_us - 30 * 86_400 * 1_000_000;
             let proj = project_id.map(|p| Value::Blob(p.as_bytes().to_vec()));
             let ws = || Value::Blob(workspace_id.as_bytes().to_vec());
-            let clause = if proj.is_some() {
-                " AND pg.project_id = ?"
-            } else {
-                ""
-            };
-            let inner_clause = if proj.is_some() {
-                " AND project_id = ?"
-            } else {
-                ""
-            };
+            // The duplicate list's inner query must see the same repositories
+            // as the outer one, or a hidden page sharing a title would still
+            // make a visible one show up as a duplicate.
+            let clause = format!(
+                "{}{}",
+                if proj.is_some() {
+                    " AND pg.project_id = ?"
+                } else {
+                    ""
+                },
+                readable_repository_predicate("pg.project_id", viewer),
+            );
+            let inner_clause = format!(
+                "{}{}",
+                if proj.is_some() {
+                    " AND project_id = ?"
+                } else {
+                    ""
+                },
+                readable_repository_predicate("project_id", viewer),
+            );
 
             // Shared SELECT prefix: identity + path-inferred `kind`.
             let kind_expr = page_kind_expr("pg.path", "pg.frontmatter_json");
@@ -6361,7 +6522,8 @@ impl ReaderPool {
     ///
     /// Both ends are constrained to `is_latest = 1`, so superseded versions
     /// never leak into the link panel. Returns empty lists when the page is
-    /// missing or has no links.
+    /// missing or has no links. `viewer` drops links whose far end is in a
+    /// repository that user may not read; `None` keeps them all.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -6370,6 +6532,7 @@ impl ReaderPool {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
         path: String,
+        viewer: Option<UserId>,
     ) -> StoreResult<PageLinks> {
         self.with_conn(move |conn| {
             let id_opt: Option<Vec<u8>> = conn
@@ -6389,6 +6552,10 @@ impl ReaderPool {
             // pages that link here. Both reuse the path-inference `kind`
             // fallback so untagged pages still classify.
             let kind_expr = page_kind_expr("pg.path", "pg.frontmatter_json");
+            // A link into a repository the viewer cannot read would show them
+            // its name and a page title and path inside it — the same leak as a
+            // graph edge — so the far end is filtered like one.
+            let visible = readable_repository_predicate("pg.project_id", viewer);
             let outgoing = format!(
                 "SELECT DISTINCT pg.path, pg.title, {kind_expr}, \
                             ws.name, pr.name \
@@ -6396,7 +6563,7 @@ impl ReaderPool {
                      JOIN pages pg ON pg.id = l.to_page_id \
                      JOIN projects pr ON pr.id = pg.project_id \
                      JOIN workspaces ws ON ws.id = pg.workspace_id \
-                     WHERE l.from_page_id = ?1 AND pg.is_latest = 1 \
+                     WHERE l.from_page_id = ?1 AND pg.is_latest = 1{visible} \
                      ORDER BY ws.name, pr.name, pg.path"
             );
             let incoming = format!(
@@ -6406,7 +6573,7 @@ impl ReaderPool {
                      JOIN pages pg ON pg.id = l.from_page_id \
                      JOIN projects pr ON pr.id = pg.project_id \
                      JOIN workspaces ws ON ws.id = pg.workspace_id \
-                     WHERE l.to_page_id = ?1 AND pg.is_latest = 1 \
+                     WHERE l.to_page_id = ?1 AND pg.is_latest = 1{visible} \
                      ORDER BY ws.name, pr.name, pg.path"
             );
 
@@ -6544,14 +6711,27 @@ impl ReaderPool {
     /// that project (as source or target) are returned; `None` returns the
     /// whole cross-project graph. Powers `/api/v1/graph`.
     ///
+    /// `viewer` keeps only edges whose *both* endpoints the user may read
+    /// (#708). One readable end is not enough: an edge carries the other end's
+    /// workspace, project and path, so a link from a page bob can read into a
+    /// repository he cannot would hand him the hidden repository's name and a
+    /// page path inside it. `None` returns the graph unfiltered.
+    ///
     /// # Errors
     /// Propagates any SQL or pool error.
     pub async fn cross_project_edges(
         &self,
         scope: Option<(WorkspaceId, ProjectId)>,
+        viewer: Option<UserId>,
     ) -> StoreResult<Vec<CrossProjectEdge>> {
         self.with_conn(move |conn| {
-            let base = "SELECT fw.name, fpr.name, fp.path, tw.name, tpr.name, tp.path \
+            let visible = format!(
+                "{}{}",
+                readable_repository_predicate("fp.project_id", viewer),
+                readable_repository_predicate("tp.project_id", viewer),
+            );
+            let base = format!(
+                "SELECT fw.name, fpr.name, fp.path, tw.name, tpr.name, tp.path \
                  FROM links l \
                  JOIN pages fp ON fp.id = l.from_page_id AND fp.is_latest = 1 \
                  JOIN pages tp ON tp.id = l.to_page_id AND tp.is_latest = 1 \
@@ -6559,7 +6739,8 @@ impl ReaderPool {
                  JOIN workspaces fw ON fw.id = fp.workspace_id \
                  JOIN projects tpr ON tpr.id = tp.project_id \
                  JOIN workspaces tw ON tw.id = tp.workspace_id \
-                 WHERE fp.project_id != tp.project_id";
+                 WHERE fp.project_id != tp.project_id{visible}"
+            );
             let map_row = |row: &rusqlite::Row<'_>| {
                 Ok(CrossProjectEdge {
                     from_workspace: row.get(0)?,
@@ -6595,34 +6776,46 @@ impl ReaderPool {
     /// Return one row per (workspace, project) with page-count and
     /// last-updated aggregates. Used by the web UI project-list view.
     ///
-    /// Only `is_latest = 1` pages are counted.
+    /// Only `is_latest = 1` pages are counted. `viewer` lists only the
+    /// repositories that user may read — see [`readable_repository_filter`];
+    /// `None` lists every one.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
-    pub async fn list_projects_with_stats(&self) -> StoreResult<Vec<ProjectSummary>> {
-        self.list_projects_with_stats_filtered(None).await
+    pub async fn list_projects_with_stats(
+        &self,
+        viewer: Option<UserId>,
+    ) -> StoreResult<Vec<ProjectSummary>> {
+        self.list_projects_with_stats_filtered(None, viewer).await
     }
 
     /// Return one row per project within one workspace.
     ///
-    /// Only `is_latest = 1` pages are counted.
+    /// Only `is_latest = 1` pages are counted. `viewer` as for
+    /// [`Self::list_projects_with_stats`].
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
     pub async fn list_projects_with_stats_for_workspace(
         &self,
         workspace: String,
+        viewer: Option<UserId>,
     ) -> StoreResult<Vec<ProjectSummary>> {
-        self.list_projects_with_stats_filtered(Some(workspace))
+        self.list_projects_with_stats_filtered(Some(workspace), viewer)
             .await
     }
 
     async fn list_projects_with_stats_filtered(
         &self,
         workspace: Option<String>,
+        viewer: Option<UserId>,
     ) -> StoreResult<Vec<ProjectSummary>> {
         self.with_conn(move |conn| {
-            let mut stmt = conn.prepare(
+            // A repository's name is itself the leak here — client work from
+            // three organisations listed by name — so the filter is on the
+            // project row, not only on the pages counted beside it.
+            let visible = readable_repository_predicate("p.id", viewer);
+            let mut stmt = conn.prepare(&format!(
                 "SELECT w.name AS workspace_name, \
                         p.name AS project_name, \
                         COUNT(pg.id) AS page_count, \
@@ -6630,10 +6823,10 @@ impl ReaderPool {
                  FROM workspaces w \
                  JOIN projects p ON p.workspace_id = w.id \
                  LEFT JOIN pages pg ON pg.project_id = p.id AND pg.is_latest = 1 \
-                 WHERE (?1 IS NULL OR w.name = ?1) \
+                 WHERE (?1 IS NULL OR w.name = ?1){visible} \
                  GROUP BY w.id, p.id \
-                 ORDER BY last_updated_us DESC NULLS LAST",
-            )?;
+                 ORDER BY last_updated_us DESC NULLS LAST"
+            ))?;
             let rows = stmt.query_map(params![workspace], |row| {
                 let workspace_name: String = row.get(0)?;
                 let project_name: String = row.get(1)?;
@@ -6816,21 +7009,40 @@ impl ReaderPool {
     ///
     /// Only `is_latest = 1` pages are counted.
     ///
+    /// With a `viewer`, a workspace is listed only when it holds at least one
+    /// repository that user may read, and its counts cover only those. A
+    /// workspace name is often an organisation's name, so listing an empty
+    /// shell of somebody else's workspace would leak exactly what the project
+    /// filter hides. `None` lists every workspace, empty ones included, as
+    /// before.
+    ///
     /// # Errors
     /// Propagates any SQL or pool error.
-    pub async fn list_workspaces_with_stats(&self) -> StoreResult<Vec<WorkspaceSummary>> {
-        self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
+    pub async fn list_workspaces_with_stats(
+        &self,
+        viewer: Option<UserId>,
+    ) -> StoreResult<Vec<WorkspaceSummary>> {
+        self.with_conn(move |conn| {
+            // In the join, not the WHERE: unreadable projects drop out of the
+            // counts while the LEFT JOIN still yields the workspace row, and
+            // the HAVING then removes workspaces left with nothing readable.
+            let visible = readable_repository_predicate("p.id", viewer);
+            let only_readable = if viewer.is_some() {
+                " HAVING COUNT(DISTINCT p.id) > 0"
+            } else {
+                ""
+            };
+            let mut stmt = conn.prepare(&format!(
                 "SELECT w.name AS workspace_name, \
                         COUNT(DISTINCT p.id) AS project_count, \
                         COUNT(pg.id) AS page_count, \
                         MAX(pg.updated_at) AS last_updated_us \
                  FROM workspaces w \
-                 LEFT JOIN projects p ON p.workspace_id = w.id \
+                 LEFT JOIN projects p ON p.workspace_id = w.id{visible} \
                  LEFT JOIN pages pg ON pg.project_id = p.id AND pg.is_latest = 1 \
-                 GROUP BY w.id \
-                 ORDER BY w.name ASC",
-            )?;
+                 GROUP BY w.id{only_readable} \
+                 ORDER BY w.name ASC"
+            ))?;
             let rows = stmt.query_map([], |row| {
                 let workspace_name: String = row.get(0)?;
                 let project_count: i64 = row.get(1)?;
@@ -9159,6 +9371,26 @@ fn cross_project_degree(
     ))
 }
 
+/// Run a one-row `SELECT workspace_id, project_id ... WHERE id = ?1` lookup.
+fn scope_row(
+    conn: &Connection,
+    sql: &str,
+    id: &[u8; 16],
+) -> StoreResult<Option<(WorkspaceId, ProjectId)>> {
+    let row = conn
+        .query_row(sql, params![id], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
+        .optional()?;
+    match row {
+        Some((ws, proj)) => Ok(Some((
+            WorkspaceId::from_slice(&ws)?,
+            ProjectId::from_slice(&proj)?,
+        ))),
+        None => Ok(None),
+    }
+}
+
 fn count_workspace(conn: &Connection, sql: &str, workspace_id: WorkspaceId) -> StoreResult<u64> {
     let n: Option<i64> = conn
         .query_row(sql, params![workspace_id.as_bytes()], |row| row.get(0))
@@ -9224,11 +9456,14 @@ fn window_activity_project(
     })
 }
 
+/// `visible` is a [`readable_repository_predicate`] over `project_id`, or
+/// empty; every table counted here carries that column.
 fn window_activity_workspace(
     conn: &Connection,
     days: u32,
     cutoff_us: i64,
     workspace_id: WorkspaceId,
+    visible: &str,
 ) -> StoreResult<ActivityWindow> {
     let count_since = |sql: &str| -> StoreResult<u64> {
         let n: Option<i64> = conn
@@ -9240,15 +9475,16 @@ fn window_activity_workspace(
     };
     Ok(ActivityWindow {
         days,
-        sessions: count_since(
-            "SELECT COUNT(*) FROM sessions WHERE workspace_id = ?1 AND started_at > ?2",
-        )?,
-        observations: count_since(
-            "SELECT COUNT(*) FROM observations WHERE workspace_id = ?1 AND created_at > ?2",
-        )?,
-        pages_updated: count_since(
-            "SELECT COUNT(*) FROM pages WHERE workspace_id = ?1 AND is_latest = 1 AND updated_at > ?2",
-        )?,
+        sessions: count_since(&format!(
+            "SELECT COUNT(*) FROM sessions WHERE workspace_id = ?1 AND started_at > ?2{visible}"
+        ))?,
+        observations: count_since(&format!(
+            "SELECT COUNT(*) FROM observations WHERE workspace_id = ?1 AND created_at > ?2{visible}"
+        ))?,
+        pages_updated: count_since(&format!(
+            "SELECT COUNT(*) FROM pages WHERE workspace_id = ?1 AND is_latest = 1 \
+             AND updated_at > ?2{visible}"
+        ))?,
     })
 }
 

@@ -3282,3 +3282,225 @@ async fn web_reads_honour_grants_once_authorization_is_on() {
         );
     }
 }
+
+/// #708, second half on the web: bob can no longer read or search alice's
+/// repositories, but every listing, the graph, the workspace overview and a
+/// page's link panel still told him they existed and roughly what was in
+/// them — repository names, workspace names that are organisation names, page
+/// titles and paths. Each surface now shows only what the viewer may read,
+/// with the shared global scope visible to all and nothing filtered when
+/// authorization is off.
+#[tokio::test]
+async fn metadata_shows_only_what_the_viewer_may_read() {
+    use ai_memory_auth::GrantRole;
+    use ai_memory_core::{AuthorizedViewer, NewUser, UserId, UserRole};
+
+    let (_tmp, store, wiki) = setup().await;
+    let w = &store.writer;
+    let acme = w.get_or_create_workspace("acme").await.unwrap();
+    let shared = w.get_or_create_workspace("shared").await.unwrap();
+    let default = w.get_or_create_workspace("default").await.unwrap();
+    let client = w
+        .get_or_create_project(acme, "client-work", None)
+        .await
+        .unwrap();
+    let alpha = w
+        .get_or_create_project(shared, "alpha", None)
+        .await
+        .unwrap();
+    let beta = w.get_or_create_project(shared, "beta", None).await.unwrap();
+    let global = w
+        .get_or_create_project(default, ai_memory_core::GLOBAL_SCOPE_PROJECT, None)
+        .await
+        .unwrap();
+    for (ws, proj, path, body) in [
+        (
+            acme,
+            client,
+            "secrets/rates.md",
+            "# Rates\n\nDay rate is confidential.",
+        ),
+        (
+            shared,
+            alpha,
+            "notes/alpha-plan.md",
+            "# Alpha plan\n\nAlice's side.",
+        ),
+        // Written after its target so the cross-repository link resolves:
+        // this is the edge bob must not see from alpha's side, nor alice from
+        // beta's.
+        (
+            shared,
+            beta,
+            "notes/beta-plan.md",
+            "# Beta plan\n\nDepends on [[shared/alpha:notes/alpha-plan]].",
+        ),
+        (
+            default,
+            global,
+            "_rules/house-style.md",
+            "# House style\n\nShared by all.",
+        ),
+    ] {
+        wiki.write_page(wiki_req(ws, proj, path, body))
+            .await
+            .unwrap();
+    }
+
+    let human = |name: &'static str| {
+        let writer = store.writer.clone();
+        async move {
+            writer
+                .create_human_user(
+                    NewUser {
+                        username: name.into(),
+                        name: None,
+                        email: None,
+                    },
+                    UserRole::User,
+                    None,
+                    false,
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let alice = human("alice").await;
+    let bob = human("bob").await;
+    let carol = human("carol").await;
+    for (user, repo) in [
+        (alice, client),
+        (alice, alpha),
+        (bob, beta),
+        (carol, alpha),
+        (carol, beta),
+    ] {
+        w.grant_memory(user, repo, GrantRole::Reader, None)
+            .await
+            .unwrap();
+    }
+
+    let api = api_router(store.reader.clone(), wiki.clone());
+    let web = router(store.reader.clone(), wiki.clone());
+    let get = |app: axum::Router, uri: &'static str, viewer: Option<UserId>| async move {
+        let mut req = Request::builder().uri(uri);
+        if let Some(viewer) = viewer {
+            req = req.extension(AuthorizedViewer(viewer));
+        }
+        let resp = app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    };
+    let shows = |body: &str, needle: &str| body.contains(needle);
+
+    // Workspaces: a workspace is listed only if it holds something readable.
+    // `acme` is an organisation's name; bob holds nothing in it.
+    let (_, body) = get(api.clone(), "/workspaces", Some(bob)).await;
+    assert!(!shows(&body, "\"acme\""), "bob sees acme: {body}");
+    assert!(shows(&body, "\"shared\""), "{body}");
+    assert!(
+        shows(&body, "\"default\""),
+        "the global scope stays visible: {body}"
+    );
+    let (_, body) = get(api.clone(), "/workspaces", Some(alice)).await;
+    assert!(
+        shows(&body, "\"acme\"") && shows(&body, "\"shared\""),
+        "{body}"
+    );
+    let (_, body) = get(api.clone(), "/workspaces", None).await;
+    assert!(
+        shows(&body, "\"acme\""),
+        "authorization off lists all: {body}"
+    );
+
+    // Project listings: the API, the API narrowed to a workspace, and the
+    // wiki's front page.
+    for (app, uri) in [(&api, "/projects"), (&web, "/")] {
+        let (status, body) = get(app.clone(), uri, Some(bob)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(shows(&body, "beta"), "{uri}: {body}");
+        assert!(
+            shows(&body, "_global"),
+            "{uri}: global stays visible: {body}"
+        );
+        assert!(
+            !shows(&body, "client-work"),
+            "{uri} leaked client-work: {body}"
+        );
+        assert!(!shows(&body, "alpha"), "{uri} leaked alpha: {body}");
+
+        let (_, body) = get(app.clone(), uri, None).await;
+        assert!(
+            shows(&body, "client-work") && shows(&body, "alpha") && shows(&body, "beta"),
+            "{uri} with authorization off: {body}"
+        );
+    }
+    let (_, body) = get(api.clone(), "/projects?workspace=acme", Some(bob)).await;
+    assert_eq!(body.trim(), "[]", "bob sees acme's projects: {body}");
+
+    // The graph: an edge needs BOTH ends readable. Alice reads alpha only and
+    // bob reads beta only, so neither sees beta -> alpha; carol reads both.
+    for viewer in [Some(alice), Some(bob)] {
+        let (_, body) = get(api.clone(), "/graph", viewer).await;
+        assert!(
+            !shows(&body, "alpha-plan"),
+            "{viewer:?} sees the edge: {body}"
+        );
+        assert!(
+            !shows(&body, "beta-plan"),
+            "{viewer:?} sees the edge: {body}"
+        );
+    }
+    for viewer in [Some(carol), None] {
+        let (_, body) = get(api.clone(), "/graph", viewer).await;
+        assert!(
+            shows(&body, "beta-plan") && shows(&body, "alpha-plan"),
+            "{viewer:?} lost the edge: {body}"
+        );
+    }
+
+    // A page's link panel is the same edge seen from one page. The panel,
+    // not the body: beta's own text names the link, and that text is bob's to
+    // read. What must not appear is the resolved far end — alpha's title,
+    // path and repository.
+    let beta_page = "/workspaces/shared/projects/beta/pages/notes/beta-plan.md";
+    let links = |body: &str| {
+        let page: serde_json::Value = serde_json::from_str(body).unwrap();
+        page["links"].to_string()
+    };
+    let (status, body) = get(api.clone(), beta_page, Some(bob)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(links(&body), "[]", "bob's link panel leaked alpha: {body}");
+    let (_, body) = get(api.clone(), beta_page, Some(carol)).await;
+    assert!(
+        links(&body).contains("alpha-plan"),
+        "carol lost a link she can read: {body}"
+    );
+
+    // Workspace overview. In `shared` bob sees beta and never alpha — titles,
+    // paths and the health lists alike.
+    let (status, body) = get(api.clone(), "/workspaces/shared/overview", Some(bob)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(shows(&body, "beta-plan"), "{body}");
+    assert!(
+        !shows(&body, "alpha-plan"),
+        "bob's overview leaked alpha: {body}"
+    );
+    let (_, body) = get(api.clone(), "/workspaces/shared/overview", None).await;
+    assert!(
+        shows(&body, "beta-plan") && shows(&body, "alpha-plan"),
+        "authorization off: {body}"
+    );
+    // A workspace holding nothing he may read is refused, not answered with an
+    // overview of zeros that would read as "nothing is happening here".
+    let (status, body) = get(api.clone(), "/workspaces/acme/overview", Some(bob)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(shows(&body, "not authorized for acme"), "{body}");
+    assert!(!shows(&body, "rates"), "{body}");
+    let (status, body) = get(api.clone(), "/workspaces/acme/overview", Some(alice)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(shows(&body, "secrets/rates.md"), "{body}");
+}

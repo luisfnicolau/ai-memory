@@ -2687,6 +2687,38 @@ impl AiMemoryServer {
         let session_id = SessionId::from_str(&args.session_id)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let dry = args.dry_run.unwrap_or(false);
+        // A session id reaches a repository without naming it, so it never
+        // passes through scope resolution and the grant check that comes with
+        // it (#708). Authorize the repository the page would land in — the
+        // consolidator's own target, not a guess — before anything runs,
+        // dry runs included: a dry run reports the resolved path and the
+        // admission verdict, which is itself information about that
+        // repository. Writing a page needs `writer`.
+        if let Some(viewer) = Self::viewer_from_parts(Some(&parts))
+            && let Some((workspace_id, project_id)) = consolidator
+                .session_target(session_id)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?
+        {
+            let label = self
+                .reader
+                .project_name_by_id(workspace_id, project_id)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                .unwrap_or_else(|| "the session's project".to_owned());
+            ai_memory_store::authorize_scope(
+                &self.reader,
+                ai_memory_store::ResolvedScope {
+                    workspace_id,
+                    project_id,
+                },
+                Some(viewer),
+                ai_memory_auth::GrantRole::Writer,
+                &label,
+            )
+            .await
+            .map_err(Self::scope_error)?;
+        }
         // Carry the request's authenticated identity into the write so the
         // consolidated page is attributed to the real operator and any
         // admission webhook authorizes by that actor (rather than the previous
@@ -11702,6 +11734,143 @@ mod tests {
             .unwrap();
         store.writer.end_session(session_id, None).await.unwrap();
         session_id
+    }
+
+    /// A session id reaches a repository without naming it, so
+    /// `memory_consolidate` used to write into whichever project a session
+    /// landed in, for anyone holding the id (#708). Bob consolidating alice's
+    /// session is refused before the LLM or the admission chain runs — the
+    /// stub panics if it is called — and a dry run is refused too, because it
+    /// reports the resolved path and admission verdict of her repository.
+    #[tokio::test]
+    async fn bob_cannot_consolidate_a_session_in_alices_repository() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let alices = store
+            .writer
+            .get_or_create_project(ws, "alice-client-work", None)
+            .await
+            .unwrap();
+        let session = seed_short_completed_session(&store, ws, alices).await;
+        let human = |name: &'static str| {
+            let writer = store.writer.clone();
+            async move {
+                writer
+                    .create_human_user(
+                        NewUser {
+                            username: name.into(),
+                            name: None,
+                            email: None,
+                        },
+                        ai_memory_core::UserRole::User,
+                        None,
+                        false,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let alice = human("alice").await;
+        let bob = human("bob").await;
+        // Bob holds reader on alice's repository: enough to read it, not to
+        // have a page written into it on his behalf.
+        store
+            .writer
+            .grant_memory(alice, alices, ai_memory_auth::GrantRole::Writer, None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .grant_memory(bob, alices, ai_memory_auth::GrantRole::Reader, None)
+            .await
+            .unwrap();
+
+        let llm: Arc<dyn LlmProvider> = Arc::new(PreflightMustNotCallLlm);
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            ws,
+            alices,
+        ));
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, alices)
+            .with_consolidator_arc(wiki, llm, consolidator);
+        let consolidate = |viewer: Option<ai_memory_core::UserId>, id: SessionId, dry: bool| {
+            let server = &server;
+            async move {
+                let mut parts = test_parts_default();
+                if let Some(viewer) = viewer {
+                    parts.extensions.insert(AuthLevel::User);
+                    parts.extensions.insert(viewer);
+                    parts
+                        .extensions
+                        .insert(ai_memory_core::AuthorizedViewer(viewer));
+                }
+                server
+                    .memory_consolidate(
+                        Parameters(ConsolidateArgs {
+                            session_id: id.to_string(),
+                            dry_run: Some(dry),
+                            multi_page: None,
+                            instructions: None,
+                        }),
+                        OptionalParts(parts),
+                    )
+                    .await
+            }
+        };
+
+        for dry in [true, false] {
+            let err = consolidate(Some(bob), session, dry)
+                .await
+                .expect_err("bob holds only reader on alice's repository");
+            let message = err.message.to_string();
+            assert!(
+                message.contains("not authorized for alice-client-work"),
+                "dry={dry}: {message}"
+            );
+            assert!(
+                message.contains("writer"),
+                "names the level needed: {message}"
+            );
+        }
+        let page = format!("sessions/{session}.md");
+        assert!(
+            store
+                .reader
+                .page_meta("default", "alice-client-work", &page)
+                .await
+                .unwrap()
+                .is_none(),
+            "a refused consolidation wrote nothing"
+        );
+
+        // Alice, and an install with authorization off, get the plan.
+        for viewer in [Some(alice), None] {
+            let plan = call_tool_json(consolidate(viewer, session, true).await.unwrap());
+            assert_eq!(plan["dry_run"], true, "{viewer:?}");
+            assert_eq!(plan["path"], page, "{viewer:?}");
+        }
+
+        // An id that matches nothing is still reported as the consolidator
+        // reports it — not as a refusal on the server's default project.
+        let err = consolidate(Some(bob), SessionId::new(), true)
+            .await
+            .expect_err("no such session");
+        assert!(
+            !err.message.contains("not authorized"),
+            "an unknown session read as a refusal: {}",
+            err.message
+        );
     }
 
     #[tokio::test]

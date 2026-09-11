@@ -555,6 +555,19 @@ pub async fn get_handoff(
             return None;
         }
     };
+    if resp.status() == reqwest::StatusCode::FORBIDDEN {
+        // Not authorized for this repository (#708). Same reasoning as the
+        // transport warning above: silence here would read as "nothing was
+        // handed off", when the truth is "you cannot see what was". The body
+        // is the server's reason and goes to stderr, never into context.
+        let reason = resp.text().await.unwrap_or_default();
+        eprintln!(
+            "ai-memory hook warning: not authorized for this project's memory ({}); \
+             nothing was injected",
+            reason.trim()
+        );
+        return None;
+    }
     if !resp.status().is_success() {
         return None;
     }
@@ -677,6 +690,19 @@ mod tests {
         let url = serve_once("202 Accepted", "queued").await;
         let outcome = post_hook(&build_client(), &url, "{}", None, Duration::from_secs(1)).await;
         assert_eq!(outcome, PostOutcome::Delivered);
+    }
+
+    #[tokio::test]
+    async fn get_handoff_never_injects_a_refusal() {
+        // A 403 carries the server's reason (#708). It is reported on stderr
+        // and must not reach the agent as context.
+        let url = serve_once(
+            "403 Forbidden",
+            "not authorized for scratch. This is an access problem, not an empty memory",
+        )
+        .await;
+        let got = get_handoff(&build_client(), &url, None, Duration::from_secs(1)).await;
+        assert!(got.is_none(), "a refusal must not become context");
     }
 
     #[tokio::test]

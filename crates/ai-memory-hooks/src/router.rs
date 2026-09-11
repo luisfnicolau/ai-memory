@@ -1223,17 +1223,25 @@ async fn handle_handoff(
     Query(query): Query<HandoffQuery>,
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
     level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    viewer_ext: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let actor = actor_identity(actor_ext);
     let skip_webhooks = admission_skips(level_ext, &headers);
-    match fetch_and_accept_handoff(&state, query, actor, skip_webhooks).await {
+    let viewer = viewer_ext.map(|axum::Extension(viewer)| viewer.user());
+    match fetch_and_accept_handoff(&state, query, actor, skip_webhooks, viewer).await {
         Ok(Some(markdown)) => (StatusCode::OK, markdown),
         Ok(None) => (StatusCode::OK, String::new()),
-        Err(e) => {
-            warn!(error = %e, "handoff fetch failed");
-            (StatusCode::OK, String::new())
-        }
+        // A refusal is the one failure that must not look like "no handoff":
+        // it is a 403 carrying the reason, which the hook client reports on
+        // stderr and never injects as context (#708).
+        Err(e) => match e.downcast_ref::<ai_memory_store::ScopeResolutionError>() {
+            Some(refusal) if refusal.is_forbidden() => (StatusCode::FORBIDDEN, refusal.to_string()),
+            _ => {
+                warn!(error = %e, "handoff fetch failed");
+                (StatusCode::OK, String::new())
+            }
+        },
     }
 }
 
@@ -1242,6 +1250,7 @@ async fn fetch_and_accept_handoff(
     query: HandoffQuery,
     actor: Option<IdentityKey>,
     skip_webhooks: Vec<String>,
+    viewer: Option<ai_memory_core::UserId>,
 ) -> anyhow::Result<Option<String>> {
     let agent = query.agent.as_deref().map_or(AgentKind::Other, parse_agent);
     // A managed run's ledger is additive, not a replacement. Returning it here
@@ -1251,7 +1260,7 @@ async fn fetch_and_accept_handoff(
     // too. The brief already reaches the managed path (it is recomposed per
     // session, so resolving it twice was harmless); the handoff is single-use
     // and had no second chance.
-    let managed = fetch_managed_context(state, &query, agent).await?;
+    let managed = fetch_managed_context(state, &query, agent, viewer).await?;
     // Keep the active-project key compatible with MCP transports: the native
     // session id is carried separately below to bind a destructive handoff
     // claim to its exact receiver.
@@ -1265,6 +1274,18 @@ async fn fetch_and_accept_handoff(
         query.workspace.as_deref(),
         query.project.as_deref(),
         ProjectStrategy::parse(query.project_strategy.as_deref()),
+    )
+    .await?;
+    // Everything below returns this repository's content — its handoff and
+    // its pinned, rules and slot pages — and claims its handoff, all keyed
+    // only on a project the caller named or a directory they are in (#708).
+    // Checked before the active-project pointer is published, so a refused
+    // repository does not become the caller's default for later calls.
+    crate::grants::authorize_resolved(
+        &state.reader,
+        Some((ws, proj)),
+        viewer,
+        ai_memory_auth::GrantRole::Reader,
     )
     .await?;
     // Session-start handoff delivery is a foreground action. Publish it so
@@ -1426,6 +1447,7 @@ async fn fetch_managed_context(
     state: &HookState,
     query: &HandoffQuery,
     agent: AgentKind,
+    viewer: Option<ai_memory_core::UserId>,
 ) -> anyhow::Result<Option<PendingManagedContext>> {
     let Some(raw_run_id) = query.managed_run.as_deref() else {
         return Ok(None);
@@ -1434,6 +1456,18 @@ async fn fetch_managed_context(
         warn!(managed_run = %raw_run_id, "invalid managed run id on SessionStart");
         return Ok(None);
     };
+    // The run id reaches a workstream's event ledger without naming its
+    // repository; the same rule as the `/workstream/runs/*` routes applies.
+    if viewer.is_some() {
+        let scope = state.reader.managed_run_scope(run_id).await?;
+        crate::grants::authorize_resolved(
+            &state.reader,
+            scope,
+            viewer,
+            ai_memory_auth::GrantRole::Writer,
+        )
+        .await?;
+    }
     if let Some(native_session_id) = query
         .session_id
         .as_deref()
@@ -8448,6 +8482,7 @@ mod tests {
                     ..ai_memory_core::ActorContext::default()
                 })),
                 Some(axum::Extension(ai_memory_core::AuthLevel::User)),
+                None,
                 HeaderMap::new(),
             )
             .await,
@@ -8970,6 +9005,113 @@ mod tests {
         );
     }
 
+    /// Session start returns a repository's handoff and pinned pages, and
+    /// claims the handoff, keyed only on a project the caller named or a
+    /// directory they are in (#708). Bob, holding nothing on it, gets a 403
+    /// with the reason — never the handoff, never an empty 200 that the hook
+    /// would read as "nothing was left for you" — and the baton stays open for
+    /// someone who may take it.
+    #[tokio::test]
+    async fn session_start_delivers_nothing_from_a_repository_the_viewer_cannot_read() {
+        use ai_memory_core::{AuthorizedViewer, NewUser, UserRole};
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        state
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                from_session_id: None,
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: None,
+                summary: "HANDOFF-MARKER".to_string(),
+                open_questions: Vec::new(),
+                next_steps: Vec::new(),
+                files_touched: Vec::new(),
+                owner_user: None,
+            })
+            .await
+            .unwrap();
+        let human = |name: &'static str| {
+            let writer = state.writer.clone();
+            async move {
+                writer
+                    .create_human_user(
+                        NewUser {
+                            username: name.into(),
+                            name: None,
+                            email: None,
+                        },
+                        UserRole::User,
+                        None,
+                        false,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let alice = human("alice").await;
+        let bob = human("bob").await;
+        state
+            .writer
+            .grant_memory(
+                alice,
+                state.project_id,
+                ai_memory_auth::GrantRole::Reader,
+                None,
+            )
+            .await
+            .unwrap();
+        let query = || HandoffQuery {
+            agent: Some("claude-code".into()),
+            cwd: Some(cwd.clone()),
+            workspace: Some("default".into()),
+            project: Some("scratch".into()),
+            project_strategy: None,
+            briefing: Some("1".into()),
+            briefing_budget: None,
+            managed_run: None,
+            session_id: None,
+        };
+        let state = Arc::new(state);
+        let session_start = |viewer: Option<ai_memory_core::UserId>| {
+            let state = state.clone();
+            let query = query();
+            async move {
+                read_handoff_response(
+                    handle_handoff(
+                        State(state),
+                        Query(query),
+                        None,
+                        None,
+                        viewer.map(|user| axum::Extension(AuthorizedViewer(user))),
+                        HeaderMap::new(),
+                    )
+                    .await,
+                )
+                .await
+            }
+        };
+
+        let (status, body) = session_start(Some(bob)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.contains("not authorized for scratch"), "{body}");
+        assert!(
+            !body.contains("HANDOFF-MARKER"),
+            "leaked the handoff: {body}"
+        );
+        assert!(
+            open_handoff_exists(&state).await,
+            "a refused session must not consume somebody else's baton",
+        );
+
+        let (status, body) = session_start(Some(alice)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("HANDOFF-MARKER"), "{body}");
+    }
+
     /// The session-start claim is destructive (a handoff is single-use), so a
     /// refused or unreachable `handoff_accept` webhook must leave the baton
     /// open for the next session instead of failing the endpoint — and the
@@ -9022,6 +9164,7 @@ mod tests {
                 Query(query()),
                 None,
                 None,
+                None,
                 HeaderMap::new(),
             )
             .await,
@@ -9048,6 +9191,7 @@ mod tests {
                 Query(query()),
                 None,
                 Some(axum::Extension(ai_memory_core::AuthLevel::Root)),
+                None,
                 headers,
             )
             .await,
@@ -9186,6 +9330,7 @@ mod tests {
                     managed_run: None,
                     session_id: None,
                 }),
+                None,
                 None,
                 None,
                 HeaderMap::new(),
@@ -10002,6 +10147,7 @@ mod tests {
             },
             None,
             Vec::new(),
+            None,
         )
         .await
         .unwrap();
@@ -10072,6 +10218,7 @@ mod tests {
             },
             None,
             Vec::new(),
+            None,
         )
         .await
         .unwrap()
@@ -10137,7 +10284,7 @@ mod tests {
             session_id: Some(session_id.into()),
         };
         let empty_sid = "empty-native-session";
-        let rendered = fetch_and_accept_handoff(&state, query(empty_sid), None, Vec::new())
+        let rendered = fetch_and_accept_handoff(&state, query(empty_sid), None, Vec::new(), None)
             .await
             .unwrap()
             .unwrap();
@@ -10178,11 +10325,16 @@ mod tests {
         assert!(reopened.lifecycle.accepted_by.is_none());
         assert!(reopened.lifecycle.accepted_at.is_none());
         assert!(reopened.lifecycle.accepted_by_session.is_none());
-        let next =
-            fetch_and_accept_handoff(&state, query("next-substantive-session"), None, Vec::new())
-                .await
-                .unwrap()
-                .unwrap();
+        let next = fetch_and_accept_handoff(
+            &state,
+            query("next-substantive-session"),
+            None,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(next.contains("REAL-WORK-MARKER"));
     }
 
@@ -10268,7 +10420,7 @@ mod tests {
             managed_run: Some(run.run_id.to_string()),
             session_id: Some("native-2".into()),
         };
-        let rendered = fetch_and_accept_handoff(&state, query.clone(), None, Vec::new())
+        let rendered = fetch_and_accept_handoff(&state, query.clone(), None, Vec::new(), None)
             .await
             .unwrap();
 
@@ -10296,7 +10448,7 @@ mod tests {
             "a handoff delivered on a managed SessionStart must be marked accepted"
         );
         assert!(
-            fetch_and_accept_handoff(&state, query, None, Vec::new())
+            fetch_and_accept_handoff(&state, query, None, Vec::new(), None)
                 .await
                 .unwrap()
                 .is_none(),
@@ -10379,11 +10531,16 @@ mod tests {
             ..ai_memory_core::ActorContext::default()
         };
         for viewer in [ai_memory_core::ActorContext::anonymous(), named] {
-            let rendered =
-                fetch_and_accept_handoff(&state, query.clone(), viewer.identity_key(), Vec::new())
-                    .await
-                    .unwrap()
-                    .expect("the brief must be injected");
+            let rendered = fetch_and_accept_handoff(
+                &state,
+                query.clone(),
+                viewer.identity_key(),
+                Vec::new(),
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("the brief must be injected");
             assert!(
                 rendered.contains("the backend runs behind a queue"),
                 "a pre-existing nested slot must survive the upgrade for {viewer:?}: {rendered}"
@@ -10445,10 +10602,11 @@ mod tests {
             session_id: None,
         };
 
-        let rendered = fetch_and_accept_handoff(&state, query, carol.identity_key(), Vec::new())
-            .await
-            .unwrap()
-            .expect("the brief must be injected");
+        let rendered =
+            fetch_and_accept_handoff(&state, query, carol.identity_key(), Vec::new(), None)
+                .await
+                .unwrap()
+                .expect("the brief must be injected");
         assert!(rendered.contains("SHARED-CONTEXT"), "{rendered}");
         assert!(
             rendered.contains("CAROL-SECRET"),
@@ -10505,19 +10663,21 @@ mod tests {
         };
 
         // Non-truthy opt-in: no handoff pending, nothing to inject.
-        let rendered = fetch_and_accept_handoff(&state, query(Some("false")), None, Vec::new())
-            .await
-            .unwrap();
+        let rendered =
+            fetch_and_accept_handoff(&state, query(Some("false")), None, Vec::new(), None)
+                .await
+                .unwrap();
         assert!(
             rendered.is_none(),
             "non-truthy briefing flag must not inject anything"
         );
 
         // Truthy opt-in, no pending handoff: brief alone (the /clear case).
-        let rendered = fetch_and_accept_handoff(&state, query(Some("true")), None, Vec::new())
-            .await
-            .unwrap()
-            .expect("brief must be injected without a pending handoff");
+        let rendered =
+            fetch_and_accept_handoff(&state, query(Some("true")), None, Vec::new(), None)
+                .await
+                .unwrap()
+                .expect("brief must be injected without a pending handoff");
         assert!(
             rendered.contains("project brief") && rendered.contains("single writer actor"),
             "brief must carry the rules page body: {rendered}"
@@ -10551,10 +10711,11 @@ mod tests {
             })
             .await
             .unwrap();
-        let rendered = fetch_and_accept_handoff(&state, query(Some("true")), None, Vec::new())
-            .await
-            .unwrap()
-            .expect("handoff + brief must both be injected");
+        let rendered =
+            fetch_and_accept_handoff(&state, query(Some("true")), None, Vec::new(), None)
+                .await
+                .unwrap()
+                .expect("handoff + brief must both be injected");
         let handoff_pos = rendered.find("resume the auth refactor").unwrap();
         let brief_pos = rendered.find("project brief").unwrap();
         assert!(
@@ -10647,10 +10808,11 @@ mod tests {
             session_id: Some("kimi-session".into()),
         };
 
-        let rendered = fetch_and_accept_handoff(&state, query(Some("true")), None, Vec::new())
-            .await
-            .unwrap()
-            .expect("managed delta and brief must be injected");
+        let rendered =
+            fetch_and_accept_handoff(&state, query(Some("true")), None, Vec::new(), None)
+                .await
+                .unwrap()
+                .expect("managed delta and brief must be injected");
         let delta_pos = rendered.find("portable managed delta sentinel").unwrap();
         let brief_pos = rendered.find("managed briefing sentinel").unwrap();
         assert!(
@@ -10658,7 +10820,7 @@ mod tests {
             "managed delta must precede the project brief: {rendered}"
         );
 
-        let rendered = fetch_and_accept_handoff(&state, query(None), None, Vec::new())
+        let rendered = fetch_and_accept_handoff(&state, query(None), None, Vec::new(), None)
             .await
             .unwrap();
         assert!(
@@ -10666,10 +10828,11 @@ mod tests {
             "delivered managed context must not repeat without a new briefing request"
         );
 
-        let rendered = fetch_and_accept_handoff(&state, query(Some("true")), None, Vec::new())
-            .await
-            .unwrap()
-            .expect("an explicit later briefing request must still render the project brief");
+        let rendered =
+            fetch_and_accept_handoff(&state, query(Some("true")), None, Vec::new(), None)
+                .await
+                .unwrap()
+                .expect("an explicit later briefing request must still render the project brief");
         assert!(rendered.contains("managed briefing sentinel"));
         assert!(!rendered.contains("portable managed delta sentinel"));
     }
@@ -10858,6 +11021,7 @@ mod tests {
             },
             None,
             Vec::new(),
+            None,
         )
         .await
         .unwrap();

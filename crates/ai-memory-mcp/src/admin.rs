@@ -1126,7 +1126,7 @@ pub struct WikiFormatStatus {
 /// chain, such as an offline `--data-dir` purge or a direct DB edit) and can
 /// be pruned so the copy reflects the live server.
 async fn handle_list_projects(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
-    match state.reader.list_projects_with_stats().await {
+    match state.reader.list_projects_with_stats(OPERATOR).await {
         Ok(projects) => (
             StatusCode::OK,
             Json(serde_json::json!({ "projects": projects })),
@@ -3383,7 +3383,7 @@ async fn handle_embed(
 
             let summaries = state
                 .reader
-                .list_projects_with_stats()
+                .list_projects_with_stats(OPERATOR)
                 .await
                 .map_err(|e| internal_err(e.to_string()))?;
             for summary in summaries
@@ -4361,7 +4361,7 @@ async fn delete_workspace_core(
     if !force {
         match state
             .reader
-            .list_projects_with_stats_for_workspace(workspace.to_string())
+            .list_projects_with_stats_for_workspace(workspace.to_string(), OPERATOR)
             .await
         {
             Ok(projects) if !projects.is_empty() => {
@@ -6508,7 +6508,7 @@ async fn handle_merge_workspace(
 
     let projects = match state
         .reader
-        .list_projects_with_stats_for_workspace(req.from.clone())
+        .list_projects_with_stats_for_workspace(req.from.clone(), OPERATOR)
         .await
     {
         Ok(p) => p,
