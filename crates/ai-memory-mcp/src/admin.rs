@@ -1723,6 +1723,42 @@ async fn lookup_ws_no_create(
         .map_err(scope_err)
 }
 
+/// Refuse a destructive operation while grants are in force under `scope`,
+/// unless the operator asked for them to be revoked (#708).
+///
+/// The store runs the same check inside the delete's transaction, which is
+/// the guarantee. This one exists to refuse *before* anything irreversible or
+/// visible happens — an admission webhook, a checkpoint, or, for a merging
+/// move, copying every page into the destination — so a refusal leaves no
+/// trace. With `revoke_grants` it passes and the store does the revoking.
+async fn refuse_if_grants_in_force(
+    state: &AdminState,
+    scope: ai_memory_store::GrantScope,
+    label: &str,
+    revoke_grants: bool,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if revoke_grants {
+        return Ok(());
+    }
+    let holders = state
+        .reader
+        .active_grants_under(scope)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    if holders.is_empty() {
+        return Ok(());
+    }
+    let refusal = StoreError::ActiveGrants {
+        scope: label.to_owned(),
+        count: holders.len(),
+        holders: holders.join(", "),
+    };
+    Err((
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({ "error": refusal.to_string() })),
+    ))
+}
+
 fn scope_err(err: ScopeResolutionError) -> (StatusCode, Json<serde_json::Value>) {
     let status = if err.is_bad_request() {
         StatusCode::BAD_REQUEST
@@ -3784,6 +3820,14 @@ struct PurgeProjectRequest {
     /// out from under a running agent, which then cannot save its history.
     #[serde(default)]
     force: bool,
+    /// Revoke the grants in force on the repositories this deletes, instead
+    /// of refusing (#708). Off by default: deleting a repository would take
+    /// that access away with no record of the decision. The revocations are
+    /// recorded, and the grant history outlives the repository either way.
+    /// Separate from `force` on purpose — getting past one guard must not
+    /// silently get past this one.
+    #[serde(default)]
+    revoke_grants: bool,
     /// Reclaim freed bytes: rebuild the FTS indexes and `VACUUM` after the
     /// delete commits. Off by default; see `ai_memory_store::Compaction` for
     /// the cost and for what it does not guarantee.
@@ -3810,6 +3854,8 @@ pub struct PurgeProjectReport {
     pub workstreams_deleted: u64,
     /// Number of `managed_runs` rows deleted via cascade.
     pub managed_runs_deleted: u64,
+    /// Grants revoked because `revoke_grants` was set. Revoked, not deleted.
+    pub grants_revoked: u64,
     /// Ids of the deleted workstreams whose `raw/workstreams/<id>/` segment
     /// directories were included in the post-commit cleanup.
     pub workstream_ids: Vec<String>,
@@ -3924,6 +3970,20 @@ async fn handle_purge_project(
 
     let label = format!("{}/{}", req.workspace, req.project);
 
+    // Checked here as well as in the store: the store's check is the
+    // transactional guarantee, this one refuses before an admission webhook
+    // or a checkpoint has run for a purge that is not going to happen.
+    if let Err(e) = refuse_if_grants_in_force(
+        &state,
+        ai_memory_store::GrantScope::Project(proj_id),
+        &label,
+        req.revoke_grants,
+    )
+    .await
+    {
+        return e;
+    }
+
     // Admission must run before any destructive work. A reject-policy webhook
     // is allowed to abort the purge while DB rows and files are still intact.
     // Seed names from the request so mirrors do not depend on DB lookup after
@@ -3963,10 +4023,25 @@ async fn handle_purge_project(
 
     let summary = match state
         .writer
-        .purge_project(ws_id, proj_id, &label, author_id, req.force, compaction)
+        .purge_project(
+            ws_id,
+            proj_id,
+            &label,
+            author_id,
+            req.force,
+            req.revoke_grants,
+            compaction,
+        )
         .await
     {
         Ok(s) => s,
+        // A grant granted between the pre-check and here. Same answer.
+        Err(e @ StoreError::ActiveGrants { .. }) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            );
+        }
         // A live managed run is a conflict, not a server fault: the operator
         // can finish the session or retry with `force`. Same status the
         // heartbeat itself returns when a lease is gone, so the two agree.
@@ -4018,6 +4093,7 @@ async fn handle_purge_project(
         embeddings_deleted: summary.embeddings_deleted,
         workstreams_deleted: summary.workstreams_deleted,
         managed_runs_deleted: summary.managed_runs_deleted,
+        grants_revoked: summary.grants_revoked,
         workstream_ids: summary.workstream_ids,
         compacted: summary.compacted,
         files_deleted,
@@ -4117,6 +4193,14 @@ struct DeleteWorkspaceRequest {
     /// non-empty workspace is refused so a typo can't wipe live data.
     #[serde(default)]
     force: bool,
+    /// Revoke the grants in force on the repositories this deletes, instead
+    /// of refusing (#708). Off by default: deleting a repository would take
+    /// that access away with no record of the decision. The revocations are
+    /// recorded, and the grant history outlives the repository either way.
+    /// Separate from `force` on purpose — getting past one guard must not
+    /// silently get past this one.
+    #[serde(default)]
+    revoke_grants: bool,
     /// Reclaim freed bytes: rebuild the FTS indexes and `VACUUM` after the
     /// delete commits. Off by default; see `ai_memory_store::Compaction` for
     /// the cost and for what it does not guarantee.
@@ -4137,6 +4221,8 @@ pub struct DeleteWorkspaceResult {
     pub workstreams_deleted: u64,
     /// `managed_runs` rows removed via cascade.
     pub managed_runs_deleted: u64,
+    /// Grants revoked because `revoke_grants` was set. Revoked, not deleted.
+    pub grants_revoked: u64,
     /// Ids of the deleted workstreams whose raw segment directories were
     /// included in the post-commit cleanup.
     pub workstream_ids: Vec<String>,
@@ -4218,8 +4304,10 @@ async fn handle_compact(
 async fn handle_delete_workspace(
     State(state): State<Arc<AdminState>>,
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    author_ext: Option<axum::Extension<ai_memory_core::UserId>>,
     Json(req): Json<DeleteWorkspaceRequest>,
 ) -> impl IntoResponse {
+    let author_id = author_ext.map(|axum::Extension(u)| u);
     let actor = actor_ext
         .map(|axum::Extension(a)| a)
         .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
@@ -4228,7 +4316,17 @@ async fn handle_delete_workspace(
     } else {
         ai_memory_store::Compaction::Skip
     };
-    match delete_workspace_core(&state, &req.workspace, req.force, actor, compaction).await {
+    match delete_workspace_core(
+        &state,
+        &req.workspace,
+        req.force,
+        req.revoke_grants,
+        author_id,
+        actor,
+        compaction,
+    )
+    .await
+    {
         Ok(result) => (
             StatusCode::OK,
             Json(serde_json::to_value(&result).unwrap_or(serde_json::Value::Null)),
@@ -4246,10 +4344,19 @@ async fn delete_workspace_core(
     state: &Arc<AdminState>,
     workspace: &str,
     force: bool,
+    revoke_grants: bool,
+    author_id: Option<ai_memory_core::UserId>,
     actor: ai_memory_core::ActorContext,
     compaction: ai_memory_store::Compaction,
 ) -> Result<DeleteWorkspaceResult, MoveErr> {
     let ws_id = lookup_ws_no_create(state, workspace).await?;
+    refuse_if_grants_in_force(
+        state,
+        ai_memory_store::GrantScope::Workspace(ws_id),
+        &format!("workspace {workspace}"),
+        revoke_grants,
+    )
+    .await?;
 
     if !force {
         match state
@@ -4291,13 +4398,15 @@ async fn delete_workspace_core(
 
     let summary = match state
         .writer
-        .delete_workspace(ws_id, force, compaction)
+        .delete_workspace(ws_id, force, revoke_grants, author_id, compaction)
         .await
     {
         Ok(s) => s,
         Err(e) => {
             let status = match &e {
-                StoreError::WorkspaceNotEmpty(_) => StatusCode::CONFLICT,
+                StoreError::WorkspaceNotEmpty(_) | StoreError::ActiveGrants { .. } => {
+                    StatusCode::CONFLICT
+                }
                 StoreError::NotFound(_) => StatusCode::NOT_FOUND,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             };
@@ -4342,6 +4451,7 @@ async fn delete_workspace_core(
         pages_deleted: summary.pages_deleted,
         workstreams_deleted: summary.workstreams_deleted,
         managed_runs_deleted: summary.managed_runs_deleted,
+        grants_revoked: summary.grants_revoked,
         workstream_ids: summary.workstream_ids,
         compacted: summary.compacted,
         files_deleted,
@@ -4492,6 +4602,14 @@ struct MoveProjectRequest {
     /// (no copy). Default `block` — the safe choice for a destructive op.
     #[serde(default)]
     on_conflict: OnConflict,
+    /// Revoke the grants in force on the source repository when this move
+    /// has to purge it (the copy-purge merge into an existing destination
+    /// project), instead of refusing (#708). Ignored by a true move, which
+    /// keeps the project id — grants follow the content there. Grants never
+    /// follow a merge: the destination holds other content, and carrying
+    /// somebody's access across would widen it to things nobody granted.
+    #[serde(default)]
+    revoke_grants: bool,
 }
 
 /// What to do when a merged page path collides with an existing destination
@@ -4933,6 +5051,21 @@ async fn move_project_core(
         Ok(None) => false,
         Err(e) => return Err(internal_err(e.to_string())),
     };
+
+    // A merge copies the source's pages into the destination and then purges
+    // the source, so it is a purge and gets the same grant check — here,
+    // before a single page is copied: refusing after the copy would leave the
+    // content duplicated in both places. A true move keeps the project id,
+    // and the grants move with it.
+    if merged_into_existing {
+        refuse_if_grants_in_force(
+            state,
+            ai_memory_store::GrantScope::Project(src_proj),
+            &format!("{}/{}", req.from_workspace, req.project),
+            req.revoke_grants,
+        )
+        .await?;
+    }
 
     let pre_checkpoint = checkpoint_or_500(
         &state.wiki,
@@ -6180,13 +6313,30 @@ async fn copy_purge_merge(
             src_ws,
             src_proj,
             &label,
+            // Also the revoker when `revoke_grants` acts, so on this path a
+            // revocation records no `users` row, as the audit author does not.
             None,
             false,
+            req.revoke_grants,
             ai_memory_store::Compaction::Skip,
         )
         .await
     {
         Ok(s) => s,
+        // Only reachable when a grant was issued between the pre-check and
+        // here; the pages are copied and the source is intact, as below.
+        Err(e @ StoreError::ActiveGrants { .. }) => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "pages were copied to {}/{}, but the source {label} could not \
+                         be purged: {e}. The source is intact.",
+                        req.to_workspace, req.project,
+                    )
+                })),
+            ));
+        }
         // A live managed run under the source always blocks the destructive
         // second leg. `force` only overrides the active-project guard; unlike
         // a true move, copy-purge would delete the lease and strand the raw
@@ -6301,6 +6451,9 @@ struct MergeWorkspaceRequest {
     /// ignore this.
     #[serde(default)]
     on_conflict: OnConflict,
+    /// Passed to every per-project move — see `MoveProjectRequest`.
+    #[serde(default)]
+    revoke_grants: bool,
 }
 
 /// Wire-format report returned by `POST /admin/merge-workspace`.
@@ -6375,6 +6528,7 @@ async fn handle_merge_workspace(
             confirm: true,
             force: req.force,
             on_conflict: req.on_conflict,
+            revoke_grants: req.revoke_grants,
         };
         match move_project_core(&state, &move_req, actor.clone()).await {
             Ok(report) => merged.push(report),
@@ -6408,6 +6562,11 @@ async fn handle_merge_workspace(
         &state,
         &req.from,
         false,
+        // Drained by this point: every project either moved with its id (and
+        // its grants), or went through a copy-purge that already applied the
+        // grant check. Nothing is left for this to revoke.
+        false,
+        None,
         actor,
         // The shell is empty by this point; there is nothing to reclaim.
         ai_memory_store::Compaction::Skip,
@@ -12009,6 +12168,222 @@ mod tests {
                 .any(|g| g["project"] == "client-work" && g["role"] == "admin"),
             "{json}"
         );
+    }
+
+    async fn write_fixture_page(router: &Router, workspace: &str, project: &str, path: &str) {
+        let (status, json) = admin_call(
+            router,
+            "POST",
+            "/admin/write-page",
+            "root-token",
+            Some(serde_json::json!({
+                "workspace": workspace,
+                "project": project,
+                "path": path,
+                "body": format!("lives in {workspace}/{project}"),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+    }
+
+    async fn grant_alice(router: &Router, workspace: &str, project: &str) {
+        let (status, json) = admin_call(
+            router,
+            "POST",
+            "/admin/grants",
+            "root-token",
+            Some(serde_json::json!({
+                "username": "alice",
+                "workspace": workspace,
+                "project": project,
+                "role": "writer",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+    }
+
+    #[tokio::test]
+    async fn purge_refuses_while_access_is_in_force_and_revokes_when_told_to() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+        let _ = post_create_user(
+            &router,
+            "root-token",
+            serde_json::json!({"username": "alice"}),
+        )
+        .await;
+        write_fixture_page(&router, "default", "client-work", "notes/a.md").await;
+        grant_alice(&router, "default", "client-work").await;
+
+        let purge = |revoke: bool| {
+            Some(serde_json::json!({
+                "workspace": "default",
+                "project": "client-work",
+                "confirm": true,
+                "revoke_grants": revoke,
+            }))
+        };
+        let (status, json) = admin_call(
+            &router,
+            "POST",
+            "/admin/purge-project",
+            "root-token",
+            purge(false),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{json}");
+        let error = json["error"].as_str().unwrap();
+        assert!(
+            error.contains("alice (writer) on default/client-work"),
+            "{error}"
+        );
+
+        // Refused before anything ran: the page is still readable.
+        let (status, _) = admin_call(
+            &router,
+            "GET",
+            "/admin/read-page?workspace=default&project=client-work&path=notes/a.md",
+            "root-token",
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a refused purge must leave the repository intact"
+        );
+
+        let (status, json) = admin_call(
+            &router,
+            "POST",
+            "/admin/purge-project",
+            "root-token",
+            purge(true),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["grants_revoked"], 1);
+        let (_, json) = admin_call(&router, "GET", "/admin/grants", "root-token", None).await;
+        assert_eq!(json["grants"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn a_merging_move_refuses_before_copying_anything_and_grants_do_not_follow() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+        let _ = post_create_user(
+            &router,
+            "root-token",
+            serde_json::json!({"username": "alice"}),
+        )
+        .await;
+        // Same project name in both workspaces: the move is a copy-then-purge
+        // merge, which destroys the source's project id.
+        write_fixture_page(&router, "team-a", "shared", "notes/from-a.md").await;
+        write_fixture_page(&router, "team-b", "shared", "notes/from-b.md").await;
+        grant_alice(&router, "team-a", "shared").await;
+
+        let mv = |revoke: bool| {
+            Some(serde_json::json!({
+                "from_workspace": "team-a",
+                "project": "shared",
+                "to_workspace": "team-b",
+                "confirm": true,
+                "revoke_grants": revoke,
+            }))
+        };
+        let (status, json) = admin_call(
+            &router,
+            "POST",
+            "/admin/move-project",
+            "root-token",
+            mv(false),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{json}");
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap()
+                .contains("alice (writer) on team-a/shared"),
+            "{json}"
+        );
+        // Refusing after the copy would leave the content in both places.
+        let (status, _) = admin_call(
+            &router,
+            "GET",
+            "/admin/read-page?workspace=team-b&project=shared&path=notes/from-a.md",
+            "root-token",
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "nothing may be copied before the refusal"
+        );
+
+        let (status, json) = admin_call(
+            &router,
+            "POST",
+            "/admin/move-project",
+            "root-token",
+            mv(true),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        // Alice held team-a/shared, not team-b/shared, and a merge must not
+        // hand her the destination's other content: no grant is in force.
+        let (_, json) = admin_call(&router, "GET", "/admin/grants", "root-token", None).await;
+        assert_eq!(json["grants"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn deleting_a_workspace_refuses_while_access_is_in_force() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+        let _ = post_create_user(
+            &router,
+            "root-token",
+            serde_json::json!({"username": "alice"}),
+        )
+        .await;
+        write_fixture_page(&router, "team-c", "api", "notes/x.md").await;
+        grant_alice(&router, "team-c", "api").await;
+
+        let delete = |revoke: bool| {
+            Some(serde_json::json!({
+                "workspace": "team-c",
+                "force": true,
+                "revoke_grants": revoke,
+            }))
+        };
+        let (status, json) = admin_call(
+            &router,
+            "POST",
+            "/admin/delete-workspace",
+            "root-token",
+            delete(false),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{json}");
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap()
+                .contains("alice (writer) on team-c/api"),
+            "{json}"
+        );
+
+        let (status, json) = admin_call(
+            &router,
+            "POST",
+            "/admin/delete-workspace",
+            "root-token",
+            delete(true),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["grants_revoked"], 1);
     }
 
     #[tokio::test]

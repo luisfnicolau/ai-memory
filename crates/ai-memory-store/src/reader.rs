@@ -1595,6 +1595,19 @@ impl ReaderPool {
         self.with_conn(crate::auth::list_active_grants).await
     }
 
+    /// Grants in force under `scope`, phrased for an operator — see
+    /// [`crate::auth::active_grants_under`].
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn active_grants_under(
+        &self,
+        scope: crate::auth::GrantScope,
+    ) -> StoreResult<Vec<String>> {
+        self.with_conn(move |conn| crate::auth::active_grants_under(conn, scope))
+            .await
+    }
+
     /// Whether any grant has ever been written — see
     /// [`crate::auth::any_grant_exists`].
     ///

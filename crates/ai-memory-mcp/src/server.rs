@@ -9617,8 +9617,9 @@ mod tests {
         let conn = rusqlite::Connection::open(db).unwrap();
         conn.execute(
             "INSERT INTO memory_grant \
-             (id, user_id, repository_id, role, granted_by_user_id, granted_at) \
-             VALUES (?1, ?2, ?3, 'writer', ?2, 1)",
+             (id, user_id, repository_id, repository_label, role, granted_by_user_id, \
+              granted_at) \
+             VALUES (?1, ?2, ?3, 'fixture', 'writer', ?2, 1)",
             rusqlite::params![
                 ai_memory_core::ids::MemoryGrantId::new()
                     .as_bytes()

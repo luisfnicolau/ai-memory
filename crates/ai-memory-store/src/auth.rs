@@ -15,6 +15,20 @@ fn ts(micros: i64) -> Timestamp {
     Timestamp::from_microsecond(micros).unwrap_or(Timestamp::UNIX_EPOCH)
 }
 
+/// SQL for a repository's `workspace/project` label, given the placeholder
+/// bound to its id.
+///
+/// Computed in the statement rather than passed in, so a grant can never be
+/// written with a label that disagrees with the row it points at. A missing
+/// project yields NULL, which the `NOT NULL` column refuses — the same outcome
+/// the foreign key would give, with no window where a caller's string wins.
+fn repository_label_sql(id_param: &str) -> String {
+    format!(
+        "(SELECT w.name || '/' || p.name FROM projects p \
+          JOIN workspaces w ON w.id = p.workspace_id WHERE p.id = {id_param})"
+    )
+}
+
 /// Every grant this user holds on this repository, revoked ones included.
 ///
 /// Revoked rows come back deliberately: the decision distinguishes "you never
@@ -155,9 +169,12 @@ pub fn grant(
     };
 
     conn.execute(
-        "INSERT INTO memory_grant \
-         (id, user_id, repository_id, role, granted_by_user_id, granted_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        &format!(
+            "INSERT INTO memory_grant \
+             (id, user_id, repository_id, repository_label, role, granted_by_user_id, granted_at) \
+             VALUES (?1, ?2, ?3, {}, ?4, ?5, ?6)",
+            repository_label_sql("?3")
+        ),
         params![
             MemoryGrantId::new().as_bytes(),
             user_id.as_bytes(),
@@ -200,6 +217,133 @@ pub fn revoke(
         ],
     )?;
     Ok(changed > 0)
+}
+
+/// Which repositories a destructive operation covers.
+#[derive(Debug, Clone, Copy)]
+pub enum GrantScope {
+    /// One repository.
+    Project(ProjectId),
+    /// Every repository in a workspace.
+    Workspace(ai_memory_core::WorkspaceId),
+}
+
+impl GrantScope {
+    /// The `WHERE` predicate on `memory_grant` rows this scope covers, bound
+    /// to `?1`.
+    const fn predicate(self) -> &'static str {
+        match self {
+            Self::Project(_) => "memory_grant.repository_id = ?1",
+            Self::Workspace(_) => {
+                "memory_grant.repository_id IN (SELECT id FROM projects WHERE workspace_id = ?1)"
+            }
+        }
+    }
+
+    fn id_bytes(self) -> Vec<u8> {
+        match self {
+            Self::Project(id) => id.as_bytes().to_vec(),
+            Self::Workspace(id) => id.as_bytes().to_vec(),
+        }
+    }
+}
+
+/// Grants still in force under `scope`, as "`user` (`role`) on `repository`"
+/// phrases for an operator to read.
+///
+/// A destructive operation calls this before it deletes anything, so the
+/// refusal can say exactly whose access is in the way rather than "a
+/// constraint failed".
+///
+/// # Errors
+/// Propagates any SQL error.
+pub fn active_grants_under(conn: &Connection, scope: GrantScope) -> StoreResult<Vec<String>> {
+    let sql = format!(
+        "SELECT users.username, memory_grant.role, workspaces.name || '/' || projects.name \
+           FROM memory_grant \
+           JOIN users      ON users.id = memory_grant.user_id \
+           JOIN projects   ON projects.id = memory_grant.repository_id \
+           JOIN workspaces ON workspaces.id = projects.workspace_id \
+          WHERE memory_grant.revoked_at IS NULL AND {} \
+          ORDER BY workspaces.name, projects.name, users.username",
+        scope.predicate()
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![scope.id_bytes()], |row| {
+        Ok(format!(
+            "{} ({}) on {}",
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    rows.collect::<Result<_, _>>()
+        .map_err(crate::StoreError::from)
+}
+
+/// Revoke every grant still in force under `scope`, recording who did it.
+///
+/// This is what `--revoke-grants` runs, inside the same transaction as the
+/// destructive operation it precedes: the revocations and the delete commit
+/// together or not at all, so there is no state where access was taken away
+/// but the repository survived, or the reverse.
+///
+/// `revoked_by` is `None` for the root bearer token, as in [`revoke`].
+///
+/// # Errors
+/// Propagates any SQL error.
+pub fn revoke_all_under(
+    conn: &Connection,
+    scope: GrantScope,
+    revoked_by: Option<UserId>,
+    now: i64,
+) -> StoreResult<u64> {
+    let sql = format!(
+        "UPDATE memory_grant SET revoked_at = ?2, revoked_by_user_id = ?3 \
+          WHERE revoked_at IS NULL AND {}",
+        scope.predicate()
+    );
+    let changed = conn.execute(
+        &sql,
+        params![
+            scope.id_bytes(),
+            now,
+            revoked_by.map(|by| by.as_bytes().to_vec())
+        ],
+    )?;
+    Ok(u64::try_from(changed).unwrap_or(0))
+}
+
+/// The grant check every destructive operation runs before deleting a
+/// repository: refuse while access is in force, or revoke it first when the
+/// operator has said to.
+///
+/// Returns how many grants were revoked (0 when there were none). Call it
+/// inside the operation's transaction, before the `DELETE`.
+///
+/// # Errors
+/// [`crate::StoreError::ActiveGrants`] when grants are in force and
+/// `revoke_grants` is false; otherwise propagates SQL errors.
+pub(crate) fn refuse_or_revoke(
+    conn: &Connection,
+    scope: GrantScope,
+    label: &str,
+    revoke_grants: bool,
+    revoked_by: Option<UserId>,
+    now: i64,
+) -> StoreResult<u64> {
+    let holders = active_grants_under(conn, scope)?;
+    if holders.is_empty() {
+        return Ok(0);
+    }
+    if !revoke_grants {
+        return Err(crate::StoreError::ActiveGrants {
+            scope: label.to_owned(),
+            count: holders.len(),
+            holders: holders.join(", "),
+        });
+    }
+    revoke_all_under(conn, scope, revoked_by, now)
 }
 
 /// One row of the operator's grant listing, resolved to names.
@@ -347,9 +491,13 @@ pub fn seed_admin_grants(conn: &Connection, now: i64) -> StoreResult<SeedReport>
                 continue;
             }
             conn.execute(
-                "INSERT INTO memory_grant \
-                 (id, user_id, repository_id, role, granted_by_user_id, granted_at) \
-                 VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
+                &format!(
+                    "INSERT INTO memory_grant \
+                     (id, user_id, repository_id, repository_label, role, \
+                      granted_by_user_id, granted_at) \
+                     VALUES (?1, ?2, ?3, {}, ?4, NULL, ?5)",
+                    repository_label_sql("?3")
+                ),
                 params![
                     MemoryGrantId::new().as_bytes(),
                     user.as_bytes(),
@@ -388,6 +536,7 @@ mod tests {
     struct Fixture {
         _tmp: tempfile::TempDir,
         store: Store,
+        ws: ai_memory_core::WorkspaceId,
         alice: UserId,
         bob: UserId,
         client: ProjectId,
@@ -434,6 +583,7 @@ mod tests {
         Fixture {
             _tmp: tmp,
             store,
+            ws,
             alice,
             bob,
             client,
@@ -811,5 +961,235 @@ mod tests {
                 active: true,
             }]
         );
+    }
+
+    /// `(repository_id, repository_label, revoked, revoked_by_user_id)`.
+    type HistoryRow = (Option<Vec<u8>>, String, bool, Option<Vec<u8>>);
+
+    /// Every row the table holds for `user`, including history whose
+    /// repository has been deleted and no longer matches any id.
+    fn history_of(store: &Store, user: UserId) -> Vec<HistoryRow> {
+        let conn = Connection::open(store.db_path()).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT repository_id, repository_label, revoked_at IS NOT NULL, revoked_by_user_id \
+                   FROM memory_grant WHERE user_id = ?1 ORDER BY granted_at",
+            )
+            .unwrap();
+        stmt.query_map(params![user.as_bytes()], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    }
+
+    async fn purge(
+        f: &Fixture,
+        repository: ProjectId,
+        revoke_grants: bool,
+    ) -> StoreResult<crate::PurgeSummary> {
+        f.store
+            .writer
+            .purge_project(
+                f.ws,
+                repository,
+                "default/client-work",
+                Some(f.bob),
+                false,
+                revoke_grants,
+                crate::Compaction::Skip,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn purging_a_repository_people_can_reach_refuses_and_names_them() {
+        let f = fixture().await;
+        f.store
+            .writer
+            .grant_memory(f.alice, f.client, GrantRole::Writer, None)
+            .await
+            .unwrap();
+
+        let err = purge(&f, f.client, false).await.unwrap_err();
+        let message = err.to_string();
+        assert!(
+            matches!(err, crate::StoreError::ActiveGrants { count: 1, .. }),
+            "{message}"
+        );
+        assert!(
+            message.contains("alice (writer) on default/client-work"),
+            "{message}"
+        );
+        assert!(message.contains("--revoke-grants"), "{message}");
+
+        // Refused means nothing happened: the repository and the access are
+        // exactly as they were.
+        assert!(
+            f.store
+                .reader
+                .find_project(f.ws, "client-work".into())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(all_rows(&f.store, f.alice, f.client)[0].is_active());
+    }
+
+    #[tokio::test]
+    async fn revoke_grants_revokes_first_and_the_history_outlives_the_repository() {
+        let f = fixture().await;
+        f.store
+            .writer
+            .grant_memory(f.alice, f.client, GrantRole::Admin, None)
+            .await
+            .unwrap();
+
+        let summary = purge(&f, f.client, true).await.unwrap();
+        assert_eq!(summary.grants_revoked, 1);
+
+        // Revoked, not deleted: the row survives the repository, says which
+        // repository it was, and records who took the access away.
+        let history = history_of(&f.store, f.alice);
+        assert_eq!(history.len(), 1);
+        let (repository, label, revoked, revoked_by) = &history[0];
+        assert_eq!(repository, &None, "the repository is gone");
+        assert_eq!(label, "default/client-work");
+        assert!(revoked);
+        assert_eq!(revoked_by.as_deref(), Some(&f.bob.as_bytes()[..]));
+    }
+
+    #[tokio::test]
+    async fn a_repository_with_only_revoked_history_purges_and_keeps_it() {
+        let f = fixture().await;
+        let w = &f.store.writer;
+        w.grant_memory(f.alice, f.client, GrantRole::Reader, None)
+            .await
+            .unwrap();
+        w.revoke_memory(f.alice, f.client, None).await.unwrap();
+
+        // Nothing in force, so nothing to refuse — and nothing to erase.
+        let summary = purge(&f, f.client, false).await.unwrap();
+        assert_eq!(summary.grants_revoked, 0);
+        let history = history_of(&f.store, f.alice);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].0, None);
+        assert_eq!(history[0].1, "default/client-work");
+    }
+
+    #[tokio::test]
+    async fn the_database_itself_refuses_to_orphan_access_or_erase_a_users_history() {
+        // Whatever a future code path does, SQL that would silently take
+        // access away or erase who-could-see-what fails at the database.
+        let f = fixture().await;
+        f.store
+            .writer
+            .grant_memory(f.alice, f.client, GrantRole::Writer, None)
+            .await
+            .unwrap();
+        let conn = Connection::open(f.store.db_path()).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+
+        let project = conn.execute(
+            "DELETE FROM projects WHERE id = ?1",
+            params![f.client.as_bytes()],
+        );
+        assert!(
+            project.is_err(),
+            "an active grant must block deleting its repository"
+        );
+
+        let user = conn.execute(
+            "DELETE FROM users WHERE id = ?1",
+            params![f.alice.as_bytes()],
+        );
+        assert!(user.is_err(), "grant history must block deleting its user");
+
+        assert_eq!(all_rows(&f.store, f.alice, f.client).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_workspace_runs_the_same_check_and_keeps_the_same_history() {
+        let f = fixture().await;
+        let w = &f.store.writer;
+        let team = w.get_or_create_workspace("team-b").await.unwrap();
+        let repo = w.get_or_create_project(team, "api", None).await.unwrap();
+        w.grant_memory(f.alice, repo, GrantRole::Writer, None)
+            .await
+            .unwrap();
+
+        // `force` gets past "not empty", never past somebody's access.
+        let err = w
+            .delete_workspace(team, true, false, None, crate::Compaction::Skip)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("alice (writer) on team-b/api"),
+            "{err}"
+        );
+
+        let summary = w
+            .delete_workspace(team, true, true, Some(f.bob), crate::Compaction::Skip)
+            .await
+            .unwrap();
+        assert_eq!(summary.grants_revoked, 1);
+        // The workspace row is gone before the cascaded project delete fires
+        // the label trigger, so the grant-time label is what survives.
+        let history = history_of(&f.store, f.alice);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].0, None);
+        assert_eq!(history[0].1, "team-b/api");
+        assert!(history[0].2);
+    }
+
+    #[tokio::test]
+    async fn a_repository_somebody_can_reach_is_never_swept_as_hollow() {
+        let f = fixture().await;
+        let w = &f.store.writer;
+        // `personal` is empty: no pages, no sessions. Hollow by every other
+        // measure, and the sweep runs on a schedule with nobody watching.
+        w.grant_memory(f.alice, f.personal, GrantRole::Writer, None)
+            .await
+            .unwrap();
+        let swept = w.sweep_hollow_projects(0).await.unwrap();
+        assert!(!swept.contains(&"personal".to_owned()), "{swept:?}");
+        assert!(all_rows(&f.store, f.alice, f.personal)[0].is_active());
+
+        // Revoked history does not hold it back, and survives the sweep.
+        w.revoke_memory(f.alice, f.personal, None).await.unwrap();
+        let swept = w.sweep_hollow_projects(0).await.unwrap();
+        assert!(swept.contains(&"personal".to_owned()), "{swept:?}");
+        let history = history_of(&f.store, f.alice);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].1, "default/personal");
+    }
+
+    #[tokio::test]
+    async fn rename_and_a_true_move_keep_the_grants_with_the_repository() {
+        // Both keep the project id, so the grants stay attached to the same
+        // content with no action needed — the id, not the name, is the key.
+        let f = fixture().await;
+        let w = &f.store.writer;
+        w.grant_memory(f.alice, f.client, GrantRole::Writer, None)
+            .await
+            .unwrap();
+
+        w.rename_project(f.ws, f.client, "client-renamed", None)
+            .await
+            .unwrap();
+        let elsewhere = w.get_or_create_workspace("elsewhere").await.unwrap();
+        w.move_project_workspace(f.client, f.ws, elsewhere)
+            .await
+            .unwrap();
+
+        let grants = all_rows(&f.store, f.alice, f.client);
+        assert_eq!(
+            ai_memory_auth::decide(&grants, f.alice, f.client, GrantRole::Writer),
+            ai_memory_auth::Access::Granted
+        );
+        let listing = f.store.reader.list_active_grants().await.unwrap();
+        assert_eq!(listing[0].workspace, "elsewhere");
+        assert_eq!(listing[0].repository, "client-renamed");
     }
 }

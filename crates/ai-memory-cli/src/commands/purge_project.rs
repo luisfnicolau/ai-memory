@@ -15,6 +15,8 @@ struct PurgeProjectRequest {
     confirm: bool,
     /// Purge even when a managed workstream still holds a live run lease.
     force: bool,
+    /// Revoke grants in force instead of refusing.
+    revoke_grants: bool,
     /// Rebuild the FTS indexes and VACUUM after the delete commits.
     compact: bool,
 }
@@ -51,6 +53,7 @@ pub async fn run(config: &Config, args: PurgeProjectArgs) -> Result<()> {
             project: project.clone(),
             confirm: true,
             force: args.force,
+            revoke_grants: args.revoke_grants,
             compact: args.compact,
         },
     )
@@ -74,6 +77,13 @@ pub async fn run(config: &Config, args: PurgeProjectArgs) -> Result<()> {
          {observations} observations, {handoffs} handoffs, {embeddings} embeddings, \
          {workstreams} workstreams, {managed_runs} managed runs."
     );
+    let grants_revoked = report["grants_revoked"].as_u64().unwrap_or(0);
+    if grants_revoked > 0 {
+        println!(
+            "Revoked {grants_revoked} grant(s) on {label}; their history is kept \
+             (ai-memory grant list shows only grants still in force)."
+        );
+    }
     if let Some(ids) = report["workstream_ids"].as_array()
         && !ids.is_empty()
     {

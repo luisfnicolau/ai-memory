@@ -6993,6 +6993,7 @@ mod tests {
                 "default/heal-project",
                 None,
                 false,
+                false,
                 ai_memory_store::Compaction::Skip,
             )
             .await
@@ -7803,6 +7804,7 @@ mod tests {
                 proj,
                 "default/repo-root-project",
                 None,
+                false,
                 false,
                 ai_memory_store::Compaction::Skip,
             )
