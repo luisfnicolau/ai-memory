@@ -1219,6 +1219,11 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             //     the users-table lookup, including before the first user is
             //     created. Admin mode separately switches on a fresh
             //     store-backed users-exist read.
+            if config.auth.authorization {
+                let users = store.reader.list_users().await?;
+                let any_grant = store.reader.any_grant_exists().await?;
+                authorization_preflight(&users, any_grant)?;
+            }
             let mut auth_state = AuthState::new(config.auth.bearer_token.clone())
                 .with_secure_cookie(config.auth.secure_cookie)
                 .with_authorization(config.auth.authorization);
@@ -2386,8 +2391,104 @@ fn host_without_port(host: &str) -> &str {
     }
 }
 
+/// Refuse to enforce authorization against a table nothing has been written to.
+///
+/// Switching `[auth].authorization` on without first running `grant seed`
+/// takes every repository away from every user at once, and the first anyone
+/// hears of it is a teammate's agent reporting that memory is gone. That is
+/// the one mistake in this feature that is both easy to make and invisible
+/// until it hurts, so the server declines to start rather than start into it.
+///
+/// "Ever written", not "currently active": an operator who has deliberately
+/// revoked everything is exercising the feature, not misconfiguring it.
+///
+/// Only users the check would actually constrain count. Root is authorized
+/// above per-repository grants and a disabled user cannot sign in, so an
+/// install whose only accounts are those has nothing to lock out and starts
+/// normally.
+fn authorization_preflight(users: &[ai_memory_core::User], any_grant: bool) -> Result<()> {
+    if any_grant {
+        return Ok(());
+    }
+    let constrained: Vec<&str> = users
+        .iter()
+        .filter(|user| user.role != ai_memory_core::UserRole::Root && user.disabled_at.is_none())
+        .map(|user| user.username.as_str())
+        .collect();
+    if constrained.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "[auth].authorization is on, but no grant has ever been written, so {n} user(s) \
+         ({names}) would lose access to every repository the moment this server starts.\n\
+         \n\
+         To keep what they have today and narrow it afterwards:\n\
+         \n\
+         \x20 1. set [auth].authorization = false and start the server\n\
+         \x20 2. ai-memory grant seed   (gives every existing user admin on every repository)\n\
+         \x20 3. set [auth].authorization = true and restart\n\
+         \x20 4. ai-memory grant list / grant revoke / grant add to narrow it",
+        n = constrained.len(),
+        names = constrained.join(", "),
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    fn account(name: &str, role: ai_memory_core::UserRole, disabled: bool) -> ai_memory_core::User {
+        ai_memory_core::User {
+            id: ai_memory_core::UserId::new(),
+            username: name.to_owned(),
+            name: None,
+            email: None,
+            created_at: 0,
+            last_seen_at: None,
+            token_expired_at: None,
+            role,
+            must_change_password: false,
+            disabled_at: disabled.then_some(1),
+            has_password: true,
+        }
+    }
+
+    #[test]
+    fn enabling_authorization_before_seeding_refuses_to_start_and_says_why() {
+        use ai_memory_core::UserRole::{Root, User};
+        let users = [
+            account("operator", Root, false),
+            account("alice", User, false),
+            account("bob", User, false),
+        ];
+        let err = authorization_preflight(&users, false)
+            .expect_err("enforcing an empty table would lock alice and bob out")
+            .to_string();
+        // Names who would be affected and the command that fixes it, so the
+        // operator can act on the message without reading any docs.
+        assert!(err.contains("2 user(s) (alice, bob)"), "{err}");
+        assert!(err.contains("ai-memory grant seed"), "{err}");
+        assert!(!err.contains("operator"), "root is not constrained: {err}");
+    }
+
+    #[test]
+    fn once_any_grant_has_been_written_the_preflight_stands_aside() {
+        use ai_memory_core::UserRole::User;
+        let users = [account("alice", User, false)];
+        authorization_preflight(&users, true).unwrap();
+    }
+
+    #[test]
+    fn an_install_with_nobody_to_constrain_starts_without_seeding() {
+        use ai_memory_core::UserRole::{Root, User};
+        // Root is authorized above grants and a disabled user cannot sign in:
+        // there is nobody to lock out, so there is nothing to refuse.
+        let users = [
+            account("operator", Root, false),
+            account("former", User, true),
+        ];
+        authorization_preflight(&users, false).unwrap();
+        authorization_preflight(&[], false).unwrap();
+    }
+
     use super::*;
     use ai_memory_core::{
         AgentKind, ApiCredentialId, NewObservation, NewSession, NewUser, ObservationKind, PagePath,

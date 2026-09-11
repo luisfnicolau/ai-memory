@@ -157,7 +157,7 @@ mod tests {
             user_id: user,
             repository_id: repository,
             role,
-            granted_by_user_id: user,
+            granted_by_user_id: Some(user),
             granted_at: Timestamp::UNIX_EPOCH,
             revoked_at: revoked.then_some(Timestamp::UNIX_EPOCH),
             revoked_by_user_id: None,

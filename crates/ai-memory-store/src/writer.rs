@@ -459,6 +459,22 @@ pub(crate) enum WriteCmd {
         token_hash: [u8; TOKEN_HASH_LEN],
         reply: oneshot::Sender<StoreResult<UserId>>,
     },
+    GrantMemory {
+        user_id: UserId,
+        repository_id: ProjectId,
+        role: ai_memory_auth::GrantRole,
+        granted_by: Option<UserId>,
+        reply: oneshot::Sender<StoreResult<crate::auth::GrantOutcome>>,
+    },
+    RevokeMemory {
+        user_id: UserId,
+        repository_id: ProjectId,
+        revoked_by: Option<UserId>,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    SeedAdminGrants {
+        reply: oneshot::Sender<StoreResult<crate::auth::SeedReport>>,
+    },
     RotateUserToken {
         user_id: UserId,
         token_hash: [u8; TOKEN_HASH_LEN],
@@ -2007,6 +2023,68 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Grant `user_id` `role` on `repository_id` (#708).
+    ///
+    /// `granted_by` is the operator making the change, or `None` when they
+    /// act through the root bearer token (no `users` row) or the grant is
+    /// seeded by [`Self::seed_admin_grants`].
+    ///
+    /// # Errors
+    /// Writer closed or SQL.
+    pub async fn grant_memory(
+        &self,
+        user_id: UserId,
+        repository_id: ProjectId,
+        role: ai_memory_auth::GrantRole,
+        granted_by: Option<UserId>,
+    ) -> StoreResult<crate::auth::GrantOutcome> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::GrantMemory {
+            user_id,
+            repository_id,
+            role,
+            granted_by,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Revoke whatever `user_id` actively holds on `repository_id`.
+    ///
+    /// Returns whether anything was in force to revoke, so calling it twice is
+    /// harmless and still reports honestly.
+    ///
+    /// # Errors
+    /// Writer closed or SQL.
+    pub async fn revoke_memory(
+        &self,
+        user_id: UserId,
+        repository_id: ProjectId,
+        revoked_by: Option<UserId>,
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RevokeMemory {
+            user_id,
+            repository_id,
+            revoked_by,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Preserve existing access when authorization is switched on — see
+    /// [`crate::auth::seed_admin_grants`] for why this has to happen at all.
+    ///
+    /// # Errors
+    /// Writer closed or SQL.
+    pub async fn seed_admin_grants(&self) -> StoreResult<crate::auth::SeedReport> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::SeedAdminGrants { reply: tx }).await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Insert a token-only compatibility identity.
     ///
     /// # Errors
@@ -3217,6 +3295,43 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             } => {
                 let result = users::insert_user(&conn, &new_user, &token_hash);
                 send_or_warn(reply, result, "create_user");
+            }
+            WriteCmd::GrantMemory {
+                user_id,
+                repository_id,
+                role,
+                granted_by,
+                reply,
+            } => {
+                let result = crate::auth::grant(
+                    &conn,
+                    user_id,
+                    repository_id,
+                    role,
+                    granted_by,
+                    jiff::Timestamp::now().as_microsecond(),
+                );
+                send_or_warn(reply, result, "grant_memory");
+            }
+            WriteCmd::RevokeMemory {
+                user_id,
+                repository_id,
+                revoked_by,
+                reply,
+            } => {
+                let result = crate::auth::revoke(
+                    &conn,
+                    user_id,
+                    repository_id,
+                    revoked_by,
+                    jiff::Timestamp::now().as_microsecond(),
+                );
+                send_or_warn(reply, result, "revoke_memory");
+            }
+            WriteCmd::SeedAdminGrants { reply } => {
+                let result =
+                    crate::auth::seed_admin_grants(&conn, jiff::Timestamp::now().as_microsecond());
+                send_or_warn(reply, result, "seed_admin_grants");
             }
             WriteCmd::RotateUserToken {
                 user_id,

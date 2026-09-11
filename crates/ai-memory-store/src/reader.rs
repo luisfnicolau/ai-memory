@@ -1543,6 +1543,23 @@ impl ReaderPool {
             .await
     }
 
+    /// Every active grant on the server, resolved to names for display.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn list_active_grants(&self) -> StoreResult<Vec<crate::auth::GrantListing>> {
+        self.with_conn(crate::auth::list_active_grants).await
+    }
+
+    /// Whether any grant has ever been written — see
+    /// [`crate::auth::any_grant_exists`].
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn any_grant_exists(&self) -> StoreResult<bool> {
+        self.with_conn(crate::auth::any_grant_exists).await
+    }
+
     /// Run a synchronous closure against a pooled read-only connection.
     ///
     /// The closure runs on the tokio blocking pool so it never starves the

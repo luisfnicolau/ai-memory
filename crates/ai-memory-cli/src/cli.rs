@@ -208,6 +208,10 @@ pub enum Command {
     /// the root bearer token and `[auth].token_pepper`.
     #[command(name = "api-key")]
     ApiKey(ApiKeyArgs),
+    /// Manage who may reach which repository (#708). All subcommands require
+    /// the root bearer token. Grants are only enforced once
+    /// `[auth].authorization = true` — run `grant seed` before switching it on.
+    Grant(GrantArgs),
     /// Print a shell-completion script to stdout. Generated from this
     /// binary's own command tree, so it never drifts from the real CLI
     /// surface. See `docs/shell-completions.md` for install paths.
@@ -506,6 +510,65 @@ pub struct UserArgs {
     /// User-management action to run.
     #[command(subcommand)]
     pub command: UserCommand,
+}
+
+/// Arguments for `grant`.
+#[derive(Debug, Args)]
+pub struct GrantArgs {
+    /// Grant-management action to run.
+    #[command(subcommand)]
+    pub command: GrantCommand,
+}
+
+/// `grant` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum GrantCommand {
+    /// List every grant in force.
+    List(GrantListArgs),
+    /// Give a user a level on a repository, or change the level they hold.
+    Add(GrantAddArgs),
+    /// Take away whatever a user holds on a repository.
+    Revoke(GrantTargetArgs),
+    /// Give every existing user admin on every existing repository.
+    ///
+    /// Run this BEFORE setting `[auth].authorization = true`. Enforcement
+    /// checks a table that starts empty, so enabling without seeding takes
+    /// every repository away from every user at once; the server refuses to
+    /// start in that state. Seeding keeps today's access and lets you narrow
+    /// it afterwards. Pairs that already hold a grant are left untouched, so
+    /// running it twice is harmless.
+    Seed,
+}
+
+/// Arguments for `grant list`.
+#[derive(Debug, Args)]
+pub struct GrantListArgs {
+    /// Emit the response as JSON instead of a human-readable table.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// The user and repository a grant is about.
+#[derive(Debug, Args)]
+pub struct GrantTargetArgs {
+    /// The user, by username.
+    pub username: String,
+    /// The repository, by project name.
+    pub project: String,
+    /// The workspace the project lives in.
+    #[arg(long, default_value = "default")]
+    pub workspace: String,
+}
+
+/// Arguments for `grant add`.
+#[derive(Debug, Args)]
+pub struct GrantAddArgs {
+    #[command(flatten)]
+    pub target: GrantTargetArgs,
+    /// `reader`, `writer` or `admin`. Required: a level left unsaid is not
+    /// guessed at.
+    #[arg(long)]
+    pub role: String,
 }
 
 /// Arguments for `completions`.

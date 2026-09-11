@@ -16,6 +16,7 @@ use rusqlite::Connection;
 
 mod api_credentials;
 mod auth;
+pub use auth::{GrantListing, GrantOutcome, SeedReport};
 mod auto_improve;
 pub mod decay;
 mod error;

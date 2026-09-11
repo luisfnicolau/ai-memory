@@ -669,7 +669,10 @@ pub fn admin_router_with_sweep_tuning(
         .route(
             "/admin/api-credentials/{id}/revoke",
             post(handle_revoke_api_credential),
-        );
+        )
+        .route("/admin/grants", get(handle_list_grants).post(handle_grant))
+        .route("/admin/grants/revoke", post(handle_revoke_grant))
+        .route("/admin/grants/seed", post(handle_seed_grants));
     operational
         .merge(users)
         .route_layer(axum::middleware::from_fn_with_state(
@@ -7262,6 +7265,154 @@ async fn handle_revoke_api_credential(
     ))
 }
 
+/// Body of `POST /admin/grants` and `POST /admin/grants/revoke`.
+///
+/// Names, not ids: this is what an operator types. `role` is ignored by
+/// revoke, which takes away whatever is held.
+#[derive(Debug, Deserialize)]
+struct GrantRequest {
+    username: String,
+    workspace: String,
+    project: String,
+    #[serde(default)]
+    role: Option<String>,
+}
+
+/// Resolve a grant request to the two ids the table keys on.
+///
+/// The project is looked up with [`OPERATOR`], never created: granting access
+/// to a repository that does not exist yet would be a typo that silently
+/// succeeds and then grants nothing anyone can reach.
+async fn grant_target(
+    state: &AdminState,
+    request: &GrantRequest,
+) -> Result<(ai_memory_core::UserId, ProjectId), (StatusCode, Json<serde_json::Value>)> {
+    let user = lookup_user_by_username(state, request.username.trim()).await?;
+    let (_, project) =
+        lookup_ws_proj_no_create(state, request.workspace.trim(), request.project.trim()).await?;
+    Ok((user.id, project))
+}
+
+/// `GET /admin/grants` — every grant in force, by name.
+async fn handle_list_grants(
+    State(state): State<Arc<AdminState>>,
+    axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_root(level)?;
+    let grants = state
+        .reader
+        .list_active_grants()
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    let grants: Vec<_> = grants
+        .into_iter()
+        .map(|g| {
+            serde_json::json!({
+                "username": g.username,
+                "workspace": g.workspace,
+                "project": g.repository,
+                "role": g.role.as_str(),
+            })
+        })
+        .collect();
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({ "grants": grants })),
+    ))
+}
+
+/// `POST /admin/grants` — grant a user a level on a repository.
+///
+/// Returns what actually happened, so "already had that" is not reported as a
+/// change.
+async fn handle_grant(
+    State(state): State<Arc<AdminState>>,
+    axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
+    operator: Option<axum::Extension<ai_memory_core::UserId>>,
+    Json(request): Json<GrantRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_root(level)?;
+    // Refuse rather than default. A grant whose level was mistyped must not
+    // quietly become `writer`: the operator meant *something*, and guessing
+    // which in an authorization table is how access gets wider than intended.
+    let role = request
+        .role
+        .as_deref()
+        .ok_or_else(|| validation_error("role is required: reader, writer or admin".into()))
+        .and_then(|raw| ai_memory_auth::GrantRole::parse(raw.trim()).map_err(validation_error))?;
+    let (user, project) = grant_target(&state, &request).await?;
+    let outcome = state
+        .writer
+        .grant_memory(user, project, role, operator.map(|axum::Extension(id)| id))
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    let (changed, previous) = match outcome {
+        ai_memory_store::GrantOutcome::Granted => (true, None),
+        ai_memory_store::GrantOutcome::RoleChanged { from } => (true, Some(from.as_str())),
+        ai_memory_store::GrantOutcome::Unchanged => (false, Some(role.as_str())),
+    };
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "username": request.username.trim(),
+            "workspace": request.workspace.trim(),
+            "project": request.project.trim(),
+            "role": role.as_str(),
+            "changed": changed,
+            "previous": previous,
+        })),
+    ))
+}
+
+/// `POST /admin/grants/revoke` — take away whatever a user holds on a
+/// repository.
+async fn handle_revoke_grant(
+    State(state): State<Arc<AdminState>>,
+    axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
+    operator: Option<axum::Extension<ai_memory_core::UserId>>,
+    Json(request): Json<GrantRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_root(level)?;
+    let (user, project) = grant_target(&state, &request).await?;
+    let revoked = state
+        .writer
+        .revoke_memory(user, project, operator.map(|axum::Extension(id)| id))
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "username": request.username.trim(),
+            "workspace": request.workspace.trim(),
+            "project": request.project.trim(),
+            "revoked": revoked,
+        })),
+    ))
+}
+
+/// `POST /admin/grants/seed` — preserve existing access before enabling
+/// authorization. See [`ai_memory_store::SeedReport`].
+async fn handle_seed_grants(
+    State(state): State<Arc<AdminState>>,
+    axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_root(level)?;
+    let report = state
+        .writer
+        .seed_admin_grants()
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "granted": report.granted,
+            "already_held": report.already_held,
+            "users": report.users,
+            "repositories": report.repositories,
+        })),
+    ))
+}
+
 async fn lookup_user_by_username(
     state: &AdminState,
     username: &str,
@@ -11662,6 +11813,225 @@ mod tests {
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json["user"]["disabled_at"].is_null());
+    }
+
+    async fn admin_call(
+        router: &Router,
+        method: &str,
+        uri: &str,
+        token: &str,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {token}"));
+        let body = match body {
+            Some(json) => {
+                builder = builder.header("content-type", "application/json");
+                Body::from(serde_json::to_vec(&json).unwrap())
+            }
+            None => Body::empty(),
+        };
+        let resp = router
+            .clone()
+            .oneshot(builder.body(body).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    /// The operator's whole grant workflow over HTTP, as `ai-memory grant`
+    /// drives it.
+    #[tokio::test]
+    async fn grants_can_be_issued_changed_listed_revoked_and_seeded_by_root() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+        let _ = post_create_user(
+            &router,
+            "root-token",
+            serde_json::json!({"username": "alice"}),
+        )
+        .await;
+        let (status, _) = admin_call(
+            &router,
+            "POST",
+            "/admin/write-page",
+            "root-token",
+            Some(serde_json::json!({
+                "workspace": "default",
+                "project": "client-work",
+                "path": "notes/seed.md",
+                "body": "exists so the repository does",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let target = |role: Option<&str>| {
+            let mut body = serde_json::json!({
+                "username": "alice",
+                "workspace": "default",
+                "project": "client-work",
+            });
+            if let Some(role) = role {
+                body["role"] = role.into();
+            }
+            Some(body)
+        };
+
+        // A level left unsaid is refused, not defaulted.
+        let (status, _) =
+            admin_call(&router, "POST", "/admin/grants", "root-token", target(None)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = admin_call(
+            &router,
+            "POST",
+            "/admin/grants",
+            "root-token",
+            target(Some("owner")),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "unknown level must not be guessed at"
+        );
+
+        let (status, json) = admin_call(
+            &router,
+            "POST",
+            "/admin/grants",
+            "root-token",
+            target(Some("writer")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["changed"], true);
+        assert!(json["previous"].is_null());
+
+        let (_, json) = admin_call(
+            &router,
+            "POST",
+            "/admin/grants",
+            "root-token",
+            target(Some("writer")),
+        )
+        .await;
+        assert_eq!(
+            json["changed"], false,
+            "the same level again is not a change"
+        );
+
+        let (_, json) = admin_call(
+            &router,
+            "POST",
+            "/admin/grants",
+            "root-token",
+            target(Some("reader")),
+        )
+        .await;
+        assert_eq!(json["changed"], true);
+        assert_eq!(json["previous"], "writer");
+
+        // A typo in the repository is a 404, and does not create it: asking
+        // twice still finds nothing.
+        for _ in 0..2 {
+            let (status, _) = admin_call(
+                &router,
+                "POST",
+                "/admin/grants",
+                "root-token",
+                Some(serde_json::json!({
+                    "username": "alice",
+                    "workspace": "default",
+                    "project": "client-wrok",
+                    "role": "reader",
+                })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        }
+
+        let (status, json) = admin_call(&router, "GET", "/admin/grants", "root-token", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json["grants"],
+            serde_json::json!([{
+                "username": "alice",
+                "workspace": "default",
+                "project": "client-work",
+                "role": "reader",
+            }])
+        );
+
+        let (_, json) = admin_call(
+            &router,
+            "POST",
+            "/admin/grants/revoke",
+            "root-token",
+            target(None),
+        )
+        .await;
+        assert_eq!(json["revoked"], true);
+        let (_, json) = admin_call(
+            &router,
+            "POST",
+            "/admin/grants/revoke",
+            "root-token",
+            target(None),
+        )
+        .await;
+        assert_eq!(json["revoked"], false, "revoking twice reports honestly");
+
+        // Seeding hands alice back admin on the repository she no longer holds
+        // anything on — preserving access is its whole job.
+        let (status, json) = admin_call(
+            &router,
+            "POST",
+            "/admin/grants/seed",
+            "root-token",
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(json["granted"].as_u64().unwrap() >= 1, "{json}");
+        let (_, json) = admin_call(&router, "GET", "/admin/grants", "root-token", None).await;
+        assert!(
+            json["grants"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|g| g["project"] == "client-work" && g["role"] == "admin"),
+            "{json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_root_may_touch_grants() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+        // Any bearer that is not root authenticates as an ordinary user in
+        // this harness. None of the grant routes may answer it: a user who
+        // could grant would be a user who could grant themselves.
+        for (method, uri) in [
+            ("GET", "/admin/grants"),
+            ("POST", "/admin/grants"),
+            ("POST", "/admin/grants/revoke"),
+            ("POST", "/admin/grants/seed"),
+        ] {
+            let body = (method == "POST").then(|| {
+                serde_json::json!({
+                    "username": "alice",
+                    "workspace": "default",
+                    "project": "client-work",
+                    "role": "admin",
+                })
+            });
+            let (status, _) = admin_call(&router, method, uri, "not-root", body).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+        }
     }
 
     #[tokio::test]

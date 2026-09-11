@@ -34,7 +34,19 @@ CREATE TABLE memory_grant (
     role                  TEXT NOT NULL DEFAULT 'writer'
                               CHECK (role IN ('reader', 'writer', 'admin')),
 
-    granted_by_user_id    BLOB NOT NULL REFERENCES users(id),
+    -- The `users` row behind the decision, when there is one. NULL when there
+    -- is not, which happens in exactly two ways and both are deliberate:
+    --
+    --   * the grant was seeded when authorization was switched on, preserving
+    --     access that already existed rather than issuing it to anyone; and
+    --   * the operator acted through the configured root bearer token, which
+    --     authenticates from `config.toml` and has no `users` row at all.
+    --
+    -- The second is upstream's own model, not a new one: a page written with
+    -- the root token carries no `author_id` either. Inventing a row, or naming
+    -- the grantee as their own granter, would be a plausible-looking lie in
+    -- the one table an access review reads.
+    granted_by_user_id    BLOB REFERENCES users(id),
     granted_at            INTEGER NOT NULL,
 
     -- Revocation is a timestamp, not a DELETE. A grant records that somebody
@@ -43,9 +55,16 @@ CREATE TABLE memory_grant (
     -- security review actually asks. It is the same reasoning the purge design
     -- already applies when it keeps the row and destroys only the content.
     revoked_at            INTEGER,
+
+    -- Who revoked it, on the same terms as `granted_by_user_id`: NULL when the
+    -- operator used the root token. `revoked_at` alone decides whether a grant
+    -- is in force; this column only answers "by whom", and must not be able to
+    -- stop the root operator from taking access away.
     revoked_by_user_id    BLOB REFERENCES users(id),
 
-    CHECK ((revoked_at IS NULL) = (revoked_by_user_id IS NULL))
+    -- A revoker without a revocation is meaningless; the reverse is the root
+    -- token, and is allowed.
+    CHECK (revoked_by_user_id IS NULL OR revoked_at IS NOT NULL)
 );
 
 -- Partial: one ACTIVE grant per pair, while the revoked history beside it may

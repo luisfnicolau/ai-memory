@@ -79,16 +79,25 @@ pub struct MemoryGrant {
     /// Which repository's memory. `projects(id)` in the schema; the data model
     /// calls the entity `repository` (ARD-08 amendment).
     pub repository_id: ProjectId,
-    /// The operator who granted it. Recorded so "who let them in" has an
-    /// answer that is not "the database".
     /// What this grant permits. See [`GrantRole`].
     pub role: GrantRole,
-    pub granted_by_user_id: UserId,
+    /// The operator who granted it, so "who let them in" has an answer that is
+    /// not "the database".
+    ///
+    /// `None` when there is no `users` row behind the decision: the grant was
+    /// seeded when authorization was switched on, or the operator used the
+    /// root bearer token, which authenticates from configuration. Naming a
+    /// person there would invent a decision that was never made.
+    pub granted_by_user_id: Option<UserId>,
+    /// When it was granted, or when it was seeded.
     pub granted_at: Timestamp,
     /// `None` while active. Revocation stamps a time rather than deleting the
     /// row: nothing is deleted, and an audit trail that forgets who lost
     /// access and when is not one.
     pub revoked_at: Option<Timestamp>,
+    /// Who revoked it, on the same terms as [`Self::granted_by_user_id`]:
+    /// `None` when the operator used the root token. Only
+    /// [`Self::revoked_at`] decides whether the grant is in force.
     pub revoked_by_user_id: Option<UserId>,
 }
 

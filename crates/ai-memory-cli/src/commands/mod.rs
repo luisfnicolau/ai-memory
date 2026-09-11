@@ -25,6 +25,7 @@ pub mod export_okf;
 pub mod finalize_session;
 pub mod forget_sweep;
 pub mod generate_auth_token;
+pub mod grant;
 pub mod handoffs;
 pub mod hook;
 pub mod hook_capture;
