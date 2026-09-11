@@ -160,13 +160,15 @@ impl fmt::Display for ScopeResolutionError {
                 match held {
                     Some(held) => write!(
                         f,
-                        "not authorized for {repository}: you have {} and this needs {}.                          Ask someone with admin on it to raise your access.",
+                        "not authorized for {repository}: you have {} and this needs {}. \
+                         Ask someone with admin on it to raise your access.",
                         held.as_str(),
                         required.as_str()
                     ),
                     None => write!(
                         f,
-                        "not authorized for {repository}. This is an access problem, not an                          empty memory — ask an operator to grant you {} on it.",
+                        "not authorized for {repository}. This is an access problem, not an \
+                         empty memory — ask an operator to grant you {} on it.",
                         required.as_str()
                     ),
                 }
@@ -221,6 +223,7 @@ pub struct ScopeResolver<'a> {
     active_project: Option<&'a ActiveProject>,
     default_workspace_id: WorkspaceId,
     default_project_id: ProjectId,
+    viewer: Option<ai_memory_core::UserId>,
 }
 
 /// Look up an explicit workspace/project pair without creating anything.
@@ -469,27 +472,8 @@ pub async fn create_global_scope(
     .await
 }
 
-/// Resolve and de-duplicate explicit multi-scope names without creating
-/// anything. Surfaces that do not have a current-project default (admin/web)
-/// can call this directly; [`ScopeResolver::resolve_many_existing`] delegates
-/// here.
-///
-/// Crate-private for the same reason as [`lookup_existing_scope`]: outside this
-/// crate the door is [`resolve_many_existing_scopes_guarded`].
-pub(crate) async fn resolve_many_existing_scopes(
-    reader: &ReaderPool,
-    scopes: &[ScopeName],
-    max: usize,
-) -> Result<Vec<ResolvedScope>, ScopeResolutionError> {
-    Ok(resolve_many_existing_scopes_labelled(reader, scopes, max)
-        .await?
-        .into_iter()
-        .map(|(_, ids)| ids)
-        .collect())
-}
-
-/// [`resolve_many_existing_scopes`] keeping the project name each scope was
-/// asked for.
+/// Resolve and de-duplicate an explicit multi-scope list, keeping the project
+/// name each scope was asked for.
 ///
 /// De-duplication drops entries, so the result cannot be zipped back against
 /// the input names — an authorization refusal that named the wrong repository
@@ -522,12 +506,25 @@ async fn resolve_many_existing_scopes_labelled(
 }
 
 impl<'a> ScopeResolver<'a> {
-    /// Build a resolver for read-only policies.
+    /// Build a resolver for read-only policies, as a given viewer.
+    ///
+    /// `viewer` is deliberately a constructor argument rather than a
+    /// `with_viewer` builder step. A builder step that is forgotten leaves the
+    /// resolver silently unauthorized; an argument that is forgotten does not
+    /// compile. Every method below authorizes its result against this user
+    /// before returning it, including the branches that fall back to the
+    /// current or default project without looking anything up — those reach a
+    /// repository too.
+    ///
+    /// `None` means no per-repository check applies: authorization is off, or
+    /// the caller is the operator's root token, which authenticates from
+    /// configuration rather than a `users` row.
     #[must_use]
     pub fn new(
         reader: &'a ReaderPool,
         default_workspace_id: WorkspaceId,
         default_project_id: ProjectId,
+        viewer: Option<ai_memory_core::UserId>,
     ) -> Self {
         Self {
             reader,
@@ -535,7 +532,38 @@ impl<'a> ScopeResolver<'a> {
             active_project: None,
             default_workspace_id,
             default_project_id,
+            viewer,
         }
+    }
+
+    /// Authorize a scope this resolver is about to hand back.
+    ///
+    /// `label` is the name the caller typed, when there was one. A fallback
+    /// resolution has no such name, so the project's own name is fetched to
+    /// build the message — on the denial path only, where one more query costs
+    /// nothing and an unnameable repository would make the refusal useless.
+    async fn guard(
+        &self,
+        scope: ResolvedScope,
+        required: ai_memory_auth::GrantRole,
+        label: Option<&str>,
+    ) -> Result<ResolvedScope, ScopeResolutionError> {
+        if self.viewer.is_none() {
+            return Ok(scope);
+        }
+        let named;
+        let label = match label {
+            Some(label) => label,
+            None => {
+                named = self
+                    .reader
+                    .project_name_by_id(scope.workspace_id, scope.project_id)
+                    .await?
+                    .unwrap_or_else(|| "the resolved project".to_owned());
+                &named
+            }
+        };
+        authorize_scope(self.reader, scope, self.viewer, required, label).await
     }
 
     /// Attach the writer handle needed by create-on-write resolution.
@@ -554,12 +582,21 @@ impl<'a> ScopeResolver<'a> {
 
     /// Look up an explicit workspace/project pair without creating anything.
     /// Used by read, maintenance, and destructive paths.
+    ///
+    /// `required` is the role the caller's operation needs — a maintenance or
+    /// destructive path asks for more than a read.
+    ///
+    /// # Errors
+    /// As [`lookup_existing_scope`], plus
+    /// [`ScopeResolutionError::NotAuthorized`].
     pub async fn lookup_existing(
         &self,
         workspace: &str,
         project: &str,
+        required: ai_memory_auth::GrantRole,
     ) -> Result<ResolvedScope, ScopeResolutionError> {
-        lookup_existing_scope(self.reader, workspace, project).await
+        let scope = lookup_existing_scope(self.reader, workspace, project).await?;
+        self.guard(scope, required, Some(project)).await
     }
 
     /// Resolve MCP-style read arguments: explicit pair if both names are
@@ -575,7 +612,10 @@ impl<'a> ScopeResolver<'a> {
             trimmed_opt(explicit_workspace),
             trimmed_opt(explicit_project),
         ) {
-            (Some(workspace), Some(project)) => self.lookup_existing(workspace, project).await,
+            (Some(workspace), Some(project)) => {
+                self.lookup_existing(workspace, project, ai_memory_auth::GrantRole::Reader)
+                    .await
+            }
             (Some(_), None) => Err(ScopeResolutionError::WorkspaceProjectPairRequired),
             (None, project) => self.resolve_current_or_project(project, actor).await,
         }
@@ -583,7 +623,29 @@ impl<'a> ScopeResolver<'a> {
 
     /// Resolve a project-only read, or the current/default project when no
     /// project was supplied.
+    ///
+    /// # Errors
+    /// As the resolution chain, plus [`ScopeResolutionError::NotAuthorized`].
     pub async fn resolve_current_or_project(
+        &self,
+        explicit_project: Option<&str>,
+        actor: &ActorKey,
+    ) -> Result<ResolvedScope, ScopeResolutionError> {
+        let scope = self
+            .resolve_current_or_project_unguarded(explicit_project, actor)
+            .await?;
+        // Guarded here rather than at each `return` inside the chain below:
+        // that chain has three exits and grows a fourth every time the
+        // fallback rules change. One exit is one place to be right.
+        self.guard(
+            scope,
+            ai_memory_auth::GrantRole::Reader,
+            trimmed_opt(explicit_project),
+        )
+        .await
+    }
+
+    async fn resolve_current_or_project_unguarded(
         &self,
         explicit_project: Option<&str>,
         actor: &ActorKey,
@@ -659,10 +721,19 @@ impl<'a> ScopeResolver<'a> {
                     (self.default_workspace_id, self.default_project_id)
                 }
             };
-            return Ok(ResolvedScope {
-                workspace_id,
-                project_id,
-            });
+            // A fallback resolution reaches a repository just as an explicit
+            // name does, so it is authorized just the same. The label comes
+            // from the project row, since the caller never named it.
+            return self
+                .guard(
+                    ResolvedScope {
+                        workspace_id,
+                        project_id,
+                    },
+                    ai_memory_auth::GrantRole::Writer,
+                    None,
+                )
+                .await;
         };
         let Some(writer) = self.writer else {
             return Err(ScopeResolutionError::WriterRequired);
@@ -674,6 +745,27 @@ impl<'a> ScopeResolver<'a> {
                 .map(|(workspace_id, _)| workspace_id)
                 .unwrap_or(self.default_workspace_id),
         };
+        // Authorize before creating, and only when there is something to
+        // authorize against: a write to an existing repository is checked
+        // exactly as a read of it would be, so "create" cannot be a way in.
+        // A project that does not exist yet holds no grant — see
+        // [`create_explicit_scope_guarded`] for why that is allowed and what
+        // still has to close behind it.
+        if let Some(existing) = self
+            .reader
+            .find_project(workspace_id, project.to_owned())
+            .await?
+        {
+            self.guard(
+                ResolvedScope {
+                    workspace_id,
+                    project_id: existing,
+                },
+                ai_memory_auth::GrantRole::Writer,
+                Some(project),
+            )
+            .await?;
+        }
         let project_id = writer
             .get_or_create_project(workspace_id, project.to_owned(), None)
             .await?;
@@ -684,12 +776,23 @@ impl<'a> ScopeResolver<'a> {
     }
 
     /// Resolve and de-duplicate an explicit multi-scope list.
+    ///
+    /// # Errors
+    /// As [`resolve_many_existing_scopes_guarded`] — a scope the viewer cannot
+    /// read fails the call rather than being dropped from the result.
     pub async fn resolve_many_existing(
         &self,
         scopes: &[ScopeName],
         max: usize,
     ) -> Result<Vec<ResolvedScope>, ScopeResolutionError> {
-        resolve_many_existing_scopes(self.reader, scopes, max).await
+        resolve_many_existing_scopes_guarded(
+            self.reader,
+            scopes,
+            max,
+            self.viewer,
+            ai_memory_auth::GrantRole::Reader,
+        )
+        .await
     }
 }
 
@@ -1034,7 +1137,7 @@ mod tests {
             .get_or_create_project(ws, "scratch", None)
             .await
             .unwrap();
-        let resolver = ScopeResolver::new(&store.reader, ws, project);
+        let resolver = ScopeResolver::new(&store.reader, ws, project, None);
         let err = resolver
             .resolve_read_args(Some("default"), None, &ActorKey::default())
             .await
@@ -1070,7 +1173,7 @@ mod tests {
         };
         active_project.set_for(&actor, active_ws, active_scratch, false);
 
-        let resolver = ScopeResolver::new(&store.reader, default_ws, default_scratch)
+        let resolver = ScopeResolver::new(&store.reader, default_ws, default_scratch, None)
             .with_active_project(&active_project);
         let scope = resolver
             .resolve_read_args(None, Some("scratch"), &actor)
@@ -1116,7 +1219,7 @@ mod tests {
             session_id: Some("s1".into()),
         };
         active_project.set_for(&actor, active_ws, active_project_id, false);
-        let resolver = ScopeResolver::new(&store.reader, default_ws, default_project)
+        let resolver = ScopeResolver::new(&store.reader, default_ws, default_project, None)
             .with_writer(&store.writer)
             .with_active_project(&active_project);
 
@@ -1158,7 +1261,7 @@ mod tests {
             .get_or_create_project(ws, "scratch", None)
             .await
             .unwrap();
-        let resolver = ScopeResolver::new(&store.reader, ws, project);
+        let resolver = ScopeResolver::new(&store.reader, ws, project, None);
         let scopes = vec![
             ScopeName::new("default", "scratch"),
             ScopeName::new(" default ", " scratch "),
@@ -1405,7 +1508,7 @@ mod tests {
             if let Some((ws, proj)) = case.active {
                 active_project.set_for(&actor, ws, proj, false);
             }
-            let resolver = ScopeResolver::new(&store.reader, default_ws, default_scratch)
+            let resolver = ScopeResolver::new(&store.reader, default_ws, default_scratch, None)
                 .with_active_project(&active_project);
             let result = resolver
                 .resolve_read_args(case.workspace, case.project, &actor)
@@ -1463,7 +1566,7 @@ mod tests {
 
         // Multi-scope resolution keeps same-named projects in their own
         // workspaces and fails closed when one entry is missing.
-        let resolver = ScopeResolver::new(&store.reader, default_ws, default_scratch);
+        let resolver = ScopeResolver::new(&store.reader, default_ws, default_scratch, None);
         let both = resolver
             .resolve_many_existing(
                 &[
@@ -1551,7 +1654,7 @@ mod tests {
             session_id: Some("s9".into()),
         };
 
-        let resolver = ScopeResolver::new(&store.reader, default_ws, default_proj)
+        let resolver = ScopeResolver::new(&store.reader, default_ws, default_proj, None)
             .with_writer(&store.writer)
             .with_active_project(&active_project);
 
@@ -1579,7 +1682,7 @@ mod tests {
         };
         active_project.set_for(&publisher, team_ws, team_proj, false);
 
-        let resolver = ScopeResolver::new(&store.reader, default_ws, default_proj)
+        let resolver = ScopeResolver::new(&store.reader, default_ws, default_proj, None)
             .with_writer(&store.writer)
             .with_active_project(&active_project);
 
@@ -1605,7 +1708,7 @@ mod tests {
             session_id: Some("s1".into()),
         };
 
-        let resolver = ScopeResolver::new(&store.reader, default_ws, default_proj)
+        let resolver = ScopeResolver::new(&store.reader, default_ws, default_proj, None)
             .with_writer(&store.writer)
             .with_active_project(&active_project);
 
@@ -1628,7 +1731,7 @@ mod tests {
         };
         active_project.set_for(&actor, team_ws, team_proj, false);
 
-        let resolver = ScopeResolver::new(&store.reader, default_ws, default_proj)
+        let resolver = ScopeResolver::new(&store.reader, default_ws, default_proj, None)
             .with_writer(&store.writer)
             .with_active_project(&active_project);
 
@@ -1657,7 +1760,7 @@ mod tests {
             session_id: Some("s9".into()),
         };
 
-        let resolver = ScopeResolver::new(&store.reader, default_ws, default_proj)
+        let resolver = ScopeResolver::new(&store.reader, default_ws, default_proj, None)
             .with_active_project(&active_project);
 
         let scope = resolver
@@ -1691,7 +1794,7 @@ mod tests {
             // And a caller with no coordinate at all.
             ActorKey::default(),
         ] {
-            let read = ScopeResolver::new(&store.reader, default_ws, default_proj)
+            let read = ScopeResolver::new(&store.reader, default_ws, default_proj, None)
                 .with_active_project(&active_project)
                 .resolve_read_args(None, None, &actor)
                 .await
@@ -1702,7 +1805,7 @@ mod tests {
                 "read must degrade to the seeded scope, not the empty default"
             );
 
-            let write = ScopeResolver::new(&store.reader, default_ws, default_proj)
+            let write = ScopeResolver::new(&store.reader, default_ws, default_proj, None)
                 .with_writer(&store.writer)
                 .with_active_project(&active_project)
                 .resolve_write_args(None, None, &actor)
@@ -1718,7 +1821,7 @@ mod tests {
         // A named project still resolves inside the workspace the seed points
         // at — that is a find-only read, and cross-workspace isolation holds:
         // `real-work` exists only in `team`.
-        let named = ScopeResolver::new(&store.reader, default_ws, default_proj)
+        let named = ScopeResolver::new(&store.reader, default_ws, default_proj, None)
             .with_active_project(&active_project)
             .resolve_read_args(None, Some("real-work"), &ActorKey::default())
             .await

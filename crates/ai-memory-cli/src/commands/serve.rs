@@ -1220,7 +1220,8 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             //     created. Admin mode separately switches on a fresh
             //     store-backed users-exist read.
             let mut auth_state = AuthState::new(config.auth.bearer_token.clone())
-                .with_secure_cookie(config.auth.secure_cookie);
+                .with_secure_cookie(config.auth.secure_cookie)
+                .with_authorization(config.auth.authorization);
             let root_user = config
                 .auth
                 .root_username
@@ -3243,11 +3244,12 @@ mod tests {
             user: None,
             session_id: Some(session_id.to_string()),
         };
-        let resolved = ai_memory_store::ScopeResolver::new(&store.reader, workspace_id, scratch)
-            .with_active_project(&active_project)
-            .resolve_read_args(None, None, &actor)
-            .await
-            .unwrap();
+        let resolved =
+            ai_memory_store::ScopeResolver::new(&store.reader, workspace_id, scratch, None)
+                .with_active_project(&active_project)
+                .resolve_read_args(None, None, &actor)
+                .await
+                .unwrap();
         assert_eq!(
             resolved.as_tuple(),
             (workspace_id, worked_in),
@@ -3258,12 +3260,13 @@ mod tests {
         // untouched by the seed: it resolves exactly where it did before, so a
         // page is never attributed to a project reconstructed from a session
         // that is not this caller's.
-        let written = ai_memory_store::ScopeResolver::new(&store.reader, workspace_id, scratch)
-            .with_writer(&store.writer)
-            .with_active_project(&active_project)
-            .resolve_write_args(None, None, &actor)
-            .await
-            .unwrap();
+        let written =
+            ai_memory_store::ScopeResolver::new(&store.reader, workspace_id, scratch, None)
+                .with_writer(&store.writer)
+                .with_active_project(&active_project)
+                .resolve_write_args(None, None, &actor)
+                .await
+                .unwrap();
         assert_eq!(
             written.as_tuple(),
             (workspace_id, scratch),

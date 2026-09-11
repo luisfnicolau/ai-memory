@@ -21,6 +21,8 @@ ai-memory-wiki.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 flate2.workspace = true
+# Tests insert grant rows directly: the store has no grant write path yet.
+rusqlite.workspace = true
 tar.workspace = true
 tempfile.workspace = true
 serde.workspace = true

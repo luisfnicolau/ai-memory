@@ -88,6 +88,31 @@ pub struct ActorContext {
     pub client: Option<String>,
 }
 
+/// The user this request is authorized *as*, for per-repository grants.
+///
+/// Distinct from the bare `UserId` the middleware also stamps, and the
+/// distinction is the whole point. `UserId` answers "who wrote this" and is
+/// always present for a database user, because attribution must not depend on
+/// a policy setting. This answers "whose grants apply", and is stamped **only
+/// when per-repository authorization is switched on**.
+///
+/// So its absence is the off switch. Every guard reads a missing
+/// `AuthorizedViewer` as "no per-repository check applies" — which is exactly
+/// what an install with authorization disabled, and the operator's root token,
+/// both need. That keeps the feature inert until an operator turns it on,
+/// instead of locking out every existing multi-user install the moment the
+/// grant tables ship empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthorizedViewer(pub crate::UserId);
+
+impl AuthorizedViewer {
+    /// The user id inside.
+    #[must_use]
+    pub const fn user(self) -> crate::UserId {
+        self.0
+    }
+}
+
 /// Authorization tier the auth middleware resolved this request to.
 ///
 /// Identity ([`ActorContext`]) carries *who* the request is from;

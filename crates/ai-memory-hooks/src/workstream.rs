@@ -105,20 +105,22 @@ fn authorize(
     })
 }
 
-/// The authenticated database user, when there is one.
+/// The user whose grants apply to this request, if any do.
 ///
-/// `None` is both "no auth configured" and "the operator's root token": the
-/// auth middleware stamps a `UserId` only on the DB-user rung. Both mean no
-/// per-repository check applies, which is what leaves single-user installs
-/// behaving exactly as they did before the guard existed.
-fn actor_user(actor: Option<Extension<ai_memory_core::UserId>>) -> Option<ai_memory_core::UserId> {
-    actor.map(|Extension(id)| id)
+/// [`ai_memory_core::AuthorizedViewer`] is stamped only when an operator has
+/// switched per-repository authorization on, and never for root. `None`
+/// therefore means no per-repository check applies, which leaves every
+/// existing install behaving exactly as it did before the guard existed.
+fn actor_user(
+    actor: Option<Extension<ai_memory_core::AuthorizedViewer>>,
+) -> Option<ai_memory_core::UserId> {
+    actor.map(|Extension(viewer)| viewer.user())
 }
 
 async fn prepare_run(
     State(state): State<WorkstreamState>,
     level: Option<Extension<AuthLevel>>,
-    actor: Option<Extension<ai_memory_core::UserId>>,
+    actor: Option<Extension<ai_memory_core::AuthorizedViewer>>,
     Json(request): Json<PrepareManagedRunRequest>,
 ) -> Response {
     if let Err(response) = authorize(level, Capability::NormalWrite) {
@@ -401,7 +403,7 @@ const fn default_event_limit() -> usize {
 async fn list_recent_workstreams(
     State(state): State<WorkstreamState>,
     level: Option<Extension<AuthLevel>>,
-    actor: Option<Extension<ai_memory_core::UserId>>,
+    actor: Option<Extension<ai_memory_core::AuthorizedViewer>>,
     Json(request): Json<ListManagedWorkstreamsRequest>,
 ) -> Response {
     if let Err(response) = authorize(level, Capability::NormalRead) {
@@ -490,7 +492,7 @@ async fn list_recent_workstreams(
 async fn rename_workstream(
     State(state): State<WorkstreamState>,
     level: Option<Extension<AuthLevel>>,
-    actor: Option<Extension<ai_memory_core::UserId>>,
+    actor: Option<Extension<ai_memory_core::AuthorizedViewer>>,
     Json(request): Json<RenameManagedWorkstreamRequest>,
 ) -> Response {
     if let Err(response) = authorize(level, Capability::NormalWrite) {

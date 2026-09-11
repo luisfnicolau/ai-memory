@@ -1300,10 +1300,37 @@ struct WritePageArgs {
 
 #[tool_router]
 impl AiMemoryServer {
-    fn scope_resolver(&self) -> ScopeResolver<'_> {
-        ScopeResolver::new(&self.reader, self.workspace_id, self.project_id)
+    /// A resolver bound to the user this request authenticated as.
+    ///
+    /// The viewer is an argument rather than something read from `&self`
+    /// because it is per-request: the server is shared, the caller is not.
+    /// Every tool below reaches its repository through here, so this is the
+    /// one place the MCP surface has to get right — and `ScopeResolver::new`
+    /// will not compile without an answer.
+    fn scope_resolver_as(&self, viewer: Option<ai_memory_core::UserId>) -> ScopeResolver<'_> {
+        ScopeResolver::new(&self.reader, self.workspace_id, self.project_id, viewer)
             .with_writer(&self.writer)
             .with_active_project(&self.active_project)
+    }
+
+    /// The user whose grants apply to this request, if any do.
+    ///
+    /// Deliberately reads [`ai_memory_core::AuthorizedViewer`] rather than the
+    /// bare `UserId` alongside it. The bare id is always present for a
+    /// database user because attribution must not depend on a policy setting;
+    /// this one is stamped only when an operator has switched per-repository
+    /// authorization on, and never for root. `None` therefore means "no
+    /// per-repository check applies" — an open install, an install that has
+    /// not enabled authorization, or the operator.
+    fn viewer_from_parts(
+        parts: Option<&axum::http::request::Parts>,
+    ) -> Option<ai_memory_core::UserId> {
+        parts.and_then(|parts| {
+            parts
+                .extensions
+                .get::<ai_memory_core::AuthorizedViewer>()
+                .map(|viewer| viewer.user())
+        })
     }
 
     fn scope_error(err: ai_memory_store::ScopeResolutionError) -> McpError {
@@ -1499,8 +1526,9 @@ impl AiMemoryServer {
         &self,
         explicit_project: Option<&str>,
         actor: &ai_memory_core::ActorKey,
+        viewer: Option<ai_memory_core::UserId>,
     ) -> Result<(WorkspaceId, ProjectId), McpError> {
-        self.scope_resolver()
+        self.scope_resolver_as(viewer)
             .resolve_current_or_project(explicit_project, actor)
             .await
             .map(ai_memory_store::ResolvedScope::as_tuple)
@@ -1512,8 +1540,9 @@ impl AiMemoryServer {
         explicit_workspace: Option<&str>,
         explicit_project: Option<&str>,
         actor: &ai_memory_core::ActorKey,
+        viewer: Option<ai_memory_core::UserId>,
     ) -> Result<(WorkspaceId, ProjectId), McpError> {
-        self.scope_resolver()
+        self.scope_resolver_as(viewer)
             .resolve_read_args(explicit_workspace, explicit_project, actor)
             .await
             .map(ai_memory_store::ResolvedScope::as_tuple)
@@ -1549,6 +1578,7 @@ impl AiMemoryServer {
             explicit_workspace,
             explicit_project,
             &ai_memory_core::ActorKey::default(),
+            None,
         )
         .await
     }
@@ -1558,8 +1588,9 @@ impl AiMemoryServer {
         explicit_workspace: Option<&str>,
         explicit_project: Option<&str>,
         actor: &ai_memory_core::ActorKey,
+        viewer: Option<ai_memory_core::UserId>,
     ) -> Result<(WorkspaceId, ProjectId), McpError> {
-        self.scope_resolver()
+        self.scope_resolver_as(viewer)
             .resolve_write_args(explicit_workspace, explicit_project, actor)
             .await
             .map(ai_memory_store::ResolvedScope::as_tuple)
@@ -1569,12 +1600,13 @@ impl AiMemoryServer {
     async fn resolve_query_scopes(
         &self,
         scopes: &[MemoryScopeArg],
+        viewer: Option<ai_memory_core::UserId>,
     ) -> Result<Vec<(WorkspaceId, ProjectId)>, McpError> {
         let names: Vec<_> = scopes
             .iter()
             .map(|scope| ScopeName::new(&scope.workspace, &scope.project))
             .collect();
-        self.scope_resolver()
+        self.scope_resolver_as(viewer)
             .resolve_many_existing(&names, MAX_QUERY_SCOPES)
             .await
             .map(|scopes| {
@@ -1996,6 +2028,7 @@ impl AiMemoryServer {
                     args.workspace.as_deref(),
                     args.project.as_deref(),
                     &aps_actor,
+                    Self::viewer_from_parts(Some(&parts)),
                 )
                 .await?;
             let fused = self
@@ -2031,7 +2064,10 @@ impl AiMemoryServer {
         let resolved_scopes = if args.scopes.is_empty() {
             None
         } else {
-            Some(self.resolve_query_scopes(&args.scopes).await?)
+            Some(
+                self.resolve_query_scopes(&args.scopes, Self::viewer_from_parts(Some(&parts)))
+                    .await?,
+            )
         };
         let hits = if let Some(scopes) = &resolved_scopes {
             let mut hits_by_id: HashMap<PageId, (PageHit, Option<ai_memory_store::SearchExplain>)> =
@@ -2079,6 +2115,7 @@ impl AiMemoryServer {
                     args.workspace.as_deref(),
                     args.project.as_deref(),
                     &aps_actor,
+                    Self::viewer_from_parts(Some(&parts)),
                 )
                 .await?;
             self.search_project(
@@ -2131,6 +2168,7 @@ impl AiMemoryServer {
                     args.workspace.as_deref(),
                     args.project.as_deref(),
                     &aps_actor,
+                    Self::viewer_from_parts(Some(&parts)),
                 )
                 .await?;
             self.reader
@@ -2159,7 +2197,12 @@ impl AiMemoryServer {
                     // global write), `hits` already covers it — don't search
                     // it twice.
                     let current = self
-                        .effective_ids_for_read_args_with_actor(None, None, &aps_actor)
+                        .effective_ids_for_read_args_with_actor(
+                            None,
+                            None,
+                            &aps_actor,
+                            Self::viewer_from_parts(Some(&parts)),
+                        )
                         .await?;
                     if current == scope.as_tuple() {
                         Vec::new()
@@ -2257,6 +2300,7 @@ impl AiMemoryServer {
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let hits = self
@@ -2303,6 +2347,7 @@ impl AiMemoryServer {
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         // The reason is free-text from the model; scrub it on the way in
@@ -2545,6 +2590,7 @@ impl AiMemoryServer {
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let report = run_sweep_with_options(
@@ -2585,6 +2631,7 @@ impl AiMemoryServer {
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let report = run_lint(
@@ -2692,6 +2739,7 @@ impl AiMemoryServer {
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let Some(llm) = self.llm.as_ref() else {
@@ -2981,6 +3029,7 @@ impl AiMemoryServer {
                     args.workspace.as_deref(),
                     args.project.as_deref(),
                     &aps_actor,
+                    Self::viewer_from_parts(Some(&parts)),
                 )
                 .await?
             }
@@ -3134,6 +3183,7 @@ impl AiMemoryServer {
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         // Diagnose cross-project scope-bleed: a read with no explicit scope
@@ -3277,6 +3327,7 @@ impl AiMemoryServer {
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let owner_filter =
@@ -3444,6 +3495,7 @@ impl AiMemoryServer {
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
 
@@ -3522,6 +3574,7 @@ impl AiMemoryServer {
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let open_questions = cap_handoff_list(
@@ -3682,6 +3735,7 @@ impl AiMemoryServer {
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let actor_user = crate::actor::actor_from_parts(&parts)
@@ -3789,6 +3843,7 @@ impl AiMemoryServer {
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         // Resolve the cross-owner escape hatch before reading the object. A
@@ -3860,6 +3915,7 @@ impl AiMemoryServer {
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let counts = self
@@ -3896,6 +3952,7 @@ impl AiMemoryServer {
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let actor = crate::actor::actor_from_parts(&parts);
@@ -3941,6 +3998,7 @@ impl AiMemoryServer {
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let actor = crate::actor::actor_from_parts(&parts);
@@ -6463,7 +6521,7 @@ mod tests {
         // Baseline: nothing published, no arg → baked-in default.
         assert_eq!(
             server
-                .effective_ids_with_actor(None, &ai_memory_core::ActorKey::default())
+                .effective_ids_with_actor(None, &ai_memory_core::ActorKey::default(), None)
                 .await
                 .unwrap(),
             (ws, baked)
@@ -6484,7 +6542,7 @@ mod tests {
         server.active_project.set(ws, other);
         assert_eq!(
             server
-                .effective_ids_with_actor(None, &ai_memory_core::ActorKey::default())
+                .effective_ids_with_actor(None, &ai_memory_core::ActorKey::default(), None)
                 .await
                 .unwrap(),
             (ws, other)
@@ -6493,7 +6551,11 @@ mod tests {
         // An explicit (existing) project arg wins over the active pointer.
         assert_eq!(
             server
-                .effective_ids_with_actor(Some("scratch"), &ai_memory_core::ActorKey::default())
+                .effective_ids_with_actor(
+                    Some("scratch"),
+                    &ai_memory_core::ActorKey::default(),
+                    None
+                )
                 .await
                 .unwrap(),
             (ws, baked),
@@ -6503,7 +6565,11 @@ mod tests {
         // An explicit but unknown project name fails closed instead of
         // silently falling through to the active pointer.
         let err = server
-            .effective_ids_with_actor(Some("does-not-exist"), &ai_memory_core::ActorKey::default())
+            .effective_ids_with_actor(
+                Some("does-not-exist"),
+                &ai_memory_core::ActorKey::default(),
+                None,
+            )
             .await
             .expect_err("unknown explicit project must not fall back");
         assert!(
@@ -6670,7 +6736,11 @@ mod tests {
         );
         assert_eq!(
             server
-                .effective_ids_with_actor(Some("sibling"), &ai_memory_core::ActorKey::default())
+                .effective_ids_with_actor(
+                    Some("sibling"),
+                    &ai_memory_core::ActorKey::default(),
+                    None
+                )
                 .await
                 .unwrap(),
             (active_ws, sibling_proj),
@@ -9539,6 +9609,146 @@ mod tests {
         assert_eq!(author.username, "alice");
         assert_eq!(author.name.as_deref(), Some("Alice Smith"));
         assert_eq!(author.email.as_deref(), Some("alice@example.com"));
+    }
+
+    /// Insert a grant row directly — the store has no grant write path yet.
+    fn grant_writer(db: &std::path::Path, user: ai_memory_core::UserId, repository: ProjectId) {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.execute(
+            "INSERT INTO memory_grant \
+             (id, user_id, repository_id, role, granted_by_user_id, granted_at) \
+             VALUES (?1, ?2, ?3, 'writer', ?2, 1)",
+            rusqlite::params![
+                ai_memory_core::ids::MemoryGrantId::new()
+                    .as_bytes()
+                    .to_vec(),
+                user.as_bytes().to_vec(),
+                repository.as_bytes().to_vec(),
+            ],
+        )
+        .unwrap();
+    }
+
+    /// The finding that started #708, as a test.
+    ///
+    /// Two `role=user` accounts on upstream 2.1.1: alice writes a page into her
+    /// client project and bob reads the whole body back. This asserts both
+    /// halves of the fix — that bob is refused when authorization is on, and
+    /// that he is *not* refused when it is off, because an install that has
+    /// never issued a grant must keep working exactly as it did.
+    #[tokio::test]
+    async fn bob_cannot_read_alices_page_once_authorization_is_on() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "alice-client-work", None)
+            .await
+            .unwrap();
+        let user = |name: &str| {
+            let writer = store.writer.clone();
+            let name = name.to_owned();
+            async move {
+                writer
+                    .create_human_user(
+                        NewUser {
+                            username: name,
+                            name: None,
+                            email: None,
+                        },
+                        ai_memory_core::UserRole::User,
+                        None,
+                        false,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let alice = user("alice").await;
+        let bob = user("bob").await;
+        grant_writer(store.db_path(), alice, proj);
+
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_wiki(wiki);
+
+        // Alice holds writer on this repository, so her write lands.
+        let mut alice_parts = test_parts_default();
+        alice_parts.extensions.insert(AuthLevel::User);
+        alice_parts.extensions.insert(alice);
+        alice_parts
+            .extensions
+            .insert(ai_memory_core::AuthorizedViewer(alice));
+        server
+            .memory_write_page(
+                Parameters(WritePageArgs {
+                    path: "secrets/rates.md".into(),
+                    body: "# Rates\n\nDay rate is confidential.".into(),
+                    title: None,
+                    tier: Some("semantic".into()),
+                    tags: vec![],
+                    pinned: false,
+                    project: None,
+                    workspace: None,
+                    scope: None,
+                    expires_at: None,
+                }),
+                OptionalParts(alice_parts),
+            )
+            .await
+            .expect("alice holds writer on her own repository");
+
+        let read_as = |viewer: Option<ai_memory_core::UserId>| {
+            let server = &server;
+            async move {
+                let mut parts = test_parts_default();
+                parts.extensions.insert(AuthLevel::User);
+                parts.extensions.insert(bob);
+                if let Some(viewer) = viewer {
+                    parts
+                        .extensions
+                        .insert(ai_memory_core::AuthorizedViewer(viewer));
+                }
+                server
+                    .memory_read_page(
+                        Parameters(ReadPageArgs {
+                            path: Some("secrets/rates.md".into()),
+                            query: None,
+                            project: None,
+                            workspace: None,
+                        }),
+                        OptionalParts(parts),
+                    )
+                    .await
+            }
+        };
+
+        // Authorization ON: bob is stamped as an authorized viewer, holds
+        // nothing, and is refused — with a message that says so rather than
+        // handing back an empty result he would read as "there is nothing here".
+        let err = read_as(Some(bob))
+            .await
+            .expect_err("bob holds no grant on alice's repository");
+        let message = err.message.to_string();
+        assert!(
+            message.contains("not authorized for alice-client-work"),
+            "refusal must name the repository: {message}"
+        );
+        assert!(
+            message.contains("not an empty memory"),
+            "refusal must not be mistakable for an empty repository: {message}"
+        );
+
+        // Authorization OFF: the middleware stamps no viewer, so nothing is
+        // enforced and the install behaves as it did before grants existed.
+        read_as(None)
+            .await
+            .expect("with authorization off, an existing install must be unchanged");
     }
 
     fn parts_with_level(level: ai_memory_core::AuthLevel) -> axum::http::request::Parts {

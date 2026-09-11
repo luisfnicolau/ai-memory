@@ -156,7 +156,7 @@ async fn projects_handler(
 
 async fn pages_handler(
     State(state): State<Arc<WebState>>,
-    viewer: Option<axum::Extension<ai_memory_core::UserId>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     Path((workspace, project)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let _ = lookup_project(&state, &workspace, &project, viewer_of(viewer)).await?;
@@ -268,7 +268,7 @@ async fn page_handler(
 
 async fn search_handler(
     State(state): State<Arc<WebState>>,
-    viewer: Option<axum::Extension<ai_memory_core::UserId>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Response, Response> {
     let query = SearchQuery::from_raw(raw_query.as_deref()).map_err(ApiFailure::into_response)?;
@@ -280,7 +280,7 @@ async fn search_handler(
 
 async fn search_post_handler(
     State(state): State<Arc<WebState>>,
-    viewer: Option<axum::Extension<ai_memory_core::UserId>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     Json(request): Json<SearchRequest>,
 ) -> Result<Response, Response> {
     search_with_request(&state, request, viewer_of(viewer)).await
@@ -439,7 +439,7 @@ async fn search_scopes(
 
 async fn recent_handler(
     State(state): State<Arc<WebState>>,
-    viewer: Option<axum::Extension<ai_memory_core::UserId>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     Path((workspace, project)): Path<(String, String)>,
     Query(query): Query<LimitQuery>,
 ) -> Result<Response, Response> {
@@ -456,7 +456,7 @@ async fn recent_handler(
 
 async fn briefing_handler(
     State(state): State<Arc<WebState>>,
-    viewer: Option<axum::Extension<ai_memory_core::UserId>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Path((workspace, project)): Path<(String, String)>,
     Query(query): Query<LimitQuery>,
@@ -727,7 +727,7 @@ const fn default_handoff_limit() -> usize {
 /// server that *does* authenticate shows to a caller it cannot place.
 async fn handoffs_handler(
     State(state): State<Arc<WebState>>,
-    viewer: Option<axum::Extension<ai_memory_core::UserId>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
     auth: Option<axum::Extension<ai_memory_core::AuthLevel>>,
     Path((workspace, project)): Path<(String, String)>,
@@ -793,7 +793,7 @@ async fn handoffs_handler(
 
 async fn project_overview_handler(
     State(state): State<Arc<WebState>>,
-    viewer: Option<axum::Extension<ai_memory_core::UserId>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Path((workspace, project)): Path<(String, String)>,
     Query(query): Query<LimitQuery>,
@@ -867,7 +867,7 @@ const SESSION_OBSERVATIONS_MAX_BODY_CHARS: usize = 16_384;
 
 async fn sessions_handler(
     State(state): State<Arc<WebState>>,
-    viewer: Option<axum::Extension<ai_memory_core::UserId>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Path((workspace, project)): Path<(String, String)>,
     Query(query): Query<SessionListQuery>,
@@ -893,7 +893,7 @@ async fn sessions_handler(
 
 async fn session_observations_handler(
     State(state): State<Arc<WebState>>,
-    viewer: Option<axum::Extension<ai_memory_core::UserId>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Path((workspace, project, session_id)): Path<(String, String, String)>,
     Query(query): Query<SessionObservationsQuery>,
@@ -1015,17 +1015,17 @@ fn cap_body(body: &str, max_chars: usize) -> String {
     out
 }
 
-/// The authenticated database user, when there is one.
+/// The user whose grants apply to this request, if any do.
 ///
-/// `None` covers two different situations that authorize identically: an
-/// install with no auth configured, and the operator's root token. The auth
-/// middleware only stamps a `UserId` on the DB-user rung, so `None` means "no
-/// per-repository check applies" — which is what keeps every existing
-/// single-user install behaving exactly as it did before the guard existed.
+/// [`ai_memory_core::AuthorizedViewer`] is stamped only when an operator has
+/// switched per-repository authorization on, and never for root. `None`
+/// therefore covers every posture that authorizes identically — no auth, auth
+/// without authorization, and the operator — which is what keeps existing
+/// installs behaving exactly as they did before the guard existed.
 fn viewer_of(
-    viewer: Option<axum::Extension<ai_memory_core::UserId>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
 ) -> Option<ai_memory_core::UserId> {
-    viewer.map(|axum::Extension(id)| id)
+    viewer.map(|axum::Extension(viewer)| viewer.user())
 }
 
 /// Resolve a workspace/project pair the viewer is allowed to read.

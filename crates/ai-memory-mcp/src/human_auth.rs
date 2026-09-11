@@ -976,7 +976,7 @@ pub async fn require_session(
         return json_err(StatusCode::UNAUTHORIZED, "auth required");
     }
     match load_session(&state, req.headers(), req.method()).await {
-        Ok(live) => inject_session(&mut req, live),
+        Ok(live) => inject_session(&mut req, live, state.authorization()),
         Err(resp) => return resp,
     }
     next.run(req).await
@@ -997,7 +997,7 @@ pub async fn require_session_or_anonymous(
         return next.run(req).await;
     }
     match load_session(&state, req.headers(), req.method()).await {
-        Ok(live) => inject_session(&mut req, live),
+        Ok(live) => inject_session(&mut req, live, state.authorization()),
         Err(resp) => return resp,
     }
     next.run(req).await
@@ -1068,7 +1068,7 @@ pub async fn require_dual_auth(
             if live.user.must_change_password {
                 return json_err(StatusCode::FORBIDDEN, "password change required");
             }
-            inject_session(&mut req, live);
+            inject_session(&mut req, live, state.authorization());
             req.extensions_mut().insert(state.clone());
             next.run(req).await
         }
@@ -1076,12 +1076,23 @@ pub async fn require_dual_auth(
     }
 }
 
-fn inject_session(req: &mut Request<axum::body::Body>, live: LiveWebSession) {
+/// Stamp a browser session's identity onto the request.
+///
+/// `authorization` decides whether the session also carries an
+/// [`ai_memory_core::AuthorizedViewer`]. A root session never does: root is
+/// the operator, authorized above per-repository granularity, and stamping one
+/// would make the operator's own grants (of which there are none) the limit of
+/// what they can reach.
+fn inject_session(req: &mut Request<axum::body::Body>, live: LiveWebSession, authorization: bool) {
     let level = if live.user.role == UserRole::Root {
         AuthLevel::Root
     } else {
         AuthLevel::User
     };
+    if authorization && level == AuthLevel::User {
+        req.extensions_mut()
+            .insert(ai_memory_core::AuthorizedViewer(live.user.id));
+    }
     let actor = ActorContext {
         user: Some(live.user.username.clone()),
         name: live.user.name.clone(),

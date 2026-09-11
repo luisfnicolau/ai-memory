@@ -557,6 +557,18 @@ pub struct AuthSettings {
     /// `Authorization: Bearer <token>`. Generate one with
     /// `ai-memory generate-auth-token`.
     pub bearer_token: Option<String>,
+    /// Enforce per-repository authorization (#708).
+    ///
+    /// Off by default, and off is what every upgrade gets: the grant table
+    /// ships empty, so turning enforcement on for an install that has not
+    /// issued any grants would deny every authenticated user everything they
+    /// could reach yesterday. Grants are recorded and readable either way;
+    /// this decides whether they are *enforced*.
+    ///
+    /// Root is unaffected — the operator authenticates from configuration
+    /// rather than a `users` row and is authorized above per-repository
+    /// granularity.
+    pub authorization: bool,
     /// Mark the browser session cookie `Secure`. Human authentication on a
     /// non-loopback listener requires this explicit HTTPS reverse-proxy
     /// posture. It may be false only for direct loopback smoke/development.
