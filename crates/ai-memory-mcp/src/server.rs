@@ -3761,6 +3761,7 @@ impl AiMemoryServer {
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let actor_user = crate::actor::actor_from_parts(&parts)
@@ -10139,6 +10140,7 @@ mod tests {
                 author_id: None,
                 expires_at: None,
                 entities: Vec::new(),
+                evidence: Vec::new(),
             })
             .await
             .unwrap();

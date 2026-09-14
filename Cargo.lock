@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-auth"
-version = "2.1.1"
+version = "2.2.0"
 dependencies = [
  "ai-memory-core",
  "jiff",
