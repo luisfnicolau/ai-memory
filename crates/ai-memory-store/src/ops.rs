@@ -145,7 +145,7 @@ pub struct PurgeSummary {
     /// Number of `managed_runs` rows deleted (cascades through workstreams).
     pub managed_runs_deleted: u64,
     /// Grants revoked because the operator passed `--revoke-grants`. Revoked,
-    /// not deleted: their history rows outlive the repository (V62).
+    /// not deleted: their history rows outlive the repository (V65).
     pub grants_revoked: u64,
     /// Ids of the deleted workstreams. The admin layer uses these typed,
     /// pre-delete identifiers to remove `raw/workstreams/<id>/` after the SQL
@@ -313,7 +313,7 @@ pub fn get_or_create_project(
 /// made about it. Sweeping it would take that access away on a schedule with
 /// nobody watching — and the database now refuses to, so without this the
 /// whole sweep would fail on the first such row. Revoked-only history does not
-/// hold a repository back; its rows survive the delete (V62).
+/// hold a repository back; its rows survive the delete (V65).
 ///
 /// # Errors
 /// Propagates SQLite failures.
@@ -3837,7 +3837,7 @@ pub fn clear_bootstrap_progress(conn: &Connection, fingerprint: &str) -> StoreRe
 ///    handoffs, and page_embeddings automatically. Grants are the exception:
 ///    they are checked before this step (refused while in force, revoked when
 ///    `revoke_grants` is set) and their history rows survive it, because
-///    `memory_grant.repository_id` is `ON DELETE SET NULL` (V62).
+///    `memory_grant.repository_id` is `ON DELETE SET NULL` (V65).
 /// 4. Commit and return the [`PurgeSummary`].
 ///
 /// The `workspace_project_label` string is passed in by the caller (the

@@ -1,4 +1,4 @@
--- V62: authorize a user against a repository (#708).
+-- V65: authorize a user against a repository (#708).
 --
 -- 2.1.1 authenticates and does not authorize. `users`, `web_sessions` and
 -- `api_credentials` carry no reference to a project, so any account reads every
@@ -22,7 +22,7 @@ CREATE TABLE memory_grant (
 
     -- References `projects(id)`, the primary key — deliberately not the
     -- project's name or its identity string. Which row a working directory
-    -- resolves to is a separate question (see V61); this table only needs the
+    -- resolves to is a separate question (see V64); this table only needs the
     -- answer to be stable, so a change to that resolution cannot silently
     -- re-point existing grants.
     --

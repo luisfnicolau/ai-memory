@@ -833,7 +833,7 @@ mod tests {
     /// grant endpoints — so the guard would otherwise be untestable, and an
     /// untested guard is a claim rather than a control. Writing the row by
     /// hand also keeps these tests honest about the schema: they fail if
-    /// V62's shape changes under them.
+    /// V65's shape changes under them.
     fn grant_row(
         db: &std::path::Path,
         user: ai_memory_core::UserId,
