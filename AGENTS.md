@@ -197,6 +197,9 @@ evals/                     live A/B harness; workspace member, not shipped.
 companions/ai-memory-importer/  standalone OMC + external-conversation importer; NOT a root
                            workspace member — build/test it with
                            `--manifest-path companions/ai-memory-importer/Cargo.toml`.
+companions/ai-memory-macos/     Swift menu bar wrapper; NOT a root workspace member —
+                           `swift test --package-path companions/ai-memory-macos`
+                           and `./companions/ai-memory-macos/build.sh`.
 hooks/                     per-agent lifecycle hook bundles (shell/native).
 bin/                       host wrapper scripts (`ai-memory`, `deploy`, `release`).
 docker/                    Dockerfile, compose files, TLS proxy templates.
@@ -272,6 +275,10 @@ no tiers.
   `cargo test --manifest-path companions/ai-memory-importer/Cargo.toml`
   (plus fmt/clippy on the same manifest). Root `--workspace` commands do
   not cover it.
+- Run the macOS menu bar companion separately:
+  `swift test --package-path companions/ai-memory-macos`
+  (plus `./companions/ai-memory-macos/build.sh` to stage `AI Memory.app`).
+  Root `--workspace` commands do not cover it.
 
 ### Platform notes
 
@@ -316,7 +323,10 @@ no tiers.
   is what holds PR feedback near the eight minutes the gating jobs take.
   **Add the `windows` label** to a PR touching path handling, file
   locking, or git plumbing, so the check runs before the merge rather
-  than after it.
+  than after it. Its `hooks` job is the one exception: `tests/hooks/test_lib.sh`
+  drives `hooks/lib/ai-memory-hook.ps1`, which only executes where PowerShell
+  is native, so that job runs on every pull request. It needs no toolchain and
+  costs seconds, so it does not move PR feedback time.
 
 ## Code style guidelines
 
@@ -487,6 +497,21 @@ Additional boundary rules:
   `Added`/`Changed`/`Fixed` heading, past-tense, trailing `(#NNN)`
   reference) and update the relevant README/docs references in the same
   commit. Internal refactors and test-only churn are exempt.
+- **Competitor research keeps the comparison docs in sync — never let them
+  go stale.** Any new competitor research pass, or a correction to an existing
+  one, must land its findings in the comparison docs in the *same* change, not
+  just in a research note: update `docs/comparison.md` (the public camp table +
+  positioning + "coming from …" migration notes), `docs/research-2026-landscape.md`
+  (the §3 camp entry + §6 sources, appending per the no-standalone-doc
+  convention), and `docs/competitive-parity.md` (the migration verdict + the
+  "did we copy without improving?" audit) wherever the finding applies. When a
+  competitor is reclassified or a claim is corrected, fix the camp table *and*
+  every per-tool claim that repeats it — a benchmark number, a "not file-first",
+  a camp label. This is a recurring failure: the Sept-2026 parity audit found
+  Supermemory mislabeled as a fact extractor, agentmemory's `0.967` attributed
+  to the wrong benchmark, and basic-memory's shipped reranking/Teams unrecorded.
+  Treat a stale claim in `comparison.md` (the doc that promises to be *fair*) as
+  a defect, not a nicety.
 - **CI pacing: fast per merge, full matrix before release.** Every
   implementation merge gates on the fast Linux jobs only. The slow
   macOS/Windows legs run on a `full-ci` PR label, nightly (windows), or
@@ -494,6 +519,16 @@ Additional boundary rules:
   release**: dispatch `ci` (macOS legs) and `windows` on the exact
   release-candidate SHA and wait for green before tagging. Never tag a
   release whose SHA lacks a green full matrix.
+- **Every release updates the Homebrew tap — do not forget it.** After
+  `release.yml` publishes the GitHub release and its per-target tarballs,
+  update `~/Projects/homebrew-tap/Formula/ai-memory.rb`: bump `version` and
+  set each platform `sha256` to the value from the release's published
+  `ai-memory-<target>.tar.gz.sha256` assets (`macos-aarch64`, `macos-x86_64`,
+  `linux-aarch64`, `linux-x86_64`), then commit (`ai-memory X.Y.Z`) and push
+  the tap. Verify each `sha256` matches the published asset before pushing — a
+  wrong hash makes `brew install` fail for everyone. This is a mandatory,
+  recurring post-release step (it has been forgotten repeatedly); do not rely
+  on a contributor PR to the tap to remember it.
 - **No version bumps or release tags without explicit user approval.**
   Do not bump crate/package versions automatically.
 - **PR evaluation:** report pros, cons, and recommended fix, then ask for
@@ -501,7 +536,7 @@ Additional boundary rules:
 - **MCP tool surface changes** require updating `MEMORY_INSTRUCTIONS`,
   `ai_memory_core::SNIPPET_BODY`, README/docs tool references, and the
   regression tests asserting every tool appears in both prompt surfaces.
-  The tool count is currently 19 (see `docs/ARCHITECTURE.md`).
+  The tool count is currently 23 (see `docs/ARCHITECTURE.md`).
 - **Semantic versioning:** patch = fixes; minor = additive (new CLI
   subcommands, MCP tools, config keys, a new agent harness or LLM
   provider); major = breaking (on-disk format without migration, removed
@@ -526,6 +561,17 @@ Additional boundary rules:
   and milestone plan.
 - [`docs/install.md`](docs/install.md) — installation cookbook for every
   supported agent client.
+- [`docs/cookbook.md`](docs/cookbook.md) — task-oriented cheat sheet: "I want
+  to do X" → how (recall, durable rules, importing a knowledge base, two agents
+  working together).
+- [`docs/comparison.md`](docs/comparison.md) — fair, user-facing comparison
+  against other memory tools (camps, migration notes, how the field validates
+  the file-first/pages-over-facts approach). Analysis behind it:
+  `research-2026-landscape.md`.
+- [`docs/competitive-parity.md`](docs/competitive-parity.md) — self-critical
+  internal audit: per-competitor migration-worthiness (do we do the basics +
+  add enough to justify switching?), the "did we copy without improving?"
+  borrowed-ideas verdicts, and documented gap-fill recommendations.
 - [`docs/lifecycle-ops.md`](docs/lifecycle-ops.md) — read before touching
   purge/rename/backup/restore/reset/reindex/restore-page.
 - [`docs/auto-improvement-loop.md`](docs/auto-improvement-loop.md) —
@@ -534,5 +580,7 @@ Additional boundary rules:
   four-rung auth ladder.
 - [`docs/managed-workstreams.md`](docs/managed-workstreams.md) —
   `ai-memory run` cross-harness continuity.
+- [`docs/agent-messaging.md`](docs/agent-messaging.md) — cross-project
+  agent-to-agent inbox/queue and the on-start hot-context notice.
 - [`docs/companion-crates.md`](docs/companion-crates.md) — boundary for
   optional companion projects (e.g. the importer).

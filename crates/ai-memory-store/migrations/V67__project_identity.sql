@@ -1,4 +1,4 @@
--- V64: give a project an identity that is not its folder name (ARD-08).
+-- V67: give a project an identity that is not its folder name (ARD-08).
 --
 -- Upstream keys a project by `(workspace_id, name)`, and the name is the
 -- basename of whatever directory the agent happened to run in. That is a

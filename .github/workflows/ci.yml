@@ -159,6 +159,59 @@ jobs:
       - run: scripts/check-native-packaging.sh
       - run: tests/wrapper_upgrade.sh
 
+  # `tests/hooks/test_lib.sh` covers `hooks/_lib.sh`, the POSIX shell bundle —
+  # the one shipped surface no Rust job reaches. Its own header says "POSIX
+  # shell + sed/awk only, so no extra CI setup needed", and nothing was running
+  # it: the suite appears only in AGENTS.md, as a manual shell-level check.
+  #
+  # The matrix is the substance here, not decoration. The bundle runs on
+  # whatever awk the host provides, and the implementations disagree on exactly
+  # what this code leans on: `ai_memory_json_string` builds its JSON escapes
+  # out of gsub replacement strings, and `ai_memory_json_field` parses a spool
+  # entry back out. A single-awk leg would say nothing about the hosts users
+  # install on — macOS ships the one-true-awk lineage (`original-awk` here),
+  # Debian and Ubuntu default to mawk, most other Linux to gawk.
+  #
+  # BusyBox awk is included now that #737 fixed the gsub-replacement escape bug
+  # it exposed (#733) — it is the implementation on Alpine and many minimal
+  # containers, so covering it is the point of this job, not an afterthought.
+  hooks-shell:
+    name: hook bundle (${{ matrix.awk }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # BusyBox joined the matrix once #737 fixed the gsub-replacement escape
+        # bug (#733): its awk is a distinct implementation the bundle runs on,
+        # and it is invoked as the `awk` applet of the `busybox` binary rather
+        # than a standalone `/usr/bin/busybox`, so the shim special-cases it.
+        awk: [gawk, mawk, original-awk, busybox]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # A PATH shim rather than `update-alternatives`, so the leg is explicit
+      # about which binary the suite gets and fails loudly if a package ever
+      # stops shipping that path.
+      - name: select ${{ matrix.awk }} as awk
+        run: |
+          sudo apt-get update
+          mkdir -p "$RUNNER_TEMP/awk-shim"
+          if [ '${{ matrix.awk }}' = busybox ]; then
+            sudo apt-get install -y --no-install-recommends busybox
+            test -x /usr/bin/busybox
+            printf '#!/bin/sh\nexec /usr/bin/busybox awk "$@"\n' \
+              > "$RUNNER_TEMP/awk-shim/awk"
+          else
+            sudo apt-get install -y --no-install-recommends '${{ matrix.awk }}'
+            test -x '/usr/bin/${{ matrix.awk }}'
+            printf '#!/bin/sh\nexec /usr/bin/%s "$@"\n' '${{ matrix.awk }}' \
+              > "$RUNNER_TEMP/awk-shim/awk"
+          fi
+          chmod +x "$RUNNER_TEMP/awk-shim/awk"
+          echo "$RUNNER_TEMP/awk-shim" >> "$GITHUB_PATH"
+      - name: awk in use
+        run: awk --version 2>&1 | head -n 1 || true
+      - run: sh tests/hooks/test_lib.sh
+
   # `bin/release` copies `## [Unreleased]` into the new version section
   # verbatim, so a repeated `### ` heading there ships release notes with the
   # entries split across two identical headings. Valid Markdown, invisible in

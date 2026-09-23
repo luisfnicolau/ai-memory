@@ -812,20 +812,42 @@ mod tests {
             "new-token"
         );
 
+        // An abrupt exit is a *three*-way race, and each outcome is the same
+        // correct verdict reached down a different path: the stdout reader
+        // sees EOF ("...ended before replying"), the stderr monitor sees EOF
+        // ("...ended before completing"), or the request write loses to the
+        // exit and takes EPIPE ("Could not write to..."). The first de-flake
+        // widened the assertion to the shared prefix of the first two, and a
+        // loaded runner then produced the third. Enumerate the branches
+        // instead of asserting a prefix: a substring wide enough to cover all
+        // three would no longer say anything.
+        const ABRUPT_EXIT: &[&str] = &[
+            "Codex recovery process ended before replying",
+            "Codex recovery process ended before completing",
+            "Could not write to Codex recovery process",
+        ];
         for (mode, expected) in [
-            ("wrong-id", "unexpected JSON-RPC response id"),
-            ("invalid", "invalid JSON"),
-            ("oversized", "exceeded its limit"),
-            ("stderr", "stderr exceeded its limit"),
-            ("exit", "ended before replying"),
-            ("exit-nonzero", "ended before replying"),
+            ("wrong-id", &["unexpected JSON-RPC response id"][..]),
+            ("invalid", &["invalid JSON"][..]),
+            ("oversized", &["exceeded its limit"][..]),
+            ("stderr", &["stderr exceeded its limit"][..]),
+            ("exit", ABRUPT_EXIT),
+            ("exit-nonzero", ABRUPT_EXIT),
         ] {
             fs::write(dir.path().join("fake-mode"), mode).unwrap();
             let error = recover_with_codex(&auth, Duration::from_secs(3))
                 .await
                 .unwrap_err()
                 .to_string();
-            assert!(error.contains(expected), "mode={mode}, error={error}");
+            assert!(
+                expected.iter().any(|want| error.contains(want)),
+                "mode={mode}, error={error}, expected one of {expected:?}"
+            );
+            // Whichever branch won, the operator has to be told how to fix it.
+            assert!(
+                error.contains("run `codex login status`"),
+                "mode={mode} must surface as a re-auth error, got {error}"
+            );
         }
 
         fs::write(dir.path().join("fake-mode"), "sleep").unwrap();

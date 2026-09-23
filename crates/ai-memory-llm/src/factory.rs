@@ -9,13 +9,14 @@ use secrecy::{ExposeSecret, SecretString};
 
 use crate::AnthropicProvider;
 use crate::CodexProvider;
+use crate::CopilotEmbedder;
 use crate::CopilotProvider;
 use crate::GeminiProvider;
 use crate::OpenAiCompatProvider;
 use crate::OpenAiOAuthProvider;
 use crate::OpenAiProvider;
 use crate::OpenCodeProvider;
-use crate::auth::{AuthRequirement, ProviderAuth};
+use crate::auth::{AuthRequirement, CopilotAuth, ProviderAuth};
 use crate::embedding::{Embedder, OpenAiCompatEmbedder, OpenAiEmbedder, VoyageEmbedder};
 use crate::error::{LlmError, LlmResult};
 use crate::google::GoogleEmbedder;
@@ -157,6 +158,9 @@ pub enum EmbedderChoice {
     /// manually; docs/local-embeddings.md).
     #[cfg(feature = "local-embeddings")]
     Local,
+    /// GitHub Copilot's OpenAI-compatible `/embeddings` endpoint. Reuses the
+    /// Copilot OAuth login (no separate API key).
+    Copilot,
 }
 
 impl EmbedderChoice {
@@ -171,6 +175,7 @@ impl EmbedderChoice {
             Self::OpenAiCompat => "openai-compat",
             #[cfg(feature = "local-embeddings")]
             Self::Local => "local",
+            Self::Copilot => "copilot",
         }
     }
 }
@@ -192,6 +197,9 @@ pub struct EmbedderConfig {
     pub base_url: Option<String>,
     /// `<data_dir>/models/` root, required by the `local` provider.
     pub models_dir: Option<std::path::PathBuf>,
+    /// Resolved Copilot auth, required by the `copilot` provider. `None`
+    /// for every other provider.
+    pub copilot_auth: Option<CopilotAuth>,
     /// True when no provider was configured and `local` was chosen as
     /// the 2.0 default. Best-effort semantics: a defaulted embedder
     /// that cannot fetch or load its model degrades to no-embedder with
@@ -252,6 +260,12 @@ pub fn build_embedder(config: EmbedderConfig) -> LlmResult<Arc<dyn Embedder>> {
             })?;
             Arc::new(crate::local::LocalEmbedder::load(&models_dir)?)
         }
+        EmbedderChoice::Copilot => {
+            let auth = config.copilot_auth.ok_or_else(|| {
+                LlmError::NotConfigured("copilot embedding provider requires Copilot auth".into())
+            })?;
+            Arc::new(CopilotEmbedder::new(auth, config.model, config.dim)?)
+        }
     };
     Ok(arc)
 }
@@ -281,6 +295,7 @@ pub fn try_default_embedding_dim(provider: EmbedderChoice, model: &str) -> Optio
         (EmbedderChoice::Google, "gemini-embedding-001") => Some(768),
         (EmbedderChoice::Google, _) => Some(768),
         (EmbedderChoice::OpenAiCompat, _) => None,
+        (EmbedderChoice::Copilot, _) => Some(crate::copilot::COPILOT_DEFAULT_EMBED_DIM),
     }
 }
 

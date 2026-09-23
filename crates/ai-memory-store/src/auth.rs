@@ -140,7 +140,7 @@ pub enum GrantOutcome {
 /// honest: there is exactly one unrevoked row per pair at every instant.
 ///
 /// `granted_by` is `None` for the root bearer token and for grants seeded
-/// when authorization is switched on — see the column comment in V65.
+/// when authorization is switched on — see the column comment in V68.
 ///
 /// # Errors
 /// Propagates any SQL error.
@@ -193,7 +193,7 @@ pub fn grant(
 /// harmless and still reports honestly.
 ///
 /// `revoked_by` is `None` when the operator acts through the root bearer
-/// token, which has no `users` row — see the column comment in V65. It must
+/// token, which has no `users` row — see the column comment in V68. It must
 /// not be able to prevent a revocation: taking access away is the operation
 /// that most needs to work when something has gone wrong.
 ///
@@ -435,7 +435,7 @@ pub struct SeedReport {
 /// the server must be able to hand out access themselves afterwards, or every
 /// subsequent grant funnels through whoever ran this.
 ///
-/// Seeded grants carry no granter — see the column comment in V65. Pairs that
+/// Seeded grants carry no granter — see the column comment in V68. Pairs that
 /// already hold something are left exactly as they are, so running this twice
 /// changes nothing the second time.
 ///

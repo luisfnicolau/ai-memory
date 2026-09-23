@@ -1,13 +1,16 @@
 # Installation cookbook
 
 The [README quick-start](../README.md#quick-start) covers the happy
-path (docker + Claude Code). This page covers everything else:
+paths (Docker + Claude Code, Arch AUR, macOS menu bar app). This page
+covers everything else:
 
 - [Server on a different machine](#server-on-a-different-machine)
   (homelab, LAN box, remote server)
 - [Configuring the CLI URL and auth](#configuring-the-cli-url-and-auth)
 - [Arch Linux native packages (AUR)](#arch-linux-native-packages-aur)
   (systemd system service or user service)
+- [macOS menu bar app](#macos-menu-bar-app)
+  (self-contained `.app` + LaunchAgent)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
   (Codex, Command Code, Devin CLI, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, ZCode, Kimi Code, Kiro CLI, Pool, OpenClaw, VS Code Copilot, Zed)
 - [Installing hooks without docker](#installing-hooks-without-docker)
@@ -563,19 +566,21 @@ opt-in** — enable the server first, then the client:
 1. **Server:** set `capture_assistant = true` in the live
    `<data_dir>/config.toml` (or the service's configured TOML file), or set
    `AI_MEMORY_CAPTURE_ASSISTANT=true`, then restart `ai-memory serve`.
-2. **Client:** re-install the Claude Code hooks with the flag:
+2. **Client:** re-install the Claude Code (or Codex) hooks with the flag:
 
    ```bash
    ai-memory install-hooks --agent claude-code --capture-assistant --apply
+   # Codex is supported too — its Stop payload carries last_assistant_message:
+   ai-memory install-hooks --agent codex --capture-assistant --apply
    ```
 
 The client sanitizes (built-in patterns) and truncates the excerpt before it
 touches the spool or wire; the server re-scrubs with its `[sanitize]` patterns
 before storing. If either side is off — or the marker is malformed — the Stop
 stays empty. Re-running `install-hooks` without `--capture-assistant` removes
-the flag (idempotent). `--capture-assistant` is Claude Code + native-platform
-only; on any other agent or the script fallback the installer refuses it rather
-than enabling something that cannot take effect. Assistant text is
+the flag (idempotent). `--capture-assistant` is Claude Code and Codex on a
+native hook platform only; on any other agent or the script fallback the
+installer refuses it rather than enabling something that cannot take effect. Assistant text is
 privacy-sensitive — read the `SECURITY.md` notes on what it can contain and where
 it flows (consolidation/reviewer prompts, and out to a cloud LLM provider if one
 is configured) before enabling it.
@@ -593,14 +598,20 @@ agent host, then use that native executable to run
 `install-hooks --agent claude-code --apply`. Even if the script fallback is
 retained, the server still strips any raw field on receipt before persistence.
 
-Native `ai-memory hook --event ...` commands spool events locally. Session start
+Native `ai-memory hook --event ...` commands spool events locally. The POSIX
+shell bundle spools too, but only on failure: it POSTs first and writes the
+event to the same `<data_dir>/hook-spool/` contract when the server is
+unreachable or answers 5xx, then flushes the backlog behind the next delivery
+that succeeds. A 4xx is a permanent rejection and is not retried. (The
+PowerShell bundle still drops an undelivered event.) Session start
 does a short bounded cleanup drain before fetching a handoff; cancellation-prone
 boundary events (`stop`, `pre-compact`, and `session-end`) start a detached
 `hook-drain` helper so delivery does not depend on one shutdown hook surviving.
-Each spooled entry keeps one idempotency key across retries. A server that
-processed an event but lost the batch response will not duplicate its
-observation or completed session-end effects; if processing stopped after the
-observation commit, the retry re-runs downstream work. SessionEnd atomically
+The POSIX bundle assigns one idempotency key before its initial POST and keeps
+that key if the event enters the spool. A server that processed an event but
+lost the response will not duplicate its observation or completed session-end
+effects; if processing stopped after the observation commit, the retry re-runs
+downstream work. SessionEnd atomically
 commits its end watermark with its automatic handoff; a retry that finds that
 transaction complete finishes any interrupted wiki commit, durable provider
 enqueue, and ingest-key completion without adding a second handoff. Those
@@ -703,6 +714,42 @@ AI_MEMORY_NATIVE_TEST_BOX=ai-memory-native-test scripts/test-native-arch-systemd
 AI_MEMORY_NATIVE_TEST_KEEP_BOX=1 scripts/test-native-arch-systemd-distrobox.sh
 AI_MEMORY_NATIVE_TEST_IMAGE=quay.io/toolbx/arch-toolbox:latest scripts/test-native-arch-systemd-distrobox.sh
 ```
+
+---
+
+## macOS menu bar app
+
+On a Mac, the self-contained menu bar app is the GUI install: it bundles the
+native `ai-memory` binary and `hooks/` tree, governs the existing LaunchAgent
+(`com.github.akitaonrails.ai-memory`), and opens `/web`, `ai-memory status`,
+`config.toml`, the data directory, and logs. It does not replace those tools
+with a second dashboard.
+
+Needs a Rust toolchain and Xcode / Swift 6 (the same as a source build):
+
+```bash
+git clone https://github.com/akitaonrails/ai-memory
+cd ai-memory
+./companions/ai-memory-macos/build.sh
+open "companions/ai-memory-macos/dist/AI Memory.app"
+```
+
+Drag **AI Memory.app** to `/Applications`, then **Install & Start Server**
+from the menu extra (no Dock icon). When the status item is green, wire an
+agent with the bundled binary so `install-hooks` finds the sibling `hooks/`
+tree:
+
+```bash
+BIN="/Applications/AI Memory.app/Contents/Resources/runtime/ai-memory"
+"$BIN" install-mcp --client claude-code --apply
+"$BIN" install-hooks --agent claude-code --apply
+```
+
+Durable memory stays in `~/Library/Application Support/ai-memory`. Replacing
+the `.app` is an update and does not rewrite that tree. Prebuilt tarball,
+source-build, Docker-wrapper, and hand-installed launchd paths remain in
+[`docs/macos.md`](macos.md). Companion source:
+[`companions/ai-memory-macos`](../companions/ai-memory-macos).
 
 ---
 
@@ -865,7 +912,8 @@ successful calls; it reuses the post-tool-use handler), `Stop`,
 native `ai-memory hook --event … --agent kimi-code` commands on local installs
 (local spool plus batched delivery, capture-policy v1 enforced); the staged
 script bundle under `~/.local/share/ai-memory/hooks/kimi-code/` is the
-compatibility fallback (fire-and-forget POSTs to `/hook`). A pending handoff
+compatibility fallback (POSTs to `/hook`, spooling a failed delivery for a
+later drain, without capture-policy v1 enforcement). A pending handoff
 is injected at `UserPromptSubmit` through the hook's stdout, which Kimi Code
 appends to the model context as a user message before the turn; Kimi Code
 fires `SessionStart` but discards that hook's stdout, so hooks installed by
@@ -1534,7 +1582,9 @@ The `serve` subcommand also accepts:
 | _(config only)_ | `AI_MEMORY_HOOK_RATE_PER_SEC`, `AI_MEMORY_HOOK_RATE_BURST` | Optional per-actor/session hook ingest token bucket. Unset/`0` rate disables it; burst defaults to the rate (minimum one token when enabled). |
 
 On macOS, see [`docs/macos.md`](macos.md); use the archive matching your
-architecture: `aarch64` for Apple Silicon, `x86_64` for Intel. On Windows, see
+architecture: `aarch64` for Apple Silicon, `x86_64` for Intel. The
+[menu bar app](#macos-menu-bar-app) is the self-contained GUI path (bundles
+the binary, starts the LaunchAgent, opens `/web` and status). On Windows, see
 [`docs/windows.md`](windows.md).
 The short version: run the install commands from the same environment that
 launches the agent. WSL2-launched agents need WSL paths and POSIX `.sh` hooks.
@@ -1592,6 +1642,7 @@ If you set only the provider, ai-memory picks a sensible default:
 | `AI_MEMORY_EMBEDDING_PROVIDER=voyage` | `voyage-3` (1024-dim) | Voyage's current general-purpose recommendation. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=google` / `gemini` | `gemini-embedding-001` (768-dim) | Google-hosted embeddings via `embedContent`. Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`). |
 | `AI_MEMORY_EMBEDDING_PROVIDER=openai-compat` | no default — set model, dim, and base URL explicitly | Self-hosted engines (Ollama, LM Studio, vLLM). Keyless by default; `EMBEDDING_API_KEY`, else `LLM_API_KEY`, is sent as a bearer token when present (gateways). Example: `AI_MEMORY_EMBEDDING_BASE_URL=http://localhost:11434/v1`, `AI_MEMORY_EMBEDDING_MODEL=nomic-embed-text`, `AI_MEMORY_EMBEDDING_DIM=768`. Switching an existing `openai`+base-URL setup to `openai-compat` changes the stored `{provider, model, dim}` triple — run `ai-memory embed --force` to re-embed. |
+| `AI_MEMORY_EMBEDDING_PROVIDER=copilot` | `text-embedding-3-small` (1536-dim) | Reuses the `copilot` LLM provider's OAuth login (`ai-memory auth login copilot`, `COPILOT_GITHUB_TOKEN`, or `GITHUB_COPILOT_API_TOKEN`) — no separate API key. Calls Copilot's `/embeddings` endpoint following the OpenAI-compatible contract Copilot documents for chat; that endpoint's exact shape is not covered by a live test against Copilot here, so treat it as needing a real-Copilot smoke test. |
 
 > **What we don't recommend:** reasoning-mode models (Claude with extended
 > thinking, GPT-o3, Gemini "thinking" variants) — they burn token budget on
@@ -1720,13 +1771,13 @@ Use `ai-memory auth status` to check whether a token is present and
 `ai-memory auth logout openai-oauth` to remove it.
 
 > [!TIP]
-> **Pick a small, fast model.** Consolidation / lint / explore are
-> summarisation tasks, not hard reasoning — a mini-class model is plenty and
-> is much easier on subscription rate limits. Set e.g.
-> `AI_MEMORY_LLM_MODEL=gpt-5-mini` (the `gpt-5.5` default works but is
-> overkill for this workload). If you stay on a reasoning model, set
-> `AI_MEMORY_LLM_REASONING_EFFORT=none` or `low` so hidden thought tokens
-> do not eat the JSON budget. Reserve high-effort reasoning for your
+> **Leave the model at the provider default (`gpt-5.5`).** The Codex/ChatGPT
+> backend behind `openai-oauth` only accepts a small server-defined set of model
+> ids and rejects others — including `gpt-5-mini` — with a deterministic 400, so
+> do not set `AI_MEMORY_LLM_MODEL` for this backend. Consolidation / lint /
+> explore are summarisation tasks, so if the default reasoning is too heavy set
+> `AI_MEMORY_LLM_REASONING_EFFORT=none` or `low` instead, so hidden thought
+> tokens do not eat the JSON budget. Reserve high-effort reasoning for your
 > coding agent.
 
 ### Codex credential reuse
@@ -2359,6 +2410,11 @@ unrelated Compose project just because its file occupies a conventional path;
 the wrapper instead writes the inspected standalone recreation script for
 review, preserving the existing `/data` mount and other runtime options.
 
+The macOS menu bar app is not covered by `ai-memory upgrade`. Rebuild with
+`./companions/ai-memory-macos/build.sh` (or replace `/Applications/AI Memory.app`
+with a newer staged bundle). Wiki, SQLite, config, and models stay in
+`~/Library/Application Support/ai-memory`.
+
 Set `AI_MEMORY_NO_VERSION_CHECK=1` to silence the daily check. To pin wrapper
 self-upgrades to a fork or tagged release, set `AI_MEMORY_WRAPPER_URL=<url>`;
 the wrapper requires `<url>.sha256` unless
@@ -2366,7 +2422,28 @@ the wrapper requires `<url>.sha256` unless
 
 When the upgraded server starts, it applies SQLite schema migrations and
 pending wiki-structure migrations automatically. No manual database
-reset or wiki rewrite is required for normal upgrades.
+reset or wiki rewrite is required for normal upgrades. Migrations are
+forward-only: after a newer version has applied its schema, an older binary
+will refuse to open that data dir (it fails closed rather than risk
+corruption), so take a `ai-memory backup` before upgrading if you might need
+to roll back to the previous version.
+
+### Upgrading to 2.3.0
+
+2.3.0 is a normal forward upgrade (the only new migration, `V64`, just adds the
+cross-project `agent_messages` table — nothing existing is altered or removed).
+Two capture/UX conveniences are **on by default**; both are additive and
+non-destructive, but worth knowing about for your first session after upgrading:
+
+- **First `ai-memory run <harness>` auto-installs that harness's hooks + MCP** if
+  they were not already wired (idempotent, one-time per harness; it preserves
+  your existing hook config, including a `--capture-assistant` opt-in). Disable
+  with `ai-memory run --no-autowire` or `AI_MEMORY_RUN_AUTOWIRE=false`.
+- **The first session in a brand-new (empty) project imports that project's
+  existing local harness history once**, so installing ai-memory mid-project is
+  not amnesiac. It only ever runs on an empty project (never touches one that
+  already has captured memory) and is hard-capped. Disable with
+  `AI_MEMORY_BACKFILL_ON_START=false`; run it by hand with `ai-memory backfill`.
 
 If the server runs on another host, `ai-memory upgrade` refreshes only
 the local wrapper, local image, and local hook scripts. Redeploy the
@@ -2381,6 +2458,8 @@ write to `~/.local/share/ai-memory/hooks/`.
 
 ## See also
 
+- [`docs/macos.md`](macos.md) - macOS install paths: menu bar app, native
+  release tarball, source build, Docker wrapper, and launchd
 - [`docs/deploy.md`](deploy.md) - homelab deploy walkthrough
   (`bin/deploy`, cloudflared TLS, env-file management)
 - [`docs/usage.md`](usage.md) - handoffs, proactive querying, web UI, slim
