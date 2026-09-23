@@ -140,7 +140,9 @@ pub enum GrantOutcome {
 /// honest: there is exactly one unrevoked row per pair at every instant.
 ///
 /// `granted_by` is `None` for the root bearer token and for grants seeded
-/// when authorization is switched on — see the column comment in V68.
+/// when authorization is switched on, and `user_id` itself for the grant a
+/// creator receives with the repository they create — see the column comment
+/// in V68.
 ///
 /// # Errors
 /// Propagates any SQL error.

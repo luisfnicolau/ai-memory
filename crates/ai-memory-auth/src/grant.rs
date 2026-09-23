@@ -88,6 +88,9 @@ pub struct MemoryGrant {
     /// seeded when authorization was switched on, or the operator used the
     /// root bearer token, which authenticates from configuration. Naming a
     /// person there would invent a decision that was never made.
+    ///
+    /// Equal to `user_id` for exactly one kind of grant: the `admin` a user
+    /// receives with a repository they create, where the act was theirs.
     pub granted_by_user_id: Option<UserId>,
     /// When it was granted, or when it was seeded.
     pub granted_at: Timestamp,

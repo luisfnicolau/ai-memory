@@ -258,6 +258,30 @@ pub fn get_or_create_project(
     name: &str,
     repo_path: Option<&str>,
 ) -> StoreResult<ai_memory_core::ProjectId> {
+    get_or_create_project_as(conn, workspace_id, name, repo_path, None).map(|(id, _)| id)
+}
+
+/// [`get_or_create_project`] on behalf of a user, reporting whether this call
+/// created the row.
+///
+/// When it does and `creator` is set, the creator is granted `admin` on the new
+/// repository in the same transaction, recorded as their own granter. With
+/// authorization on, the creator otherwise could not read back what they had
+/// just made, and a hook capture opening a new repository would create it and
+/// then be refused on it forever. Same transaction because the alternative is
+/// a window in which the row exists and nobody may reach it — and a caller
+/// that sees `created == false` must authorize against the existing row, which
+/// is what closes the race between two users naming the same new repository.
+///
+/// # Errors
+/// Propagates SQLite failures.
+pub fn get_or_create_project_as(
+    conn: &mut Connection,
+    workspace_id: &ai_memory_core::WorkspaceId,
+    name: &str,
+    repo_path: Option<&str>,
+    creator: Option<ai_memory_core::UserId>,
+) -> StoreResult<(ai_memory_core::ProjectId, bool)> {
     let repo_path = repo_path.map(normalize_repo_path_key);
     let tx = conn.transaction()?;
     let mut also_in = Vec::new();
@@ -288,6 +312,16 @@ pub fn get_or_create_project(
         created = true;
         id
     };
+    if created && let Some(creator) = creator {
+        crate::auth::grant(
+            &tx,
+            creator,
+            id,
+            ai_memory_auth::GrantRole::Admin,
+            Some(creator),
+            Timestamp::now().as_microsecond(),
+        )?;
+    }
     tx.commit()?;
     if scheduler_state_table_exists(conn)? {
         crate::auto_improve::ensure_scheduler_state(conn, *workspace_id, id)?;
@@ -295,7 +329,7 @@ pub fn get_or_create_project(
     if created {
         warn_project_name_in_other_workspaces(name, &also_in);
     }
-    Ok(id)
+    Ok((id, created))
 }
 
 /// Delete "hollow" project rows: zero pages (any version), zero sessions,
@@ -310,8 +344,8 @@ pub fn get_or_create_project(
 /// scope) are exempt even when empty. Returns the deleted names for logging.
 ///
 /// A repository somebody holds a grant on is not hollow, whatever it contains:
-/// it is waiting for its first write, and the grant is a decision an operator
-/// made about it. Sweeping it would take that access away on a schedule with
+/// it is waiting for its first write, and the grant is a decision somebody
+/// made about it — an operator's, or the creator's, by creating it. Sweeping it would take that access away on a schedule with
 /// nobody watching — and the database now refuses to, so without this the
 /// whole sweep would fail on the first such row. Revoked-only history does not
 /// hold a repository back; its rows survive the delete (V68).

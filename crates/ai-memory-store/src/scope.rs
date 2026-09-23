@@ -407,12 +407,15 @@ pub async fn lookup_existing_scope_guarded(
 /// - The repository already exists: the user must hold `required` on it, the
 ///   same as any other write. Otherwise "create" would be a way to reach a
 ///   repository the guard would have refused on the read path.
-/// - The repository does not exist yet: there is nothing to hold a grant on,
-///   so creation proceeds. Note the creator does not receive a grant here —
-///   there is no grant *write* path in the store yet, so on an install with
-///   authorization enabled the creator cannot read back what they just made.
-///   The enable/grant-admin work closes that; until it lands nobody can be in
-///   that state, because nothing can enable authorization.
+/// - The repository does not exist yet: this call creates it, and the creator
+///   is granted `admin` on it in the same transaction, recorded as their own
+///   granter — without that, the creator could not read back what they had
+///   just made.
+///
+/// Which shape applies is decided by the writer, not by a lookup beforehand.
+/// Looking first and creating second leaves a window in which another user
+/// creates the repository, and `get_or_create` then hands their row back
+/// unchecked.
 ///
 /// # Errors
 /// As [`create_explicit_scope`], plus [`ScopeResolutionError::NotAuthorized`].
@@ -424,16 +427,21 @@ pub async fn create_explicit_scope_guarded(
     authorized_user: Option<ai_memory_core::UserId>,
     required: ai_memory_auth::GrantRole,
 ) -> Result<ResolvedScope, ScopeResolutionError> {
-    match lookup_existing_scope(reader, workspace, project).await {
-        Ok(existing) => {
-            authorize_scope(reader, existing, authorized_user, required, project).await?;
-        }
-        // A repository that is not there yet cannot carry a grant. Any other
-        // failure is a real store problem and must not be read as "absent".
-        Err(err) if err.is_not_found() => {}
-        Err(err) => return Err(err),
+    let Some(creator) = authorized_user else {
+        return create_explicit_scope(writer, workspace, project).await;
+    };
+    let workspace_id = writer.get_or_create_workspace(workspace.to_owned()).await?;
+    let (project_id, created) = writer
+        .get_or_create_project_as(workspace_id, project.to_owned(), None, Some(creator))
+        .await?;
+    let scope = ResolvedScope {
+        workspace_id,
+        project_id,
+    };
+    if created {
+        return Ok(scope);
     }
-    create_explicit_scope(writer, workspace, project).await
+    authorize_scope(reader, scope, Some(creator), required, project).await
 }
 
 /// [`resolve_many_existing_scopes`] with the authorization check applied to
@@ -865,34 +873,23 @@ impl<'a> ScopeResolver<'a> {
                 .map(|(workspace_id, _)| workspace_id)
                 .unwrap_or(self.default_workspace_id),
         };
-        // Authorize before creating, and only when there is something to
-        // authorize against: a write to an existing repository is checked
-        // exactly as a read of it would be, so "create" cannot be a way in.
-        // A project that does not exist yet holds no grant — see
-        // [`create_explicit_scope_guarded`] for why that is allowed and what
-        // still has to close behind it.
-        if let Some(existing) = self
-            .reader
-            .find_project(workspace_id, project.to_owned())
-            .await?
-        {
-            self.guard(
-                ResolvedScope {
-                    workspace_id,
-                    project_id: existing,
-                },
-                ai_memory_auth::GrantRole::Writer,
-                Some(project),
-            )
+        // A write to an existing repository is checked exactly as a read of it
+        // would be, so "create" cannot be a way in. One this call creates
+        // grants its creator `admin` in the same transaction, so there is
+        // nothing to check — see [`create_explicit_scope_guarded`] for why the
+        // writer, not a lookup beforehand, decides which case this is.
+        let (project_id, created) = writer
+            .get_or_create_project_as(workspace_id, project.to_owned(), None, self.viewer)
             .await?;
-        }
-        let project_id = writer
-            .get_or_create_project(workspace_id, project.to_owned(), None)
-            .await?;
-        Ok(ResolvedScope {
+        let scope = ResolvedScope {
             workspace_id,
             project_id,
-        })
+        };
+        if created {
+            return Ok(scope);
+        }
+        self.guard(scope, ai_memory_auth::GrantRole::Writer, Some(project))
+            .await
     }
 
     /// Resolve and de-duplicate an explicit multi-scope list.
@@ -1172,8 +1169,9 @@ mod tests {
             }
         ));
 
-        // A repository that does not exist yet cannot carry a grant, so
-        // creating it proceeds.
+        // A repository that does not exist yet cannot be refused, so creating
+        // it proceeds — and hands its creator admin, recorded as their own
+        // grant, so they can read back what they just made.
         let fresh = create_explicit_scope_guarded(
             &store.reader,
             &store.writer,
@@ -1186,6 +1184,140 @@ mod tests {
         .unwrap();
         assert_eq!(fresh.workspace_id, ws);
         assert_ne!(fresh.project_id, project);
+        let grants = store
+            .reader
+            .grants_for(bob, fresh.project_id)
+            .await
+            .unwrap();
+        assert_eq!(grants.len(), 1, "{grants:?}");
+        assert_eq!(grants[0].role, GrantRole::Admin);
+        assert_eq!(grants[0].granted_by_user_id, Some(bob));
+        lookup_existing_scope_guarded(
+            &store.reader,
+            "default",
+            "brand-new",
+            Some(bob),
+            GrantRole::Reader,
+        )
+        .await
+        .expect("the creator reads back what they created");
+
+        // Creating it hands nothing to anyone else, and a second "create" of
+        // the same name is a write to an existing repository: refused, and no
+        // grant appears as a side effect.
+        let err = create_explicit_scope_guarded(
+            &store.reader,
+            &store.writer,
+            "default",
+            "brand-new",
+            Some(alice),
+            GrantRole::Writer,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ScopeResolutionError::NotAuthorized { held: None, .. }
+        ));
+        assert!(
+            store
+                .reader
+                .grants_for(alice, fresh.project_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// With no viewer — authorization off, an open install, or root — creating
+    /// writes no grant. The switch's preflight refuses to start on an install
+    /// where no grant was ever written; a grant appearing here would let it
+    /// pass without `grant seed` ever having run.
+    #[tokio::test]
+    async fn creating_without_a_viewer_grants_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (_, _, alice, _) = guard_fixture(&store).await;
+
+        let fresh = create_explicit_scope_guarded(
+            &store.reader,
+            &store.writer,
+            "default",
+            "unguarded",
+            None,
+            GrantRole::Writer,
+        )
+        .await
+        .unwrap();
+        assert!(
+            store
+                .reader
+                .grants_for(alice, fresh.project_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        let any: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory_grant", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(any, 0);
+    }
+
+    /// The MCP write path creates through the resolver, not the free function,
+    /// and must behave the same: the creator gets admin, and a name somebody
+    /// else already created is checked rather than handed back.
+    #[tokio::test]
+    async fn write_args_grant_the_creator_and_check_everyone_else() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, project, alice, bob) = guard_fixture(&store).await;
+        let actor = ActorKey {
+            user: None,
+            session_id: None,
+        };
+
+        let as_bob =
+            ScopeResolver::new(&store.reader, ws, project, Some(bob)).with_writer(&store.writer);
+        let created = as_bob
+            .resolve_write_args(Some("default"), Some("bobs-repo"), &actor)
+            .await
+            .unwrap();
+        let grants = store
+            .reader
+            .grants_for(bob, created.project_id)
+            .await
+            .unwrap();
+        assert_eq!(grants.len(), 1, "{grants:?}");
+        assert_eq!(grants[0].role, GrantRole::Admin);
+        assert_eq!(grants[0].granted_by_user_id, Some(bob));
+
+        // Writing to it again is a write to an existing repository he holds
+        // admin on; no second grant is issued.
+        as_bob
+            .resolve_write_args(Some("default"), Some("bobs-repo"), &actor)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .reader
+                .grants_for(bob, created.project_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let as_alice =
+            ScopeResolver::new(&store.reader, ws, project, Some(alice)).with_writer(&store.writer);
+        let err = as_alice
+            .resolve_write_args(Some("default"), Some("bobs-repo"), &actor)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ScopeResolutionError::NotAuthorized { held: None, .. }
+        ));
     }
 
     #[tokio::test]

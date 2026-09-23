@@ -650,7 +650,7 @@ async fn handle_hook(
     // extensions still exist, and travels with the event into `process()`.
     let skip_webhooks = admission_skips(level_ext, &headers);
     let actor_storage_key = actor.as_ref().map(IdentityKey::storage_key);
-    if should_drop_subagent(&state, &env).await {
+    if should_drop_subagent(&state, &env, viewer).await {
         state.ingest_metrics.record_dropped_by_policy();
         return (StatusCode::ACCEPTED, "subagent capture dropped");
     }
@@ -837,7 +837,7 @@ async fn handle_hook_batch(
         // Accept-but-drop subagent captures (see `handle_hook`): count the item
         // as committed so the client clears it from its spool, but do not store
         // it. Keeps the contiguous-prefix ack contract intact.
-        if should_drop_subagent(&state, &env).await {
+        if should_drop_subagent(&state, &env, viewer).await {
             state.ingest_metrics.record_dropped_by_policy();
             accepted_indices.push(idx);
             continue;
@@ -1159,7 +1159,11 @@ const fn canonical_tool_name(family: ToolFamily) -> &'static str {
 /// `stop` / `session_end`) of a session already known to be a subagent. No-op
 /// (returns `false`) unless this event's project opted in via the per-event
 /// `drop_subagent` flag (sourced from its `.ai-memory.toml`).
-async fn should_drop_subagent(state: &HookState, env: &HookEnvelope) -> bool {
+async fn should_drop_subagent(
+    state: &HookState,
+    env: &HookEnvelope,
+    viewer: Option<ai_memory_core::UserId>,
+) -> bool {
     if !env.drop_subagent_requested {
         return false;
     }
@@ -1172,6 +1176,7 @@ async fn should_drop_subagent(state: &HookState, env: &HookEnvelope) -> bool {
         env.workspace_override.as_deref(),
         env.project_override.as_deref(),
         env.project_strategy,
+        viewer,
     )
     .await
     else {
@@ -1314,6 +1319,7 @@ async fn fetch_and_accept_handoff(
         query.workspace.as_deref(),
         query.project.as_deref(),
         ProjectStrategy::parse(query.project_strategy.as_deref()),
+        viewer,
     )
     .await?;
     // Everything below returns this repository's content — its handoff and
@@ -2093,6 +2099,7 @@ async fn resolve_project_ids_inner(
     workspace_override: Option<&str>,
     project_override: Option<&str>,
     project_strategy: ProjectStrategy,
+    creator: Option<ai_memory_core::UserId>,
 ) -> anyhow::Result<(WorkspaceId, ProjectId)> {
     let cwd_norm = cwd
         .filter(|s| !s.is_empty())
@@ -2300,11 +2307,16 @@ async fn resolve_project_ids_inner(
         );
         parent_id
     } else {
+        // `creator` is the authorized viewer, set only when per-repository
+        // authorization is on. A repository this capture opens is granted to
+        // them in the same transaction; without that the capture would create
+        // it and then be refused on it, as would every capture after it.
         state
             .writer
-            .get_or_create_project(ws, project_name, repo_path)
+            .get_or_create_project_as(ws, project_name, repo_path, creator)
             .await
             .map_err(|e| anyhow::anyhow!("get_or_create_project: {e}"))?
+            .0
     };
     let ids = (ws, proj);
     state.project_cache.lock().await.insert(cache_key, ids);
@@ -2330,6 +2342,7 @@ async fn resolve_project_ids(
         workspace_override,
         project_override,
         project_strategy,
+        None,
     )
     .await?;
     if has_publishable_scope_hint(cwd, project_override) {
@@ -2660,6 +2673,7 @@ async fn process_authorized(
                 env.workspace_override.as_deref(),
                 env.project_override.as_deref(),
                 env.project_strategy,
+                viewer,
             )
             .await?
         }
@@ -2796,6 +2810,7 @@ async fn process_authorized(
                     env.workspace_override.as_deref(),
                     env.project_override.as_deref(),
                     env.project_strategy,
+                    viewer,
                 )
                 .await?;
             }
@@ -3993,6 +4008,69 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stored.len(), 1);
+    }
+
+    /// A capture that opens a new repository grants it to the user capturing.
+    ///
+    /// The hook path creates a repository before it checks the grant, so
+    /// without this the first capture from a new checkout would create the
+    /// row and then be refused on it — and so would every capture after it,
+    /// since nobody would ever hold a grant on it. The creator is granted
+    /// admin, as their own granter; a second user reaching the same row finds
+    /// it existing and is checked like anyone else.
+    #[tokio::test]
+    async fn a_capture_opening_a_new_repository_grants_it_to_its_creator() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let repo = tmp.path().join("fresh-checkout");
+        std::fs::create_dir_all(&repo).unwrap();
+        let cora = user_holding(&state, "cora", state.project_id, None).await;
+        let dan = user_holding(&state, "dan", state.project_id, None).await;
+
+        let first = SessionId::new().to_string();
+        capture_as(&state, &repo, &first, Some(cora))
+            .await
+            .expect("the capture that creates a repository must be kept");
+        let stored = state
+            .reader
+            .observations_for_session(first.parse().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        let created = stored[0].project_id;
+        assert_ne!(created, state.project_id);
+        let grants = state.reader.grants_for(cora, created).await.unwrap();
+        assert_eq!(grants.len(), 1, "{grants:?}");
+        assert_eq!(grants[0].role, ai_memory_store::GrantRole::Admin);
+        assert_eq!(grants[0].granted_by_user_id, Some(cora));
+
+        let second = SessionId::new().to_string();
+        capture_as(&state, &repo, &second, Some(cora))
+            .await
+            .expect("and so must every capture after it");
+
+        let intruder = SessionId::new().to_string();
+        let refused = capture_as(&state, &repo, &intruder, Some(dan)).await;
+        assert!(
+            refused.is_err_and(|e| e.is::<CaptureNotAuthorized>()),
+            "a second user must not inherit the creator's repository"
+        );
+        assert!(
+            state
+                .reader
+                .observations_for_session(intruder.parse().unwrap())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            state
+                .reader
+                .grants_for(dan, created)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// A capture, with the viewer it is authenticated as.
@@ -6442,7 +6520,7 @@ mod tests {
                 "sessionId": "shared-session", "subagentType": "general-purpose"
             }),
         );
-        assert!(should_drop_subagent(&state, &marked_project_a).await);
+        assert!(should_drop_subagent(&state, &marked_project_a, None).await);
         assert!(
             state.active_project.get().is_none(),
             "drop preflight may resolve scope but must not publish it as active"
@@ -6459,7 +6537,7 @@ mod tests {
             serde_json::json!({ "sessionId": "shared-session", "toolName": "kept" }),
         );
         assert!(
-            !should_drop_subagent(&state, &unmarked_project_b).await,
+            !should_drop_subagent(&state, &unmarked_project_b, None).await,
             "a subagent session tracked in project-a must not drop same-id events in project-b"
         );
 
@@ -6474,7 +6552,7 @@ mod tests {
             serde_json::json!({ "sessionId": "shared-session", "toolName": "dropped" }),
         );
         assert!(
-            should_drop_subagent(&state, &unmarked_project_a).await,
+            should_drop_subagent(&state, &unmarked_project_a, None).await,
             "the originally tracked project's unmarked tail still drops"
         );
     }
@@ -6496,20 +6574,20 @@ mod tests {
             query("subagent-start"),
             serde_json::json!({ "sessionId": "tail-session" }),
         );
-        assert!(should_drop_subagent(&state, &start).await);
+        assert!(should_drop_subagent(&state, &start, None).await);
 
         let subagent_stop = HookEnvelope::from_query_and_body(
             query("subagent-stop"),
             serde_json::json!({ "sessionId": "tail-session" }),
         );
-        assert!(should_drop_subagent(&state, &subagent_stop).await);
+        assert!(should_drop_subagent(&state, &subagent_stop, None).await);
 
         let unmarked_stop_tail = HookEnvelope::from_query_and_body(
             query("stop"),
             serde_json::json!({ "sessionId": "tail-session" }),
         );
         assert!(
-            should_drop_subagent(&state, &unmarked_stop_tail).await,
+            should_drop_subagent(&state, &unmarked_stop_tail, None).await,
             "SubagentStop must not clear tracking before the unmarked stop tail"
         );
 
@@ -6518,7 +6596,7 @@ mod tests {
             serde_json::json!({ "sessionId": "tail-session" }),
         );
         assert!(
-            should_drop_subagent(&state, &session_end_tail).await,
+            should_drop_subagent(&state, &session_end_tail, None).await,
             "SessionEnd tail is dropped and then clears tracking"
         );
 
@@ -6527,7 +6605,7 @@ mod tests {
             serde_json::json!({ "sessionId": "tail-session", "toolName": "kept" }),
         );
         assert!(
-            !should_drop_subagent(&state, &after_session_end).await,
+            !should_drop_subagent(&state, &after_session_end, None).await,
             "SessionEnd clears tracking for that scoped session"
         );
     }

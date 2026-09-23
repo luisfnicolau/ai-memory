@@ -80,6 +80,12 @@ CREATE TABLE memory_grant (
     -- the root token carries no `author_id` either. Inventing a row, or naming
     -- the grantee as their own granter, would be a plausible-looking lie in
     -- the one table an access review reads.
+    --
+    -- The one grant that does name its grantee is the creator's: whoever
+    -- creates a repository is granted `admin` on it in the same transaction,
+    -- and the act that produced that grant was theirs. So
+    -- `granted_by_user_id = user_id` reads as exactly one thing — "acquired by
+    -- creating the repository" — and never as an access somebody else decided.
     granted_by_user_id    BLOB REFERENCES users(id),
     granted_at            INTEGER NOT NULL,
 

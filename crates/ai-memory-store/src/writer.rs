@@ -61,6 +61,13 @@ pub(crate) enum WriteCmd {
         repo_path: Option<String>,
         reply: oneshot::Sender<StoreResult<ProjectId>>,
     },
+    GetOrCreateProjectAs {
+        workspace_id: WorkspaceId,
+        name: String,
+        repo_path: Option<String>,
+        creator: Option<ai_memory_core::UserId>,
+        reply: oneshot::Sender<StoreResult<(ProjectId, bool)>>,
+    },
     EnsureProjectWorkspace {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
@@ -737,6 +744,33 @@ impl WriterHandle {
             workspace_id,
             name: name.into(),
             repo_path,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// [`Self::get_or_create_project`] on behalf of `creator`, who is granted
+    /// `admin` in the same transaction when this call creates the row. Returns
+    /// whether it did: a caller that gets `false` must authorize against the
+    /// existing repository — see [`ops::get_or_create_project_as`].
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error.
+    pub async fn get_or_create_project_as(
+        &self,
+        workspace_id: WorkspaceId,
+        name: impl Into<String>,
+        repo_path: Option<String>,
+        creator: Option<ai_memory_core::UserId>,
+    ) -> StoreResult<(ProjectId, bool)> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::GetOrCreateProjectAs {
+            workspace_id,
+            name: name.into(),
+            repo_path,
+            creator,
             reply: tx,
         })
         .await?;
@@ -2793,6 +2827,22 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     repo_path.as_deref(),
                 );
                 send_or_warn(reply, result, "get_or_create_project");
+            }
+            WriteCmd::GetOrCreateProjectAs {
+                workspace_id,
+                name,
+                repo_path,
+                creator,
+                reply,
+            } => {
+                let result = ops::get_or_create_project_as(
+                    &mut conn,
+                    &workspace_id,
+                    &name,
+                    repo_path.as_deref(),
+                    creator,
+                );
+                send_or_warn(reply, result, "get_or_create_project_as");
             }
             WriteCmd::EnsureProjectWorkspace {
                 workspace_id,
