@@ -17,10 +17,17 @@
 -- same grant — as an unrelated `api/` from another. That is an access-control
 -- hole, not untidiness.
 --
--- Additive on purpose. `identity` defaults to empty, existing rows are
--- backfilled from the name they already have, and every existing query keeps
--- working untouched: nothing reads this column until the resolution path is
--- taught to, and the partial index below ignores rows that never are.
+-- Additive on purpose. `identity` defaults to empty, and every existing query
+-- keeps working untouched: nothing reads this column until the resolution path
+-- is taught to, and the partial index below ignores rows that never are.
+--
+-- Existing rows are deliberately NOT backfilled. Identities are case-folded,
+-- so `API` and `api` are one repository to the resolver, while upstream's
+-- `UNIQUE (workspace_id, name)` is case-sensitive and may already hold both.
+-- Backfilling `lower(name)` failed the whole upgrade on such an install, and
+-- keeping one of the pair would have the migration silently decide which
+-- project — and so which grants — a future `api/` checkout lands in. That is
+-- the resolution path's decision to make on first sighting, not this file's.
 
 ALTER TABLE projects ADD COLUMN identity TEXT NOT NULL DEFAULT '';
 
@@ -30,14 +37,6 @@ ALTER TABLE projects ADD COLUMN identity TEXT NOT NULL DEFAULT '';
 -- never downgrade it, and that comparison needs to know where this one came
 -- from. An empty string means no rung has claimed the row yet.
 ALTER TABLE projects ADD COLUMN identity_source TEXT NOT NULL DEFAULT '';
-
--- Existing projects keep working under the only identity they can honestly
--- claim: the name they were created with. `folder_name` is the weakest rung,
--- so the first capture that resolves a git remote will upgrade it.
-UPDATE projects
-   SET identity = lower(name),
-       identity_source = 'folder_name'
- WHERE identity = '';
 
 -- Partial, so rows with no identity do not collide with each other on the
 -- empty string. Two projects may share a name across workspaces, and within a
