@@ -332,6 +332,208 @@ pub fn get_or_create_project_as(
     Ok((id, created))
 }
 
+/// How [`resolve_project_by_identity`] reached the project it returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityResolution {
+    /// A project already carried this identity.
+    Matched,
+    /// The name-matched project carried no identity and the caller may write
+    /// to it, so it took this one. Existing projects migrate this way.
+    Claimed,
+    /// The name-matched project carried no identity, but the caller may not
+    /// write to it. It is returned unclaimed, for the caller's grant check to
+    /// refuse — never split, which would let the first outsider after an
+    /// upgrade take the identity away from the team whose project it is.
+    Unclaimed,
+    /// No project existed under the name; one was created with the identity.
+    Created,
+    /// The name belonged to a project with a different identity, so a new one
+    /// was created under a distinct name.
+    Split,
+}
+
+impl IdentityResolution {
+    /// Whether this call created the project — and so granted its creator.
+    #[must_use]
+    pub fn created(self) -> bool {
+        matches!(self, Self::Created | Self::Split)
+    }
+}
+
+/// Resolve the project a repository identity routes to, creating it if
+/// needed, in one transaction (#708).
+///
+/// 1. A project in the workspace already carrying `identity` wins, whatever
+///    it is called.
+/// 2. Otherwise the candidate is `candidate` (the cwd-prefix parent the hook
+///    router found) or the project named `name`:
+///    - none → create `name` with the identity;
+///    - it carries no identity → claim it when `creator` may write to it (or
+///      there is no creator: authorization off, an open install, root), else
+///      return it unclaimed;
+///    - it carries a different identity → create a new project named from
+///      the identity ([`ai_memory_core::repository_identity::split_name_base`],
+///      then `-2`, `-3`, …).
+///
+/// An identity already on a project is never overwritten. A created project
+/// grants its creator `admin`, as [`get_or_create_project_as`] does. A split
+/// project gets no `repo_path`: the path belongs to the project the name
+/// matched, and sharing it would let prefix matching route that project's
+/// other captures here.
+///
+/// # Errors
+/// Propagates SQLite failures.
+pub fn resolve_project_by_identity(
+    conn: &mut Connection,
+    workspace_id: &ai_memory_core::WorkspaceId,
+    identity: &ai_memory_core::repository_identity::RepositoryIdentity,
+    name: &str,
+    repo_path: Option<&str>,
+    candidate: Option<ai_memory_core::ProjectId>,
+    creator: Option<ai_memory_core::UserId>,
+) -> StoreResult<(ai_memory_core::ProjectId, IdentityResolution)> {
+    let repo_path = repo_path.map(normalize_repo_path_key);
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+
+    let matched: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT id FROM projects WHERE workspace_id = ?1 AND identity = ?2",
+            params![workspace_id.as_bytes(), identity.identity],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let (id, resolution) = if let Some(bytes) = matched {
+        (
+            ai_memory_core::ProjectId::from_slice(&bytes)?,
+            IdentityResolution::Matched,
+        )
+    } else {
+        let candidate_row: Option<(Vec<u8>, String)> = match candidate {
+            Some(candidate) => tx
+                .query_row(
+                    "SELECT id, identity FROM projects WHERE workspace_id = ?1 AND id = ?2",
+                    params![workspace_id.as_bytes(), candidate.as_bytes()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?,
+            None => tx
+                .query_row(
+                    "SELECT id, identity FROM projects WHERE workspace_id = ?1 AND name = ?2",
+                    params![workspace_id.as_bytes(), name],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?,
+        };
+        match candidate_row {
+            None => {
+                let id = insert_project_with_identity(
+                    &tx,
+                    workspace_id,
+                    name,
+                    repo_path.as_deref(),
+                    identity,
+                    now,
+                )?;
+                (id, IdentityResolution::Created)
+            }
+            Some((bytes, held)) if held.is_empty() => {
+                let id = ai_memory_core::ProjectId::from_slice(&bytes)?;
+                let may_write = match creator {
+                    None => true,
+                    Some(user) => matches!(
+                        ai_memory_auth::decide(
+                            &crate::auth::grants_for(&tx, user, id)?,
+                            user,
+                            id,
+                            ai_memory_auth::GrantRole::Writer,
+                        ),
+                        ai_memory_auth::Access::Granted
+                    ),
+                };
+                if may_write {
+                    tx.execute(
+                        "UPDATE projects SET identity = ?1, identity_source = ?2 WHERE id = ?3",
+                        params![identity.identity, identity.source.as_str(), id.as_bytes()],
+                    )?;
+                    (id, IdentityResolution::Claimed)
+                } else {
+                    (id, IdentityResolution::Unclaimed)
+                }
+            }
+            Some(_) => {
+                let base = ai_memory_core::repository_identity::split_name_base(&identity.identity);
+                let mut split_name = base.clone();
+                let mut n = 2_u32;
+                while tx
+                    .query_row(
+                        "SELECT 1 FROM projects WHERE workspace_id = ?1 AND name = ?2",
+                        params![workspace_id.as_bytes(), split_name],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some()
+                {
+                    split_name = format!("{base}-{n}");
+                    n += 1;
+                }
+                let id = insert_project_with_identity(
+                    &tx,
+                    workspace_id,
+                    &split_name,
+                    None,
+                    identity,
+                    now,
+                )?;
+                (id, IdentityResolution::Split)
+            }
+        }
+    };
+    if resolution.created()
+        && let Some(creator) = creator
+    {
+        crate::auth::grant(
+            &tx,
+            creator,
+            id,
+            ai_memory_auth::GrantRole::Admin,
+            Some(creator),
+            now,
+        )?;
+    }
+    tx.commit()?;
+    if resolution.created() && scheduler_state_table_exists(conn)? {
+        crate::auto_improve::ensure_scheduler_state(conn, *workspace_id, id)?;
+    }
+    Ok((id, resolution))
+}
+
+fn insert_project_with_identity(
+    tx: &rusqlite::Transaction<'_>,
+    workspace_id: &ai_memory_core::WorkspaceId,
+    name: &str,
+    repo_path: Option<&str>,
+    identity: &ai_memory_core::repository_identity::RepositoryIdentity,
+    now: i64,
+) -> StoreResult<ai_memory_core::ProjectId> {
+    let id = ai_memory_core::ProjectId::new();
+    tx.execute(
+        "INSERT INTO projects \
+         (id, workspace_id, name, repo_path, created_at, identity, identity_source) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            id.as_bytes(),
+            workspace_id.as_bytes(),
+            name,
+            repo_path,
+            now,
+            identity.identity,
+            identity.source.as_str(),
+        ],
+    )?;
+    Ok(id)
+}
+
 /// Delete "hollow" project rows: zero pages (any version), zero sessions,
 /// zero observations, zero handoffs, zero managed workstreams, zero
 /// auto-improve runs/proposals/rejections, and older than `min_age_days`.

@@ -11,6 +11,7 @@ mod belief_authority;
 mod client_activity;
 mod fts_drift_status;
 mod handoff_ownership;
+mod identity_resolution;
 mod most_recently_active_scope;
 mod multi_session;
 mod pinned_pages;

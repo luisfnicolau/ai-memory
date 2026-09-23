@@ -1,123 +1,116 @@
-//! The D1 identity chain: what names a repository, independent of where it
-//! sits on any one disk.
+//! Repository identity: what names a repository independently of where it
+//! sits on any one disk (#708).
 //!
 //! ## Why this exists
 //!
-//! ARD-08 and hard rule #4: **repository identity is never a filesystem
-//! path.** A path is per-device by construction, so any identity derived from
-//! one splits the same repository into a different project on every machine —
-//! which defeats the product's first objective, memory that follows a person
-//! across devices and is shared with their team.
+//! A project is keyed by `(workspace_id, name)`, and an undeclared checkout
+//! gets its name from its folder. Folder names are not unique: two unrelated
+//! repositories both checked out as `api/` land in one project. On a
+//! multi-user server with per-project grants that is an access problem, not
+//! untidiness — whatever resolves a working directory to a project decides
+//! which grant applies. And a path cannot fix it, because a path is
+//! per-machine by construction: keying on one would split the same repository
+//! into a different project on every device.
 //!
-//! FR-06 defines the chain, in order:
+//! So the client resolves an identity from what a repository carries with it,
+//! first rung wins:
 //!
-//! 1. **normalised git remote** — `upstream` when present, else `origin`
-//! 2. **manifest** — the `project = "…"` field of `.ai-memory.toml`
-//! 3. **folder name**
+//! 1. **explicit** — `identity = "…"` in `.ai-memory.toml`, written by a person;
+//! 2. **manifest** — `project = "…"` in `.ai-memory.toml`, also written by a
+//!    person;
+//! 3. **git remote** — `upstream` when present, else `origin`, normalised;
+//! 4. **folder name** — the basename.
 //!
-//! ## The rung above the chain
+//! The two declarations rank above the remote because a statement beats an
+//! inference. A fork that is its own product is the common case: its
+//! `upstream` names the project it forked from, while its marker names what
+//! it is. Letting the remote win would key the fork's memory under its
+//! parent's identity.
 //!
-//! Everything FR-06 describes *infers* an identity, and inference has cases it
-//! cannot reach: a directory with no remote at all, two checkouts that should
-//! deliberately share one memory, a subdirectory of a monorepo that deserves
-//! its own. Guessing serves none of them.
+//! ## Which rungs route by identity
 //!
-//! So `identity = "…"` in `.ai-memory.toml` — written by hand, or by the
-//! `link` command once it exists (Migration 2.1.1 05) — sits
-//! above the whole chain. It is the only rung a person states rather than the
-//! system deduces, and stating it is precisely the act of overriding what
-//! would otherwise be deduced. A declaration that lost to a git remote would
-//! be a declaration that does nothing in the case people most want it for.
-//!
-//! Steps 2 and 3 already existed (`crate::marker` and `derive_project_name`
-//! respectively). Step 1 did not: before this module, nothing outside the
-//! workstream subsystem ever looked at a remote, so two clones of
-//! `github.com/acme/api` under `~/work/api` and `~/dev/acme-api` resolved to
-//! two unrelated projects.
+//! Only [`IdentitySource::Explicit`] and [`IdentitySource::GitRemote`] — see
+//! [`IdentitySource::routes_by_identity`]. A declared `project` already routes
+//! by name, as it always has: the person chose that name, and two checkouts
+//! declaring it share it by agreement. A folder name adds nothing a name
+//! lookup does not already do. What is left is exactly the undeclared
+//! checkout with a remote, which is the case that collided.
 //!
 //! ## Why the chain stops rather than searching
 //!
-//! FR-06b: when neither `upstream` nor `origin` exists, we fall to the next
-//! step instead of picking some other remote. Remote names are personal —
-//! one person's `fork`, another's `mine` — so choosing arbitrarily produces an
-//! identity that differs per person, which is worse than falling back to a
-//! shared convention.
-//!
-//! `upstream` wins over `origin` because in fork workflows every contributor's
-//! `origin` points at their own fork. Keying on `origin` there would give each
-//! contributor a private memory of the same repository.
+//! When neither `upstream` nor `origin` exists, the chain falls to the next
+//! rung instead of picking some other remote. Remote names are personal —
+//! one person's `fork`, another's `mine` — so choosing among them would give
+//! the same repository a different identity per person. `upstream` wins over
+//! `origin` because in fork workflows every contributor's `origin` is their
+//! own fork, which would give each of them a private memory.
 //!
 //! ## Why local-path remotes are rejected
 //!
 //! A remote can legitimately be a filesystem path — `/srv/git/api.git`,
 //! `../sibling`, `file:///srv/git/api.git`, `C:\repos\api`. Those are paths,
-//! and hard rule #4 applies to them exactly as it applies to `cwd`. They
-//! produce no identity here; the chain moves on to the manifest.
+//! with every problem paths have, so they yield no identity and the chain
+//! moves on.
 //!
-//! This is the failure mode the previous implementation had. The workstream
-//! crate's `inspect_repository` falls back to `git-common-dir`, then
-//! `git-root`, then `cwd` when it finds no remote — all paths. It reads as a
-//! chain but its lower steps re-introduce exactly what the rule forbids.
+//! ## Where this runs
+//!
+//! On the client, which is the only side that can see the checkout — a
+//! remote server cannot read the user's disk. Normalising there also means a
+//! remote with embedded credentials (`https://user:token@host/…`) never
+//! leaves the machine. The native hook client calls this module; the shell,
+//! PowerShell and TypeScript clients port [`normalize_remote_url`], and all
+//! four are checked against `fixtures/remote_identity_cases.json`.
 
 use serde::{Deserialize, Serialize};
 
 /// The marker filename, matching `crates/ai-memory-cli/src/marker.rs`.
-///
-/// The fork wrote `.lore.toml` here and kept this one as a fallback. That
-/// reasoning inverts on this base: the marker is upstream's, committed into
-/// repositories that upstream's own tooling reads, so there is exactly one
-/// name and it is theirs.
 pub const MARKER_FILENAME: &str = ".ai-memory.toml";
 
 /// Every marker name that is read, highest precedence first.
 ///
-/// One entry today. The list stays because the failure mode it exists to
-/// prevent is the worst this system has: dropping a name that is still on
-/// somebody's disk sends the identity down to the next rung of the chain —
-/// usually the folder name — which **silently re-homes that repository's
-/// memory to a different project**. No error, no warning; the previous memory
-/// simply stops being found. Any future rename adds a name here rather than
-/// replacing one.
+/// One entry today. The list stays because dropping a name that is still on
+/// somebody's disk sends resolution down to the next rung — usually the
+/// folder name — which silently re-homes that repository's memory. Any future
+/// rename adds a name here rather than replacing one.
 pub const MARKER_FILENAMES: &[&str] = &[MARKER_FILENAME];
+
+/// Longest identity accepted from the wire. Real remotes are far shorter; the
+/// bound exists so a client cannot park an arbitrary blob in a unique index.
+pub const MAX_IDENTITY_LEN: usize = 512;
 
 /// Which rung of the chain produced an identity.
 ///
 /// Stored alongside the identity so an operator can tell a globally unique
-/// identity from a merely local one. `FolderName` is not unique across
-/// organisations — two companies both having an `api` folder is ordinary —
-/// and E6 in the use cases accepts that as a known limitation. Recording the
-/// source is what lets a later diagnostic distinguish "shared by design" from
-/// "collided by accident".
+/// identity from a merely local one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IdentitySource {
-    /// An `identity = "…"` declaration a person wrote deliberately, normally
-    /// by hand in the marker. Outranks everything below it.
+    /// `identity = "…"` in the marker. Outranks everything below it.
     ///
-    /// The rungs beneath this one all *infer* an identity. This one is told.
-    /// Inference is right by default and wrong in the cases that matter most
-    /// to the people hitting them: a directory with no remote, two checkouts
-    /// that should share one memory, a subdirectory that deserves its own.
-    /// None of those can be guessed, and all of them can be stated.
+    /// Every rung beneath this one is either a name or an inference. This one
+    /// is the answer to the cases neither can reach: a directory with no
+    /// remote that must not collide with every other `notes/`, two checkouts
+    /// that should share one memory, a monorepo subdirectory that deserves its
+    /// own.
     Explicit,
+    /// `project = "…"` in the marker. Unique by agreement.
+    Manifest,
     /// A normalised `upstream` or `origin` URL. Globally unique.
     GitRemote,
-    /// The `project` field of a `.ai-memory.toml` marker. Unique by agreement.
-    Manifest,
     /// The directory's basename. **Not** globally unique.
     FolderName,
 }
 
 impl IdentitySource {
-    /// The stored spelling, matching the `identity_source` enum in the data
-    /// model. Kept explicit rather than derived from the variant name so a
-    /// rename in Rust cannot silently rewrite what is already in the database.
+    /// The stored and wire spelling. Kept explicit rather than derived from the
+    /// variant name so a rename in Rust cannot silently rewrite what is
+    /// already in the database.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Explicit => "explicit",
-            Self::GitRemote => "git_remote",
             Self::Manifest => "manifest",
+            Self::GitRemote => "git_remote",
             Self::FolderName => "folder_name",
         }
     }
@@ -129,23 +122,27 @@ impl IdentitySource {
     pub fn from_str_opt(s: &str) -> Option<Self> {
         match s {
             "explicit" => Some(Self::Explicit),
-            "git_remote" => Some(Self::GitRemote),
             "manifest" => Some(Self::Manifest),
+            "git_remote" => Some(Self::GitRemote),
             "folder_name" => Some(Self::FolderName),
             _ => None,
         }
     }
 
     /// Whether an identity from this rung is unique beyond the local machine.
-    ///
-    /// Used to decide whether to warn the user that their memory may not line
-    /// up with a colleague's (FR-06, E6 and the wireframe at S6).
     #[must_use]
     pub fn is_globally_unique(self) -> bool {
         // An explicit declaration is as unique as the person writing it meant
-        // it to be — which is the point of writing one. Treat it as settled so
-        // the "this folder's memory may not line up with your colleagues'"
-        // warning stops nagging someone who has already answered it.
+        // it to be — which is the point of writing one.
+        matches!(self, Self::Explicit | Self::GitRemote)
+    }
+
+    /// Whether the server routes a capture by this identity rather than by
+    /// project name. See the module docs: a declared `project` and a folder
+    /// name keep name routing, so only the two rungs that carry information a
+    /// name does not are routed by identity.
+    #[must_use]
+    pub fn routes_by_identity(self) -> bool {
         matches!(self, Self::Explicit | Self::GitRemote)
     }
 }
@@ -166,40 +163,42 @@ pub struct RepositoryIdentity {
 /// and the crate stays free of a git dependency.
 #[derive(Debug, Default, Clone)]
 pub struct IdentityInputs<'a> {
-    /// `identity = "…"` from the nearest `.ai-memory.toml`, written
-    /// deliberately by a person. Wins over every inferred rung.
+    /// `identity = "…"` from the nearest `.ai-memory.toml`.
     pub explicit_identity: Option<&'a str>,
+    /// `project = "…"` from the nearest `.ai-memory.toml`.
+    pub manifest_name: Option<&'a str>,
     /// URL of the `upstream` remote, if any.
     pub upstream_remote: Option<&'a str>,
     /// URL of the `origin` remote, if any.
     pub origin_remote: Option<&'a str>,
-    /// `project = "…"` from the nearest `.ai-memory.toml`.
-    pub manifest_name: Option<&'a str>,
     /// Basename of the repository root (or of the cwd when there is no repo).
     pub folder_name: Option<&'a str>,
 }
 
-/// Walk the D1 chain and return the first rung that yields an identity.
+/// Walk the chain and return the first rung that yields an identity.
 ///
-/// Returns `None` only when every rung is empty — a case the caller must
-/// surface rather than paper over, because a capture with no repository
-/// identity has nowhere correct to land.
+/// Returns `None` only when every rung is empty.
 #[must_use]
 pub fn resolve(inputs: &IdentityInputs<'_>) -> Option<RepositoryIdentity> {
-    // Rung 0. Someone decided this. Nothing inferred below overrides it —
-    // including a git remote, because the reasons to override a remote are
-    // exactly the reasons someone would write this down: two repositories that
-    // should share one memory, or a subdirectory that deserves its own.
+    // Rungs 1 and 2 are statements. Nothing inferred below overrides either —
+    // including a git remote, because the reasons to write one down are
+    // exactly the cases where the remote gives the wrong answer.
     if let Some(declared) = inputs.explicit_identity.and_then(non_empty) {
         return Some(RepositoryIdentity {
-            identity: declared.trim().to_lowercase(),
+            identity: declared.to_lowercase(),
             source: IdentitySource::Explicit,
         });
     }
+    if let Some(name) = inputs.manifest_name.and_then(non_empty) {
+        return Some(RepositoryIdentity {
+            identity: name.to_lowercase(),
+            source: IdentitySource::Manifest,
+        });
+    }
 
-    // Rung 1. `upstream` first (FR-06b). A remote that normalises to nothing
-    // — a local path, or a string git accepted but we cannot key on — does not
-    // stop the chain; it simply yields nothing and we continue.
+    // Rung 3. `upstream` first. A remote that normalises to nothing — a local
+    // path, or a string git accepted but we cannot key on — does not stop the
+    // chain; it simply yields nothing and we continue.
     for remote in [inputs.upstream_remote, inputs.origin_remote]
         .into_iter()
         .flatten()
@@ -212,24 +211,82 @@ pub fn resolve(inputs: &IdentityInputs<'_>) -> Option<RepositoryIdentity> {
         }
     }
 
-    // Rung 2. The manifest is a deliberate declaration, so it is taken as
-    // written apart from trimming and case folding.
-    if let Some(name) = inputs.manifest_name.and_then(non_empty) {
-        return Some(RepositoryIdentity {
-            identity: name.trim().to_lowercase(),
-            source: IdentitySource::Manifest,
-        });
-    }
-
-    // Rung 3. The folder name. Not globally unique; see `IdentitySource`.
+    // Rung 4. The folder name. Not globally unique; see `IdentitySource`.
     if let Some(name) = inputs.folder_name.and_then(non_empty) {
         return Some(RepositoryIdentity {
-            identity: name.trim().to_lowercase(),
+            identity: name.to_lowercase(),
             source: IdentitySource::FolderName,
         });
     }
 
     None
+}
+
+/// Accept an identity a client sent over the wire, or `None` to ignore it.
+///
+/// The server cannot re-run the chain — it never sees the checkout — so it
+/// checks that what arrived has the shape the chain produces: case-folded,
+/// trimmed, bounded, free of control characters, and for a remote, a
+/// `host/path` with no empty segment. Anything else is dropped and the capture
+/// routes by name, exactly as a client that sent nothing would. Only the rungs
+/// that route by identity are accepted; the others carry nothing the server
+/// uses.
+#[must_use]
+pub fn accept_wire_identity(identity: &str, source: &str) -> Option<RepositoryIdentity> {
+    let source = IdentitySource::from_str_opt(source.trim())?;
+    if !source.routes_by_identity() {
+        return None;
+    }
+    let identity = identity.trim();
+    if identity.is_empty()
+        || identity.len() > MAX_IDENTITY_LEN
+        || identity.chars().any(char::is_control)
+        || identity != identity.to_lowercase()
+    {
+        return None;
+    }
+    if source == IdentitySource::GitRemote
+        && (!identity.contains('/')
+            || identity.split('/').any(str::is_empty)
+            || identity.chars().any(char::is_whitespace))
+    {
+        return None;
+    }
+    Some(RepositoryIdentity {
+        identity: identity.to_owned(),
+        source,
+    })
+}
+
+/// The project name to give a repository whose folder name is already held by
+/// a different identity, before any numeric suffix.
+///
+/// For a path-shaped identity it is the last two segments joined with `-`
+/// (`github.com/orgb/api` → `orgb-api`): the owner is what tells two `api`s
+/// apart in a listing. Characters a project name cannot carry — `/` appears in
+/// URL paths — become `-`.
+#[must_use]
+pub fn split_name_base(identity: &str) -> String {
+    let segments: Vec<&str> = identity.split('/').filter(|s| !s.is_empty()).collect();
+    let tail = if segments.len() >= 2 {
+        segments[segments.len() - 2..].join("-")
+    } else {
+        segments.join("-")
+    };
+    let mut out = String::with_capacity(tail.len());
+    for c in tail.chars() {
+        let keep = c.is_alphanumeric() || matches!(c, '-' | '_' | '.');
+        let c = if keep { c } else { '-' };
+        if !(c == '-' && out.ends_with('-')) {
+            out.push(c);
+        }
+    }
+    let out = out.trim_matches('-').to_owned();
+    if out.is_empty() {
+        "repository".to_owned()
+    } else {
+        out
+    }
 }
 
 fn non_empty(s: &str) -> Option<&str> {
@@ -478,23 +535,51 @@ mod tests {
         assert_eq!(got.identity, "github.com/acme/api");
     }
 
-    /// FR-06b: an unusable remote does not halt the chain, and no *other*
-    /// remote is substituted — the caller never offers one.
+    /// An unusable remote does not halt the chain, and no *other* remote is
+    /// substituted — the caller never offers one.
     #[test]
-    fn a_path_remote_falls_through_to_the_manifest() {
+    fn a_path_remote_falls_through_to_the_folder() {
         let got = resolve(&IdentityInputs {
             origin_remote: Some("/srv/git/api.git"),
-            manifest_name: Some("acme-api"),
             folder_name: Some("whatever"),
             ..Default::default()
         })
         .expect("an identity");
-        assert_eq!(got.identity, "acme-api");
+        assert_eq!(got.identity, "whatever");
+        assert_eq!(got.source, IdentitySource::FolderName);
+    }
+
+    /// A declared project is a statement, and a statement beats the remote.
+    /// This is the fork that is its own product: its `upstream` names what it
+    /// forked from, its marker names what it is.
+    #[test]
+    fn a_declared_project_beats_the_git_remote() {
+        let got = resolve(&IdentityInputs {
+            manifest_name: Some("Lore"),
+            upstream_remote: Some("https://github.com/upstream-owner/tool"),
+            origin_remote: Some("git@github.com:fork-owner/lore.git"),
+            folder_name: Some("my-checkout"),
+            ..Default::default()
+        })
+        .expect("an identity");
+        assert_eq!(got.identity, "lore");
         assert_eq!(got.source, IdentitySource::Manifest);
+        assert!(
+            !got.source.routes_by_identity(),
+            "a declared name routes by name"
+        );
     }
 
     #[test]
     fn the_chain_runs_in_order() {
+        let remote_over_folder = resolve(&IdentityInputs {
+            origin_remote: Some("https://github.com/acme/api"),
+            folder_name: Some("on-disk"),
+            ..Default::default()
+        })
+        .expect("an identity");
+        assert_eq!(remote_over_folder.source, IdentitySource::GitRemote);
+
         let manifest_only = resolve(&IdentityInputs {
             manifest_name: Some("Declared"),
             folder_name: Some("on-disk"),
@@ -640,5 +725,68 @@ mod tests {
         assert!(IdentitySource::GitRemote.is_globally_unique());
         assert!(!IdentitySource::Manifest.is_globally_unique());
         assert!(!IdentitySource::FolderName.is_globally_unique());
+        assert!(IdentitySource::Explicit.routes_by_identity());
+        assert!(IdentitySource::GitRemote.routes_by_identity());
+        assert!(!IdentitySource::Manifest.routes_by_identity());
+        assert!(!IdentitySource::FolderName.routes_by_identity());
+    }
+
+    const CASES: &str = include_str!("../fixtures/remote_identity_cases.json");
+
+    /// The fixture every client normaliser is checked against. The Rust core
+    /// is the reference: a case that fails here is a wrong fixture, a case
+    /// that fails in a script client is a drifted port.
+    #[test]
+    fn the_shared_fixture_holds_for_the_reference_normaliser() {
+        let cases: serde_json::Value = serde_json::from_str(CASES).unwrap();
+        let normalize = cases["normalize"].as_array().unwrap();
+        assert!(normalize.len() >= 20);
+        for case in normalize {
+            let url = case["url"].as_str().unwrap();
+            let expected = case["identity"].as_str();
+            assert_eq!(
+                normalize_remote_url(url).as_deref(),
+                expected,
+                "normalising {url:?}"
+            );
+        }
+        for case in cases["split_name"].as_array().unwrap() {
+            let identity = case["identity"].as_str().unwrap();
+            let expected = case["name"].as_str().unwrap();
+            assert_eq!(
+                split_name_base(identity),
+                expected,
+                "splitting {identity:?}"
+            );
+        }
+    }
+
+    /// What a client produces, the server accepts; what it cannot produce, or
+    /// what does not route, is ignored rather than trusted.
+    #[test]
+    fn the_server_accepts_only_what_the_chain_can_produce() {
+        let ok = accept_wire_identity("github.com/acme/api", "git_remote").unwrap();
+        assert_eq!(ok.source, IdentitySource::GitRemote);
+        assert!(accept_wire_identity("acme platform", "explicit").is_some());
+
+        for (identity, source) in [
+            ("github.com/acme/api", "manifest"),
+            ("github.com/acme/api", "folder_name"),
+            ("github.com/acme/api", "something_new"),
+            ("GitHub.com/Acme/API", "git_remote"),
+            ("github.com", "git_remote"),
+            ("github.com//api", "git_remote"),
+            ("github.com/acme/api/", "git_remote"),
+            ("github.com/acme api", "git_remote"),
+            ("", "explicit"),
+            ("   ", "explicit"),
+            ("line\nbreak", "explicit"),
+        ] {
+            assert!(
+                accept_wire_identity(identity, source).is_none(),
+                "accepted {identity:?} as {source}"
+            );
+        }
+        assert!(accept_wire_identity(&"a/".repeat(MAX_IDENTITY_LEN), "explicit").is_none());
     }
 }
