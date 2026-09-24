@@ -3162,11 +3162,17 @@ async fn namespace_path_lists_its_pages() {
 /// resolve, so the guard never saw either: bob could open alice's page in a
 /// browser and find it from the search box.
 #[tokio::test]
-async fn web_reads_honour_grants_once_authorization_is_on() {
+async fn web_reads_honour_grants_in_a_restricted_project() {
     use ai_memory_auth::GrantRole;
     use ai_memory_core::{AuthorizedViewer, NewUser, UserId, UserRole};
 
     let (_tmp, store, wiki) = setup().await;
+    // Grants only decide anything in a restricted project.
+    store
+        .writer
+        .set_new_project_mode(ai_memory_store::AccessMode::Restricted)
+        .await
+        .unwrap();
     let ws = store
         .writer
         .get_or_create_workspace("default")
@@ -3213,8 +3219,8 @@ async fn web_reads_honour_grants_once_authorization_is_on() {
 
     let api = api_router(store.reader.clone(), wiki.clone());
     let web = router(store.reader.clone(), wiki.clone());
-    // `viewer` is what the auth middleware stamps when `[auth].authorization`
-    // is on; `None` is the switch off (or root).
+    // `viewer` is what the auth middleware stamps for a database user; `None`
+    // is root, or an install with no database users.
     let get = |app: axum::Router, uri: &'static str, viewer: Option<UserId>| async move {
         let mut req = Request::builder().uri(uri);
         if let Some(viewer) = viewer {
@@ -3278,7 +3284,7 @@ async fn web_reads_honour_grants_once_authorization_is_on() {
         let (_, body) = get(app.clone(), uri, None).await;
         assert!(
             body.contains("secrets/rates.md"),
-            "{uri} with authorization off: {body}"
+            "{uri} with no viewer: {body}"
         );
     }
 }
@@ -3288,14 +3294,20 @@ async fn web_reads_honour_grants_once_authorization_is_on() {
 /// page's link panel still told him they existed and roughly what was in
 /// them — repository names, workspace names that are organisation names, page
 /// titles and paths. Each surface now shows only what the viewer may read,
-/// with the shared global scope visible to all and nothing filtered when
-/// authorization is off.
+/// with the shared global scope visible to all and nothing filtered with no
+/// viewer.
 #[tokio::test]
 async fn metadata_shows_only_what_the_viewer_may_read() {
     use ai_memory_auth::GrantRole;
     use ai_memory_core::{AuthorizedViewer, NewUser, UserId, UserRole};
 
     let (_tmp, store, wiki) = setup().await;
+    // Grants only decide anything in a restricted project.
+    store
+        .writer
+        .set_new_project_mode(ai_memory_store::AccessMode::Restricted)
+        .await
+        .unwrap();
     let w = &store.writer;
     let acme = w.get_or_create_workspace("acme").await.unwrap();
     let shared = w.get_or_create_workspace("shared").await.unwrap();
@@ -3411,10 +3423,7 @@ async fn metadata_shows_only_what_the_viewer_may_read() {
         "{body}"
     );
     let (_, body) = get(api.clone(), "/workspaces", None).await;
-    assert!(
-        shows(&body, "\"acme\""),
-        "authorization off lists all: {body}"
-    );
+    assert!(shows(&body, "\"acme\""), "no viewer lists all: {body}");
 
     // Project listings: the API, the API narrowed to a workspace, and the
     // wiki's front page.
@@ -3435,7 +3444,7 @@ async fn metadata_shows_only_what_the_viewer_may_read() {
         let (_, body) = get(app.clone(), uri, None).await;
         assert!(
             shows(&body, "client-work") && shows(&body, "alpha") && shows(&body, "beta"),
-            "{uri} with authorization off: {body}"
+            "{uri} with no viewer: {body}"
         );
     }
     let (_, body) = get(api.clone(), "/projects?workspace=acme", Some(bob)).await;
@@ -3492,7 +3501,7 @@ async fn metadata_shows_only_what_the_viewer_may_read() {
     let (_, body) = get(api.clone(), "/workspaces/shared/overview", None).await;
     assert!(
         shows(&body, "beta-plan") && shows(&body, "alpha-plan"),
-        "authorization off: {body}"
+        "no viewer: {body}"
     );
     // A workspace holding nothing he may read is refused, not answered with an
     // overview of zeros that would read as "nothing is happening here".

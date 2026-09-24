@@ -20,8 +20,8 @@ mod auth;
 // guarded resolver takes a `GrantRole`, so a crate that depends on the
 // store must be able to name the level it needs without also depending
 // on `ai-memory-auth` directly.
-pub use ai_memory_auth::GrantRole;
-pub use auth::{GrantListing, GrantOutcome, GrantScope, SeedReport};
+pub use ai_memory_auth::{AccessMode, GrantRole};
+pub use auth::{GrantListing, GrantOutcome, GrantScope};
 mod auto_improve;
 pub mod belief;
 pub mod decay;

@@ -7,7 +7,7 @@ use ai_memory_auth::{GrantRole, MemoryGrant};
 use ai_memory_core::ids::MemoryGrantId;
 use ai_memory_core::{ProjectId, UserId};
 use jiff::Timestamp;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::StoreResult;
 
@@ -27,6 +27,111 @@ fn repository_label_sql(id_param: &str) -> String {
         "(SELECT w.name || '/' || p.name FROM projects p \
           JOIN workspaces w ON w.id = p.workspace_id WHERE p.id = {id_param})"
     )
+}
+
+/// The access mode of a repository, or `None` when there is no such project.
+///
+/// # Errors
+/// Propagates SQL errors, and a stored mode this version cannot read.
+pub fn access_mode_of(
+    conn: &Connection,
+    repository_id: ProjectId,
+) -> StoreResult<Option<ai_memory_auth::AccessMode>> {
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT access_mode FROM projects WHERE id = ?1",
+            params![repository_id.as_bytes()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    stored
+        .map(|s| {
+            ai_memory_auth::AccessMode::parse(&s).ok_or_else(|| {
+                crate::StoreError::MalformedRecord(format!("unknown projects.access_mode {s:?}"))
+            })
+        })
+        .transpose()
+}
+
+/// Whether `user` may reach `repository_id` at `required`: an open repository
+/// admits everyone, a restricted one asks the grants.
+///
+/// The one place that combines the mode with the grants, so every entry point
+/// — scope resolution, captures, identity claims — answers the same way. A
+/// repository that does not exist is treated as restricted: nothing is
+/// admitted to what is not there.
+///
+/// # Errors
+/// Propagates SQL errors.
+pub fn access(
+    conn: &Connection,
+    user: UserId,
+    repository_id: ProjectId,
+    required: ai_memory_auth::GrantRole,
+) -> StoreResult<ai_memory_auth::Access> {
+    let mode =
+        access_mode_of(conn, repository_id)?.unwrap_or(ai_memory_auth::AccessMode::Restricted);
+    let grants = match mode {
+        ai_memory_auth::AccessMode::Open => Vec::new(),
+        ai_memory_auth::AccessMode::Restricted => grants_for(conn, user, repository_id)?,
+    };
+    Ok(ai_memory_auth::decide_with_mode(
+        mode,
+        &grants,
+        user,
+        repository_id,
+        required,
+    ))
+}
+
+/// Set a repository's access mode, returning the mode it had. `None` when the
+/// repository does not exist.
+///
+/// # Errors
+/// Propagates SQL errors.
+pub fn set_access_mode(
+    conn: &Connection,
+    repository_id: ProjectId,
+    mode: ai_memory_auth::AccessMode,
+) -> StoreResult<Option<ai_memory_auth::AccessMode>> {
+    let Some(previous) = access_mode_of(conn, repository_id)? else {
+        return Ok(None);
+    };
+    conn.execute(
+        "UPDATE projects SET access_mode = ?1 WHERE id = ?2",
+        params![mode.as_str(), repository_id.as_bytes()],
+    )?;
+    Ok(Some(previous))
+}
+
+/// Users who have written to `repository_id` and would not be admitted if it
+/// were restricted: enabled, not root, and holding no active grant on it.
+///
+/// What an operator needs to see when restricting a project — the people who
+/// were working in it and are about to be refused — so they can grant the ones
+/// who should stay. "Written to" is page authorship, the attribution upstream
+/// already records.
+///
+/// # Errors
+/// Propagates SQL errors.
+pub fn authors_without_grant(
+    conn: &Connection,
+    repository_id: ProjectId,
+) -> StoreResult<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT u.username FROM pages p \
+           JOIN users u ON u.id = p.author_id \
+          WHERE p.project_id = ?1 \
+            AND u.role <> 'root' AND u.disabled_at IS NULL \
+            AND NOT EXISTS (SELECT 1 FROM memory_grant mg \
+                             WHERE mg.user_id = u.id AND mg.repository_id = ?1 \
+                               AND mg.revoked_at IS NULL) \
+          ORDER BY u.username",
+    )?;
+    let names = stmt
+        .query_map(params![repository_id.as_bytes()], |row| row.get(0))?
+        .collect::<Result<Vec<String>, _>>()?;
+    Ok(names)
 }
 
 /// Every grant this user holds on this repository, revoked ones included.
@@ -139,8 +244,8 @@ pub enum GrantOutcome {
 /// that matters after an incident. It also keeps the active-pair unique index
 /// honest: there is exactly one unrevoked row per pair at every instant.
 ///
-/// `granted_by` is `None` for the root bearer token and for grants seeded
-/// when authorization is switched on, and `user_id` itself for the grant a
+/// `granted_by` is `None` for the root bearer token, and `user_id` itself for
+/// the grant a
 /// creator receives with the repository they create — see the column comment
 /// in V68.
 ///
@@ -410,125 +515,6 @@ pub fn list_active_grants(conn: &Connection) -> StoreResult<Vec<GrantListing>> {
     Ok(out)
 }
 
-/// What switching authorization on did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct SeedReport {
-    /// Grants written.
-    pub granted: usize,
-    /// Pairs that already had an active grant and were left alone.
-    pub already_held: usize,
-    /// Users considered.
-    pub users: usize,
-    /// Repositories considered.
-    pub repositories: usize,
-}
-
-/// Give every existing user admin on every existing repository.
-///
-/// This is the enable path, and it exists because the alternative is a
-/// lockout. Authorization enforces against a table that ships empty, so an
-/// operator who simply switches it on takes every repository away from every
-/// user on the server at once — including, on a team server, work those people
-/// were relying on ten seconds earlier. Preserving what people already had and
-/// letting the operator narrow it afterwards is the only ordering that is safe
-/// to run on a Tuesday afternoon.
-///
-/// `admin` rather than `writer` for the same reason: the people already using
-/// the server must be able to hand out access themselves afterwards, or every
-/// subsequent grant funnels through whoever ran this.
-///
-/// Seeded grants carry no granter — see the column comment in V68. Pairs that
-/// already hold something are left exactly as they are, so running this twice
-/// changes nothing the second time.
-///
-/// Root users are skipped: root is authorized above per-repository
-/// granularity and never has an `AuthorizedViewer` stamped, so a grant for
-/// them would be a row nothing ever reads.
-///
-/// # Errors
-/// Propagates any SQL error.
-pub fn seed_admin_grants(conn: &Connection, now: i64) -> StoreResult<SeedReport> {
-    let users: Vec<UserId> = {
-        let mut stmt = conn.prepare(
-            "SELECT id FROM users WHERE role <> 'root' AND disabled_at IS NULL ORDER BY username",
-        )?;
-        let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
-        let mut out = Vec::new();
-        for row in rows {
-            if let Ok(id) = UserId::from_slice(&row?) {
-                out.push(id);
-            }
-        }
-        out
-    };
-    let repositories: Vec<ProjectId> = {
-        let mut stmt = conn.prepare("SELECT id FROM projects ORDER BY name")?;
-        let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
-        let mut out = Vec::new();
-        for row in rows {
-            if let Ok(id) = ProjectId::from_slice(&row?) {
-                out.push(id);
-            }
-        }
-        out
-    };
-
-    let mut report = SeedReport {
-        users: users.len(),
-        repositories: repositories.len(),
-        ..SeedReport::default()
-    };
-    for user in &users {
-        for repository in &repositories {
-            // Deliberately not `grant`: that would *change* a pair that
-            // already holds a different level, and seeding must only ever add.
-            // An operator who narrowed somebody to `reader` before enabling
-            // must not have it silently widened back to `admin` by the act of
-            // enabling.
-            let held = grants_for(conn, *user, *repository)?
-                .into_iter()
-                .any(|existing| existing.is_active());
-            if held {
-                report.already_held += 1;
-                continue;
-            }
-            conn.execute(
-                &format!(
-                    "INSERT INTO memory_grant \
-                     (id, user_id, repository_id, repository_label, role, \
-                      granted_by_user_id, granted_at) \
-                     VALUES (?1, ?2, ?3, {}, ?4, NULL, ?5)",
-                    repository_label_sql("?3")
-                ),
-                params![
-                    MemoryGrantId::new().as_bytes(),
-                    user.as_bytes(),
-                    repository.as_bytes(),
-                    GrantRole::Admin.as_str(),
-                    now,
-                ],
-            )?;
-            report.granted += 1;
-        }
-    }
-    Ok(report)
-}
-
-/// Whether any grant has ever been written.
-///
-/// The startup check uses this to refuse enforcing against an empty table —
-/// see `serve`. "Ever", not "currently active", so revoking the last grant is
-/// an ordinary operation rather than something that trips a safety net.
-///
-/// # Errors
-/// Propagates any SQL error.
-pub fn any_grant_exists(conn: &Connection) -> StoreResult<bool> {
-    conn.query_row("SELECT EXISTS(SELECT 1 FROM memory_grant)", [], |row| {
-        row.get(0)
-    })
-    .map_err(crate::StoreError::from)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,6 +551,13 @@ mod tests {
     async fn fixture() -> Fixture {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
+        // Grants only decide anything in a restricted project; every project
+        // these tests create starts restricted.
+        store
+            .writer
+            .set_new_project_mode(ai_memory_auth::AccessMode::Restricted)
+            .await
+            .unwrap();
         let ws = store
             .writer
             .get_or_create_workspace("default")
@@ -686,70 +679,6 @@ mod tests {
         assert!(!rows[0].is_active());
     }
 
-    #[tokio::test]
-    async fn seeding_preserves_access_and_never_widens_a_narrowed_grant() {
-        let f = fixture().await;
-        let w = &f.store.writer;
-        // Neither root nor a disabled user is something authorization
-        // constrains, so neither is seeded.
-        human(&f.store, "operator", UserRole::Root).await;
-        let gone = human(&f.store, "former", UserRole::User).await;
-        w.set_user_disabled(gone, true).await.unwrap();
-
-        // An operator narrowed bob to reader on the client project before
-        // enabling. Enabling must not hand him admin back.
-        w.grant_memory(f.bob, f.client, GrantRole::Reader, Some(f.alice))
-            .await
-            .unwrap();
-
-        let report = w.seed_admin_grants().await.unwrap();
-        assert_eq!(report.users, 2, "only alice and bob are constrained");
-        assert_eq!(report.repositories, 2);
-        assert_eq!(report.already_held, 1, "bob's reader grant is left alone");
-        assert_eq!(report.granted, 3);
-
-        let bob_client: Vec<_> = all_rows(&f.store, f.bob, f.client)
-            .into_iter()
-            .filter(MemoryGrant::is_active)
-            .collect();
-        assert_eq!(bob_client.len(), 1);
-        assert_eq!(bob_client[0].role, GrantRole::Reader);
-
-        // Seeded grants say nobody issued them, rather than naming someone.
-        let seeded = all_rows(&f.store, f.alice, f.personal);
-        assert_eq!(seeded.len(), 1);
-        assert_eq!(seeded[0].role, GrantRole::Admin);
-        assert_eq!(seeded[0].granted_by_user_id, None);
-
-        // Running it again changes nothing.
-        let again = w.seed_admin_grants().await.unwrap();
-        assert_eq!(again.granted, 0);
-        assert_eq!(again.already_held, 4);
-    }
-
-    #[tokio::test]
-    async fn any_grant_exists_counts_history_not_just_what_is_in_force() {
-        let f = fixture().await;
-        let r = &f.store.reader;
-        assert!(!r.any_grant_exists().await.unwrap());
-
-        f.store
-            .writer
-            .grant_memory(f.alice, f.client, GrantRole::Writer, None)
-            .await
-            .unwrap();
-        assert!(r.any_grant_exists().await.unwrap());
-
-        // Revoking the last grant is using the feature, not misconfiguring
-        // it: the startup preflight must not start refusing afterwards.
-        f.store
-            .writer
-            .revoke_memory(f.alice, f.client, None)
-            .await
-            .unwrap();
-        assert!(r.any_grant_exists().await.unwrap());
-    }
-
     async fn page(store: &Store, repository: ProjectId, path: &str, body: &str) {
         let workspace = store
             .writer
@@ -854,7 +783,7 @@ mod tests {
             (bob.clone(), bob.clone(), bob)
         );
 
-        // No viewer — authorization off, or root — sees everything, as before.
+        // No viewer — an install with no database users, or root — sees everything, as before.
         let all = vec![
             "notes/rates.md".to_owned(),
             "prefs/rates.md".to_owned(),
@@ -1315,7 +1244,7 @@ mod tests {
         assert_eq!(
             latest(None).await.as_deref(),
             Some("alice's client baton"),
-            "authorization off is unchanged"
+            "no viewer is unchanged"
         );
     }
 
@@ -1365,7 +1294,7 @@ mod tests {
         assert!(detail.duplicates.is_empty(), "{:?}", detail.duplicates);
 
         let (_, dups, _) = r.memory_health_for_workspace(f.ws, None).await.unwrap();
-        assert_eq!(dups, 1, "authorization off still sees the pair");
+        assert_eq!(dups, 1, "no viewer still sees the pair");
         let detail = r.health_detail_for_workspace(f.ws, 10, None).await.unwrap();
         assert_eq!(detail.duplicates.len(), 2);
     }

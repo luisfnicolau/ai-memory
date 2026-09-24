@@ -350,10 +350,11 @@ pub async fn lookup_existing_workspace(
 
 /// Authorize a resolved scope, or explain why not (#708).
 ///
-/// `authorized_user` is `None` when authorization is off, or when the caller is
-/// the operator's root token — both mean "no per-repository check applies", and
-/// both must keep working exactly as before this existed. That is what lets
-/// this land without changing the behaviour of every install that has one user.
+/// `authorized_user` is `None` on an install with no database users, or when the
+/// caller is the operator's root token — both mean "no per-project check
+/// applies", and both must keep working exactly as before this existed. A
+/// database user is checked against the project's access mode: an open project
+/// admits them, a restricted one asks for a grant.
 ///
 /// # Errors
 /// [`ScopeResolutionError::NotAuthorized`] when the user holds nothing on this
@@ -368,8 +369,7 @@ pub async fn authorize_scope(
     let Some(user) = authorized_user else {
         return Ok(scope);
     };
-    let grants = reader.grants_for(user, scope.project_id).await?;
-    match ai_memory_auth::decide(&grants, user, scope.project_id, required) {
+    match reader.access_for(user, scope.project_id, required).await? {
         ai_memory_auth::Access::Granted => Ok(scope),
         ai_memory_auth::Access::Denied(denial) => {
             let held = match denial {
@@ -596,8 +596,8 @@ impl<'a> ScopeResolver<'a> {
     /// current or default project without looking anything up — those reach a
     /// repository too.
     ///
-    /// `None` means no per-repository check applies: authorization is off, or
-    /// the caller is the operator's root token, which authenticates from
+    /// `None` means no per-project check applies: an install with no database
+    /// users, or the operator's root token, which authenticates from
     /// configuration rather than a `users` row.
     #[must_use]
     pub fn new(
@@ -983,6 +983,13 @@ mod tests {
         ai_memory_core::UserId,
         ai_memory_core::UserId,
     ) {
+        // Grants only decide anything in a restricted project; every project
+        // these tests create starts restricted.
+        store
+            .writer
+            .set_new_project_mode(ai_memory_auth::AccessMode::Restricted)
+            .await
+            .unwrap();
         let ws = store
             .writer
             .get_or_create_workspace("default")
@@ -1043,8 +1050,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_absent_user_is_the_unauthorized_install_and_still_resolves() {
-        // Authorization off, and the operator's root token, both arrive here
-        // as `None`. Neither may change behaviour, or enabling this crate
+        // An install with no database users, and the operator's root token,
+        // both arrive here as `None`. Neither may change behaviour, or enabling this crate
         // would break every install that has one user.
         let tmp = tempfile::TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
@@ -1229,10 +1236,8 @@ mod tests {
         );
     }
 
-    /// With no viewer — authorization off, an open install, or root — creating
-    /// writes no grant. The switch's preflight refuses to start on an install
-    /// where no grant was ever written; a grant appearing here would let it
-    /// pass without `grant seed` ever having run.
+    /// With no viewer — an install with no database users, or root — creating
+    /// writes no grant: there is no user to attribute it to.
     #[tokio::test]
     async fn creating_without_a_viewer_grants_nothing() {
         let tmp = tempfile::TempDir::new().unwrap();

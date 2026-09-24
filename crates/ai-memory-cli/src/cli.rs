@@ -221,9 +221,13 @@ pub enum Command {
     #[command(name = "api-key")]
     ApiKey(ApiKeyArgs),
     /// Manage who may reach which repository (#708). All subcommands require
-    /// the root bearer token. Grants are only enforced once
-    /// `[auth].authorization = true` — run `grant seed` before switching it on.
+    /// the root bearer token. Grants decide access to `restricted` projects;
+    /// an `open` project admits every user — see `ai-memory project access`.
     Grant(GrantArgs),
+    /// Project settings. `project access` sets a project `open` (any user)
+    /// or `restricted` (root and grant holders) (#708). Requires the root
+    /// bearer token.
+    Project(ProjectArgs),
     /// Print a shell-completion script to stdout. Generated from this
     /// binary's own command tree, so it never drifts from the real CLI
     /// surface. See `docs/shell-completions.md` for install paths.
@@ -651,15 +655,6 @@ pub enum GrantCommand {
     Add(GrantAddArgs),
     /// Take away whatever a user holds on a repository.
     Revoke(GrantTargetArgs),
-    /// Give every existing user admin on every existing repository.
-    ///
-    /// Run this BEFORE setting `[auth].authorization = true`. Enforcement
-    /// checks a table that starts empty, so enabling without seeding takes
-    /// every repository away from every user at once; the server refuses to
-    /// start in that state. Seeding keeps today's access and lets you narrow
-    /// it afterwards. Pairs that already hold a grant are left untouched, so
-    /// running it twice is harmless.
-    Seed,
 }
 
 /// Arguments for `grant list`.
@@ -691,6 +686,36 @@ pub struct GrantAddArgs {
     /// guessed at.
     #[arg(long)]
     pub role: String,
+}
+
+/// Arguments for `project`.
+#[derive(Debug, Args)]
+pub struct ProjectArgs {
+    /// Project action to run.
+    #[command(subcommand)]
+    pub command: ProjectCommand,
+}
+
+/// `project` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum ProjectCommand {
+    /// Set a project `open` or `restricted`.
+    Access(ProjectAccessArgs),
+}
+
+/// Arguments for `project access`.
+#[derive(Debug, Args)]
+pub struct ProjectAccessArgs {
+    /// The workspace the project lives in.
+    #[arg(long, default_value = "default")]
+    pub workspace: String,
+    /// The project, by name.
+    #[arg(long)]
+    pub project: String,
+    /// `open` (any authenticated user) or `restricted` (root and grant
+    /// holders). Required: a mode left unsaid is not guessed at.
+    #[arg(long)]
+    pub mode: String,
 }
 
 /// Arguments for `completions`.

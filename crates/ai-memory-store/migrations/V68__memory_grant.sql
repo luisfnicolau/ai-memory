@@ -69,14 +69,11 @@ CREATE TABLE memory_grant (
                               CHECK (role IN ('reader', 'writer', 'admin')),
 
     -- The `users` row behind the decision, when there is one. NULL when there
-    -- is not, which happens in exactly two ways and both are deliberate:
+    -- is not, which happens in exactly one way, and deliberately: the
+    -- operator acted through the configured root bearer token, which
+    -- authenticates from `config.toml` and has no `users` row at all.
     --
-    --   * the grant was seeded when authorization was switched on, preserving
-    --     access that already existed rather than issuing it to anyone; and
-    --   * the operator acted through the configured root bearer token, which
-    --     authenticates from `config.toml` and has no `users` row at all.
-    --
-    -- The second is upstream's own model, not a new one: a page written with
+    -- That is upstream's own model, not a new one: a page written with
     -- the root token carries no `author_id` either. Inventing a row, or naming
     -- the grantee as their own granter, would be a plausible-looking lie in
     -- the one table an access review reads.

@@ -1944,6 +1944,12 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store = Store::open(temp.path()).unwrap();
         let state = test_state(&store, temp.path());
+        // Grants only decide anything in a restricted project.
+        store
+            .writer
+            .set_new_project_mode(ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
 
         let prepared = prepare_run(
             State(state.clone()),
@@ -2063,7 +2069,7 @@ mod tests {
         assert_eq!(events(as_viewer(bob)).await.status(), StatusCode::FORBIDDEN);
         assert_eq!(events(as_viewer(carol)).await.status(), StatusCode::OK);
 
-        // No viewer — authorization off, or root — is unchanged.
+        // No viewer — an install with no database users, or root — is unchanged.
         assert_eq!(
             run_status(State(state.clone()), None, None, run())
                 .await

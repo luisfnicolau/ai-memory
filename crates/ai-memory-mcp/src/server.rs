@@ -11120,6 +11120,12 @@ mod tests {
     async fn a_reader_may_read_everything_and_change_nothing() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
+        // Grants only decide anything in a restricted project.
+        store
+            .writer
+            .set_new_project_mode(ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
         let ws = store
             .writer
             .get_or_create_workspace("default")
@@ -11150,7 +11156,7 @@ mod tests {
         let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
             .with_wiki(wiki);
 
-        // Seed a page as the operator (no viewer stamped = authorization off
+        // Seed a page as the operator (no viewer stamped = root or no database users
         // for this call), so there is something to try to delete.
         server
             .memory_write_page(
@@ -11348,9 +11354,15 @@ mod tests {
     /// that he is *not* refused when it is off, because an install that has
     /// never issued a grant must keep working exactly as it did.
     #[tokio::test]
-    async fn bob_cannot_read_alices_page_once_authorization_is_on() {
+    async fn bob_cannot_read_alices_page_in_a_restricted_project() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
+        // Grants only decide anything in a restricted project.
+        store
+            .writer
+            .set_new_project_mode(ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
         let ws = store
             .writer
             .get_or_create_workspace("default")
@@ -11457,19 +11469,25 @@ mod tests {
             "refusal must not be mistakable for an empty repository: {message}"
         );
 
-        // Authorization OFF: the middleware stamps no viewer, so nothing is
+        // No viewer (root, or no database users): nothing is
         // enforced and the install behaves as it did before grants existed.
         read_as(None)
             .await
-            .expect("with authorization off, an existing install must be unchanged");
+            .expect("with no viewer, an existing install must be unchanged");
     }
 
     /// The other half of #708: bob could not open alice's page, but he could
     /// still find it. `global` searches and the `default_global` recent
     /// listing never resolve a scope, so the resolver guard never saw them.
     #[tokio::test]
-    async fn bob_cannot_find_alices_page_by_searching_once_authorization_is_on() {
+    async fn bob_cannot_find_alices_page_by_searching_in_a_restricted_project() {
         let (_tmp, store, server, ws, _scratch) = setup_server().await;
+        // Grants only decide anything in a restricted project.
+        store
+            .writer
+            .set_new_project_mode(ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
         let client = store
             .writer
             .get_or_create_project(ws, "alice-client-work", None)
@@ -11521,8 +11539,8 @@ mod tests {
             .active_project
             .set_for(&ai_memory_core::ActorKey::default(), ws, client, true);
 
-        // `authorized` is whether the middleware stamped an AuthorizedViewer,
-        // i.e. whether `[auth].authorization` is on.
+        // `authorized` is whether the middleware stamped an AuthorizedViewer:
+        // a database user, rather than root or an install with no users.
         let as_user = |user: ai_memory_core::UserId, authorized: bool| {
             let mut parts = test_parts_default();
             parts.extensions.insert(AuthLevel::User);
@@ -11595,7 +11613,7 @@ mod tests {
         assert!(found_by_query(alice, true).await);
         assert!(found_by_recent(alice, true).await);
 
-        // Authorization off: no viewer is stamped and nothing changes.
+        // No viewer is stamped and nothing changes.
         assert!(found_by_query(bob, false).await);
         assert!(found_by_recent(bob, false).await);
     }
@@ -13635,6 +13653,12 @@ mod tests {
     async fn bob_cannot_consolidate_a_session_in_alices_repository() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
+        // Grants only decide anything in a restricted project.
+        store
+            .writer
+            .set_new_project_mode(ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone())
             .unwrap()
             .with_store_reader(store.reader.clone());
@@ -13743,7 +13767,7 @@ mod tests {
             "a refused consolidation wrote nothing"
         );
 
-        // Alice, and an install with authorization off, get the plan.
+        // Alice, and a caller with no viewer, get the plan.
         for viewer in [Some(alice), None] {
             let plan = call_tool_json(consolidate(viewer, session, true).await.unwrap());
             assert_eq!(plan["dry_run"], true, "{viewer:?}");

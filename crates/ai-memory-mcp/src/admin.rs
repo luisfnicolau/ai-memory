@@ -712,7 +712,7 @@ pub fn admin_router_with_sweep_tuning(
         )
         .route("/admin/grants", get(handle_list_grants).post(handle_grant))
         .route("/admin/grants/revoke", post(handle_revoke_grant))
-        .route("/admin/grants/seed", post(handle_seed_grants));
+        .route("/admin/projects/access", post(handle_project_access));
     operational
         .merge(users)
         .route_layer(axum::middleware::from_fn_with_state(
@@ -7866,25 +7866,72 @@ async fn handle_revoke_grant(
     ))
 }
 
-/// `POST /admin/grants/seed` — preserve existing access before enabling
-/// authorization. See [`ai_memory_store::SeedReport`].
-async fn handle_seed_grants(
+/// Body of `POST /admin/projects/access`.
+#[derive(Debug, serde::Deserialize)]
+struct ProjectAccessRequest {
+    workspace: String,
+    project: String,
+    mode: Option<String>,
+}
+
+/// `POST /admin/projects/access` — set a project `open` or `restricted` (#708).
+///
+/// Restricting admits only root and grant holders from the next request on —
+/// the creator holds `admin` from the moment they created it. The response
+/// names the page authors who hold no grant and so lose access, so the
+/// operator can grant the ones who should keep it. Nothing is granted
+/// automatically: restricting is the action meant to narrow access, and it must
+/// not widen it on the way.
+async fn handle_project_access(
     State(state): State<Arc<AdminState>>,
     axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
+    Json(request): Json<ProjectAccessRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     require_root(level)?;
-    let report = state
+    // Required, never defaulted: a mistyped mode must not quietly become one
+    // the operator did not ask for.
+    let mode = request
+        .mode
+        .as_deref()
+        .map(str::trim)
+        .and_then(ai_memory_auth::AccessMode::parse)
+        .ok_or_else(|| validation_error("mode is required: open or restricted".into()))?;
+    let (workspace, project) = (request.workspace.trim(), request.project.trim());
+    if project == ai_memory_core::GLOBAL_SCOPE_PROJECT {
+        return Err(validation_error(format!(
+            "{project} is the shared preferences scope, read by every user; it cannot be restricted"
+        )));
+    }
+    let (_, project_id) = lookup_ws_proj_no_create(&state, workspace, project).await?;
+    let previous = state
         .writer
-        .seed_admin_grants()
+        .set_access_mode(project_id, mode)
         .await
-        .map_err(|e| internal_err(e.to_string()))?;
+        .map_err(|e| internal_err(e.to_string()))?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": format!("no project {workspace}/{project}") })),
+            )
+        })?;
+    let without_access = if mode == ai_memory_auth::AccessMode::Restricted {
+        state
+            .reader
+            .authors_without_grant(project_id)
+            .await
+            .map_err(|e| internal_err(e.to_string()))?
+    } else {
+        Vec::new()
+    };
     Ok((
         StatusCode::OK,
         Json(serde_json::json!({
-            "granted": report.granted,
-            "already_held": report.already_held,
-            "users": report.users,
-            "repositories": report.repositories,
+            "workspace": workspace,
+            "project": project,
+            "mode": mode.as_str(),
+            "previous": previous.as_str(),
+            "changed": previous != mode,
+            "without_access": without_access,
         })),
     ))
 }
@@ -12671,28 +12718,6 @@ mod tests {
         )
         .await;
         assert_eq!(json["revoked"], false, "revoking twice reports honestly");
-
-        // Seeding hands alice back admin on the repository she no longer holds
-        // anything on — preserving access is its whole job.
-        let (status, json) = admin_call(
-            &router,
-            "POST",
-            "/admin/grants/seed",
-            "root-token",
-            Some(serde_json::json!({})),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(json["granted"].as_u64().unwrap() >= 1, "{json}");
-        let (_, json) = admin_call(&router, "GET", "/admin/grants", "root-token", None).await;
-        assert!(
-            json["grants"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|g| g["project"] == "client-work" && g["role"] == "admin"),
-            "{json}"
-        );
     }
 
     async fn write_fixture_page(router: &Router, workspace: &str, project: &str, path: &str) {
@@ -12921,7 +12946,6 @@ mod tests {
             ("GET", "/admin/grants"),
             ("POST", "/admin/grants"),
             ("POST", "/admin/grants/revoke"),
-            ("POST", "/admin/grants/seed"),
         ] {
             let body = (method == "POST").then(|| {
                 serde_json::json!({
@@ -12934,6 +12958,47 @@ mod tests {
             let (status, _) = admin_call(&router, method, uri, "not-root", body).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
         }
+    }
+
+    /// `POST /admin/projects/access` (#708): a mode is required and never
+    /// guessed, the shared preferences scope cannot be restricted, an unknown
+    /// project creates nothing, repeating a mode reports no change, and only
+    /// root may call it.
+    #[tokio::test]
+    async fn project_access_sets_the_mode_and_refuses_what_it_must() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+        write_fixture_page(&router, "default", "client-work", "notes/a.md").await;
+        let call = |token: &'static str, body: serde_json::Value| {
+            let router = router.clone();
+            async move { admin_call(&router, "POST", "/admin/projects/access", token, Some(body)).await }
+        };
+
+        for body in [
+            serde_json::json!({"workspace": "default", "project": "client-work"}),
+            serde_json::json!({"workspace": "default", "project": "client-work", "mode": "members"}),
+            serde_json::json!({"workspace": "default", "project": "_global", "mode": "restricted"}),
+        ] {
+            let (status, json) = call("root-token", body.clone()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body} -> {json}");
+        }
+        let (status, _) = call(
+            "root-token",
+            serde_json::json!({"workspace": "default", "project": "nope", "mode": "restricted"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let restrict = serde_json::json!({"workspace": "default", "project": "client-work", "mode": "restricted"});
+        let (status, json) = call("root-token", restrict.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["mode"], "restricted");
+        assert_eq!(json["previous"], "open");
+        assert_eq!(json["changed"], true);
+        let (_, json) = call("root-token", restrict.clone()).await;
+        assert_eq!(json["changed"], false, "repeating a mode is not a change");
+
+        let (status, _) = call("not-root", restrict).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

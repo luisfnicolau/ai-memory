@@ -93,15 +93,16 @@ pub struct ActorContext {
 /// Distinct from the bare `UserId` the middleware also stamps, and the
 /// distinction is the whole point. `UserId` answers "who wrote this" and is
 /// always present for a database user, because attribution must not depend on
-/// a policy setting. This answers "whose grants apply", and is stamped **only
-/// when per-repository authorization is switched on**.
+/// a policy setting. This answers "whose access applies", and is stamped for
+/// every database user — never for the root token, which authenticates from
+/// configuration and is authorized above per-project granularity, and never on
+/// an install with no database users, where there is nobody to tell apart.
 ///
-/// So its absence is the off switch. Every guard reads a missing
-/// `AuthorizedViewer` as "no per-repository check applies" — which is exactly
-/// what an install with authorization disabled, and the operator's root token,
-/// both need. That keeps the feature inert until an operator turns it on,
-/// instead of locking out every existing multi-user install the moment the
-/// grant tables ship empty.
+/// Every guard reads a missing `AuthorizedViewer` as "no per-project check
+/// applies". A present one is checked against the project's access mode: an
+/// `open` project admits every viewer, which is how every project behaves
+/// until an operator restricts it, so stamping every user changes nothing on
+/// upgrade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthorizedViewer(pub crate::UserId);
 

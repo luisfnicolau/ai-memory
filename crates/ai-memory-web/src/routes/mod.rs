@@ -18,10 +18,9 @@ mod statics;
 ///
 /// For the routes that read a repository by name without resolving a scope
 /// first — the page views and the project listing. Those went straight from a
-/// URL to the page body, so on an install with authorization switched on the
-/// guard never saw them.
+/// URL to the page body, so the guard never saw them.
 ///
-/// No viewer — authorization off, an open install, or root — returns `Ok`
+/// No viewer — an install with no database users, or root — returns `Ok`
 /// without a lookup, so these routes behave exactly as they did before.
 pub(crate) async fn authorize_read(
     state: &WebState,

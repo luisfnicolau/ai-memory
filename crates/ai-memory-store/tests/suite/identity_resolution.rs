@@ -168,6 +168,13 @@ async fn an_outsider_cannot_take_an_unclaimed_projects_identity() {
         .get_or_create_project(ws, "api", None)
         .await
         .unwrap();
+    // An open project admits everyone, outsider included; the question only
+    // arises for a restricted one.
+    store
+        .writer
+        .set_access_mode(team_project, ai_memory_store::AccessMode::Restricted)
+        .await
+        .unwrap();
     let member = user(&store, "member", 1).await;
     let outsider = user(&store, "outsider", 2).await;
     store

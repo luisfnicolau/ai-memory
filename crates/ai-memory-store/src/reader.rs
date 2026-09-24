@@ -80,11 +80,11 @@ fn now_us() -> i64 {
 /// Returns a fragment to append to a `WHERE` clause and the values it binds,
 /// numbered from `?{first_param}`. For `None` the fragment is empty and binds
 /// nothing, so a query built with no viewer is exactly the query it was before
-/// authorization existed — which is what an open install, an install that has
-/// not switched authorization on, and the root operator all need.
+/// authorization existed — which is what an install with no database users and
+/// the root operator both need.
 ///
-/// "May read" is any active grant. `reader` is the lowest level, so every
-/// grant covers it — the same answer `ai_memory_auth::decide` gives for
+/// "May read" is an open repository, or a restricted one with any active
+/// grant. `reader` is the lowest level, so every grant covers it — the same answer `ai_memory_auth::decide` gives for
 /// `GrantRole::Reader`, and a test pins the two together. The global
 /// preferences scope is always readable: it is shared by construction (see
 /// `lookup_global_scope`).
@@ -169,7 +169,9 @@ fn readable_repository_sql(
     // Aliased so the subqueries cannot bind to a `projects` / `workspaces`
     // already joined by the query this is appended to.
     format!(
-        " AND ({project_column} IN (SELECT mg.repository_id FROM memory_grant mg \
+        " AND ({project_column} IN (SELECT op.id FROM projects op \
+                                    WHERE op.access_mode = 'open') \
+               OR {project_column} IN (SELECT mg.repository_id FROM memory_grant mg \
                                     WHERE mg.user_id = {user} AND mg.revoked_at IS NULL) \
                OR {project_column} IN (SELECT gp.id FROM projects gp \
                                        JOIN workspaces gw ON gw.id = gp.workspace_id \
@@ -1772,6 +1774,34 @@ impl ReaderPool {
             .await
     }
 
+    /// Whether `user` may reach `repository_id` at `required` — the mode and
+    /// the grants together; see [`crate::auth::access`].
+    ///
+    /// # Errors
+    /// Propagates store failures.
+    pub async fn access_for(
+        &self,
+        user: ai_memory_core::UserId,
+        repository_id: ProjectId,
+        required: ai_memory_auth::GrantRole,
+    ) -> StoreResult<ai_memory_auth::Access> {
+        self.with_conn(move |conn| crate::auth::access(conn, user, repository_id, required))
+            .await
+    }
+
+    /// Page authors who would be refused if this repository were restricted;
+    /// see [`crate::auth::authors_without_grant`].
+    ///
+    /// # Errors
+    /// Propagates store failures.
+    pub async fn authors_without_grant(
+        &self,
+        repository_id: ProjectId,
+    ) -> StoreResult<Vec<String>> {
+        self.with_conn(move |conn| crate::auth::authors_without_grant(conn, repository_id))
+            .await
+    }
+
     /// Every active grant on the server, resolved to names for display.
     ///
     /// # Errors
@@ -1791,15 +1821,6 @@ impl ReaderPool {
     ) -> StoreResult<Vec<String>> {
         self.with_conn(move |conn| crate::auth::active_grants_under(conn, scope))
             .await
-    }
-
-    /// Whether any grant has ever been written — see
-    /// [`crate::auth::any_grant_exists`].
-    ///
-    /// # Errors
-    /// Propagates any SQL or pool error.
-    pub async fn any_grant_exists(&self) -> StoreResult<bool> {
-        self.with_conn(crate::auth::any_grant_exists).await
     }
 
     /// Run a synchronous closure against a pooled read-only connection.

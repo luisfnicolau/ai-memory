@@ -41,6 +41,62 @@ pub mod grant;
 pub use error::{AuthenticationFailure, NotGranted};
 pub use grant::{GrantRole, MemoryGrant};
 
+/// How a repository admits users (#708).
+///
+/// `Open` is what every repository was before this existed: any authenticated
+/// user reaches it, grants or not. `Restricted` admits only holders of a grant
+/// — the creator holds one from the moment they create it — and the root
+/// operator, who is authorized above per-repository granularity. Open by
+/// default, so an upgrade changes nothing until an operator restricts a
+/// repository on purpose.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessMode {
+    /// Any authenticated user.
+    #[default]
+    Open,
+    /// Grant holders and root only.
+    Restricted,
+}
+
+impl AccessMode {
+    /// The stored spelling, as in `projects.access_mode`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Restricted => "restricted",
+        }
+    }
+
+    /// Parse the stored spelling. Unknown values are `None`, never a default:
+    /// a mode this version cannot read must not quietly become `Open`.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "open" => Some(Self::Open),
+            "restricted" => Some(Self::Restricted),
+            _ => None,
+        }
+    }
+}
+
+/// [`decide`] for a repository in `mode`: an open repository admits everyone
+/// at every level, a restricted one asks the grants.
+#[must_use]
+pub fn decide_with_mode(
+    mode: AccessMode,
+    grants: &[MemoryGrant],
+    user: UserId,
+    repository: ProjectId,
+    required: GrantRole,
+) -> Access {
+    match mode {
+        AccessMode::Open => Access::Granted,
+        AccessMode::Restricted => decide(grants, user, repository, required),
+    }
+}
+
 /// Whether a user may reach a repository's memory, and if not, why.
 ///
 /// `Denied` carries the repository so the message can name it. A denial that

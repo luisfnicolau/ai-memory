@@ -976,7 +976,7 @@ pub async fn require_session(
         return json_err(StatusCode::UNAUTHORIZED, "auth required");
     }
     match load_session(&state, req.headers(), req.method()).await {
-        Ok(live) => inject_session(&mut req, live, state.authorization()),
+        Ok(live) => inject_session(&mut req, live),
         Err(resp) => return resp,
     }
     next.run(req).await
@@ -997,7 +997,7 @@ pub async fn require_session_or_anonymous(
         return next.run(req).await;
     }
     match load_session(&state, req.headers(), req.method()).await {
-        Ok(live) => inject_session(&mut req, live, state.authorization()),
+        Ok(live) => inject_session(&mut req, live),
         Err(resp) => return resp,
     }
     next.run(req).await
@@ -1068,7 +1068,7 @@ pub async fn require_dual_auth(
             if live.user.must_change_password {
                 return json_err(StatusCode::FORBIDDEN, "password change required");
             }
-            inject_session(&mut req, live, state.authorization());
+            inject_session(&mut req, live);
             req.extensions_mut().insert(state.clone());
             next.run(req).await
         }
@@ -1083,13 +1083,13 @@ pub async fn require_dual_auth(
 /// the operator, authorized above per-repository granularity, and stamping one
 /// would make the operator's own grants (of which there are none) the limit of
 /// what they can reach.
-fn inject_session(req: &mut Request<axum::body::Body>, live: LiveWebSession, authorization: bool) {
+fn inject_session(req: &mut Request<axum::body::Body>, live: LiveWebSession) {
     let level = if live.user.role == UserRole::Root {
         AuthLevel::Root
     } else {
         AuthLevel::User
     };
-    if authorization && level == AuthLevel::User {
+    if level == AuthLevel::User {
         req.extensions_mut()
             .insert(ai_memory_core::AuthorizedViewer(live.user.id));
     }

@@ -252,13 +252,44 @@ fn warn_project_name_in_other_workspaces(name: &str, also_in: &[String]) {
 
 /// Resolve a project by `(workspace_id, name)`, creating it if missing.
 /// Atomic.
+///
+/// Test-only: the writer creates through [`get_or_create_project_as`], which
+/// applies the server's new-project access mode. This keeps the plain shape
+/// the store's own tests build fixtures with; a new project here is `open`.
+#[cfg(test)]
 pub fn get_or_create_project(
     conn: &mut Connection,
     workspace_id: &ai_memory_core::WorkspaceId,
     name: &str,
     repo_path: Option<&str>,
 ) -> StoreResult<ai_memory_core::ProjectId> {
-    get_or_create_project_as(conn, workspace_id, name, repo_path, None).map(|(id, _)| id)
+    get_or_create_project_as(
+        conn,
+        workspace_id,
+        name,
+        repo_path,
+        None,
+        ai_memory_auth::AccessMode::Open,
+    )
+    .map(|(id, _)| id)
+}
+
+/// The access mode a newly created project starts in.
+///
+/// `default` is the server's `[auth] new_projects_restricted` setting. The
+/// two reserved projects are always open whatever it says: `scratch` is where
+/// every cwd-less event lands, and the global preferences scope is shared by
+/// construction and unioned into everybody's reads.
+pub(crate) fn initial_access_mode(
+    name: &str,
+    default: ai_memory_auth::AccessMode,
+) -> ai_memory_auth::AccessMode {
+    if name == ai_memory_core::DEFAULT_PROJECT_NAME || name == ai_memory_core::GLOBAL_SCOPE_PROJECT
+    {
+        ai_memory_auth::AccessMode::Open
+    } else {
+        default
+    }
 }
 
 /// [`get_or_create_project`] on behalf of a user, reporting whether this call
@@ -281,6 +312,7 @@ pub fn get_or_create_project_as(
     name: &str,
     repo_path: Option<&str>,
     creator: Option<ai_memory_core::UserId>,
+    new_project_mode: ai_memory_auth::AccessMode,
 ) -> StoreResult<(ai_memory_core::ProjectId, bool)> {
     let repo_path = repo_path.map(normalize_repo_path_key);
     let tx = conn.transaction()?;
@@ -309,6 +341,14 @@ pub fn get_or_create_project_as(
                 Timestamp::now().as_microsecond()
             ],
         )?;
+        // `open` is the column default, so the insert above is the one
+        // upstream always ran; only a restricted start needs another write.
+        if initial_access_mode(name, new_project_mode) == ai_memory_auth::AccessMode::Restricted {
+            tx.execute(
+                "UPDATE projects SET access_mode = 'restricted' WHERE id = ?1",
+                params![id.as_bytes()],
+            )?;
+        }
         created = true;
         id
     };
@@ -369,7 +409,7 @@ impl IdentityResolution {
 ///    router found) or the project named `name`:
 ///    - none → create `name` with the identity;
 ///    - it carries no identity → claim it when `creator` may write to it (or
-///      there is no creator: authorization off, an open install, root), else
+///      there is no creator: no database users, or root), else
 ///      return it unclaimed;
 ///    - it carries a different identity → create a new project named from
 ///      the identity ([`ai_memory_core::repository_identity::split_name_base`],
@@ -383,6 +423,7 @@ impl IdentityResolution {
 ///
 /// # Errors
 /// Propagates SQLite failures.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_project_by_identity(
     conn: &mut Connection,
     workspace_id: &ai_memory_core::WorkspaceId,
@@ -391,6 +432,7 @@ pub fn resolve_project_by_identity(
     repo_path: Option<&str>,
     candidate: Option<ai_memory_core::ProjectId>,
     creator: Option<ai_memory_core::UserId>,
+    new_project_mode: ai_memory_auth::AccessMode,
 ) -> StoreResult<(ai_memory_core::ProjectId, IdentityResolution)> {
     let repo_path = repo_path.map(normalize_repo_path_key);
     let now = Timestamp::now().as_microsecond();
@@ -433,6 +475,7 @@ pub fn resolve_project_by_identity(
                     name,
                     repo_path.as_deref(),
                     identity,
+                    initial_access_mode(name, new_project_mode),
                     now,
                 )?;
                 (id, IdentityResolution::Created)
@@ -442,12 +485,7 @@ pub fn resolve_project_by_identity(
                 let may_write = match creator {
                     None => true,
                     Some(user) => matches!(
-                        ai_memory_auth::decide(
-                            &crate::auth::grants_for(&tx, user, id)?,
-                            user,
-                            id,
-                            ai_memory_auth::GrantRole::Writer,
-                        ),
+                        crate::auth::access(&tx, user, id, ai_memory_auth::GrantRole::Writer)?,
                         ai_memory_auth::Access::Granted
                     ),
                 };
@@ -483,6 +521,7 @@ pub fn resolve_project_by_identity(
                     &split_name,
                     None,
                     identity,
+                    initial_access_mode(&split_name, new_project_mode),
                     now,
                 )?;
                 (id, IdentityResolution::Split)
@@ -514,13 +553,14 @@ fn insert_project_with_identity(
     name: &str,
     repo_path: Option<&str>,
     identity: &ai_memory_core::repository_identity::RepositoryIdentity,
+    mode: ai_memory_auth::AccessMode,
     now: i64,
 ) -> StoreResult<ai_memory_core::ProjectId> {
     let id = ai_memory_core::ProjectId::new();
     tx.execute(
         "INSERT INTO projects \
-         (id, workspace_id, name, repo_path, created_at, identity, identity_source) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+         (id, workspace_id, name, repo_path, created_at, identity, identity_source, access_mode) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             id.as_bytes(),
             workspace_id.as_bytes(),
@@ -529,6 +569,7 @@ fn insert_project_with_identity(
             now,
             identity.identity,
             identity.source.as_str(),
+            mode.as_str(),
         ],
     )?;
     Ok(id)

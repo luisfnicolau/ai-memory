@@ -22,7 +22,6 @@ pub async fn run(config: &Config, args: GrantArgs) -> Result<()> {
         GrantCommand::List(args) => list(&ep, args).await,
         GrantCommand::Add(args) => add(&ep, args).await,
         GrantCommand::Revoke(args) => revoke(&ep, args).await,
-        GrantCommand::Seed => seed(&ep).await,
     }
 }
 
@@ -68,12 +67,11 @@ async fn list(ep: &ServerEndpoint, args: GrantListArgs) -> Result<()> {
         return Ok(());
     }
     if resp.grants.is_empty() {
-        // Say what empty means, because it means two very different things
-        // depending on a setting this command cannot see.
+        // Say what empty means: nothing is lost on an open project.
         println!("(no grants in force)");
         println!(
-            "With [auth].authorization = false nothing is enforced and every user reaches \
-             every repository. With it on, nobody but root reaches anything."
+            "Open projects admit every user regardless; a restricted project now admits \
+             only root."
         );
         return Ok(());
     }
@@ -152,29 +150,5 @@ async fn revoke(ep: &ServerEndpoint, args: GrantTargetArgs) -> Result<()> {
     } else {
         println!("{} held nothing on {repo}; nothing changed.", args.username);
     }
-    Ok(())
-}
-
-#[derive(Debug, Deserialize)]
-struct SeedResponse {
-    granted: usize,
-    already_held: usize,
-    users: usize,
-    repositories: usize,
-}
-
-async fn seed(ep: &ServerEndpoint) -> Result<()> {
-    let resp: SeedResponse = post_json(ep, "/admin/grants/seed", &serde_json::json!({}))
-        .await
-        .context("seeding grants")?;
-    println!(
-        "Seeded {} admin grant(s) across {} user(s) and {} repositor(y/ies); \
-         {} pair(s) already held a grant and were left as they were.",
-        resp.granted, resp.users, resp.repositories, resp.already_held
-    );
-    println!();
-    println!("Existing access is preserved. Next:");
-    println!("  1. set [auth].authorization = true and restart the server");
-    println!("  2. ai-memory grant list, then grant revoke / grant add to narrow it");
     Ok(())
 }

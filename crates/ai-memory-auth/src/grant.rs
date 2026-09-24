@@ -84,10 +84,9 @@ pub struct MemoryGrant {
     /// The operator who granted it, so "who let them in" has an answer that is
     /// not "the database".
     ///
-    /// `None` when there is no `users` row behind the decision: the grant was
-    /// seeded when authorization was switched on, or the operator used the
-    /// root bearer token, which authenticates from configuration. Naming a
-    /// person there would invent a decision that was never made.
+    /// `None` when there is no `users` row behind the decision: the operator
+    /// used the root bearer token, which authenticates from configuration.
+    /// Naming a person there would invent a decision that was never made.
     ///
     /// Equal to `user_id` for exactly one kind of grant: the `admin` a user
     /// receives with a repository they create, where the act was theirs.

@@ -18,7 +18,7 @@ use ai_memory_store::{ReaderPool, ResolvedScope, ScopeResolutionError, authorize
 /// viewer cannot reach is refused with the same `NotAuthorized` the resolvers
 /// return — an access problem, never an empty result.
 ///
-/// No viewer — authorization off, an open install, or root — passes without
+/// No viewer — an install with no database users, or root — passes without
 /// a lookup.
 pub(crate) async fn authorize_resolved(
     reader: &ReaderPool,

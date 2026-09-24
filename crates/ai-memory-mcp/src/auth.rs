@@ -90,15 +90,6 @@ pub struct AuthState {
     /// Human password/session runtime. `None` for machine-only or
     /// zero-config anonymous loopback.
     pub human: Option<crate::human_auth::HumanAuthRuntime>,
-    /// Whether per-repository authorization is switched on.
-    ///
-    /// Off by default, and off is what every existing install gets: the grant
-    /// tables ship empty, so enforcing against them would deny every
-    /// authenticated user everything. When off the middleware stamps no
-    /// [`ai_memory_core::AuthorizedViewer`], which is what the guards read as
-    /// "no check applies". Attribution is unaffected either way — the bare
-    /// `UserId` is stamped regardless.
-    authorization: bool,
     /// Whether human auth was intended at startup. Runtime presence is
     /// separate because the browser transition checks persisted password /
     /// bootstrap state on every request.
@@ -117,24 +108,6 @@ impl AuthState {
             expected: expected.filter(|token| !token.trim().is_empty()),
             ..Self::default()
         }
-    }
-
-    /// Switch per-repository authorization on.
-    ///
-    /// Until an operator does this, grants are recorded but never enforced —
-    /// see [`ai_memory_core::AuthorizedViewer`] for why the off state is the
-    /// absence of a stamp rather than a flag each guard has to remember to
-    /// consult.
-    #[must_use]
-    pub fn with_authorization(mut self, authorization: bool) -> Self {
-        self.authorization = authorization;
-        self
-    }
-
-    /// Whether per-repository authorization is switched on.
-    #[must_use]
-    pub const fn authorization(&self) -> bool {
-        self.authorization
     }
 
     /// Require HTTPS for browser session cookies.
@@ -390,10 +363,10 @@ pub(crate) async fn authenticate_token(
                 };
                 req.extensions_mut().insert(actor);
                 req.extensions_mut().insert(hit.user.id);
-                if state.authorization {
-                    req.extensions_mut()
-                        .insert(ai_memory_core::AuthorizedViewer(hit.user.id));
-                }
+                // Every database user is subject to per-project access; an
+                // open project admits them, a restricted one asks for a grant.
+                req.extensions_mut()
+                    .insert(ai_memory_core::AuthorizedViewer(hit.user.id));
                 req.extensions_mut().insert(AuthLevel::User);
                 let writer = mu.writer.clone();
                 let user_id = hit.user.id;
@@ -1443,6 +1416,47 @@ mod tests {
         assert_eq!(actor.name.as_deref(), Some("alice display"));
         // NOT the root template — root_actor.user is "root".
         assert_ne!(actor.user.as_deref(), Some("root"));
+    }
+
+    /// Every database user is subject to per-project access, so the
+    /// middleware stamps the viewer for each of them — there is no switch.
+    /// Root is never stamped: it is authorized above per-project granularity.
+    #[tokio::test]
+    async fn a_database_user_is_always_a_viewer_and_root_never_is() {
+        async fn viewer(
+            viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
+        ) -> String {
+            viewer.map_or_else(String::new, |axum::Extension(v)| v.user().to_string())
+        }
+        let (_tmp, state, token) = setup_multiuser("alice").await;
+        let router = Router::new().route("/viewer", get(viewer)).layer(
+            axum::middleware::from_fn_with_state(Arc::new(state), require_bearer),
+        );
+        let ask = |bearer: String| {
+            let router = router.clone();
+            async move {
+                let resp = router
+                    .oneshot(
+                        Request::builder()
+                            .uri("/viewer")
+                            .header("Authorization", format!("Bearer {bearer}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                let bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+                String::from_utf8(bytes.to_vec()).unwrap()
+            }
+        };
+        assert!(!ask(token).await.is_empty(), "a database user is a viewer");
+        assert!(
+            ask("root-token-distinct-from-user-token".to_owned())
+                .await
+                .is_empty(),
+            "root is not"
+        );
     }
 
     #[tokio::test]

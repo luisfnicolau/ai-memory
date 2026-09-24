@@ -278,7 +278,7 @@ separately gated Claude Code assistant/Stop excerpt remains capped at 2 KB.
 
 | Table | What |
 |---|---|
-| `workspaces`, `projects` | Top of the 3-tuple identity coordinate. `projects.identity` / `identity_source` (#708) hold the repository identity a project routes by — an explicit marker `identity` or a normalised git remote, resolved client-side — unique per workspace when set; empty until a capture claims the project. See `docs/marker-file.md#repository-identity`. |
+| `workspaces`, `projects` | Top of the 3-tuple identity coordinate. `projects.identity` / `identity_source` (#708) hold the repository identity a project routes by — an explicit marker `identity` or a normalised git remote, resolved client-side — unique per workspace when set; empty until a capture claims the project. See `docs/marker-file.md#repository-identity`. `projects.access_mode` (`open` default / `restricted`) decides whether any authenticated user or only grant holders (`memory_grant`) and root reach it — `docs/users.md#per-project-access`. |
 | `pages` | Versioned wiki pages with `is_latest` + `supersedes` chain. M8 columns: `last_accessed_at`, `access_count`, and decay-only tombstone marker `superseded_at`. M9 cols: `embedding_provider`, `embedding_model`, `embedding_dim`. V36: `expires_at` (frontmatter TTL). V37: `salience` (NULL = `salience_default`; derived from `page_feedback`). |
 | `pages_fts` | FTS5 virtual table over `(title, body)`, auto-synced by triggers. |
 | `sessions`, `observations` | Sanitized, bounded lifecycle-hook projections. `sessions.ended_observation_count` is the stable generation watermark for resumed-session re-end eligibility; wall clocks are not used for that decision. They are an operational audit trail, not a complete native transcript. |
@@ -536,6 +536,7 @@ auth                 user                 completions
 handoffs             purge-session        compact
 api-key              export-okf           grant
 message              doctor               backfill
+project
 ```
 
 Run `ai-memory --help` for the full tree.

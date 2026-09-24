@@ -809,8 +809,8 @@ async fn handle_hook_batch(
     // All items in a batch share the drain's single identity, so the actor is
     // captured once from the batch request (mirrors `handle_hook`).
     let actor = actor_identity(actor_ext);
-    // Same gated marker as the single-event path: `None` whenever
-    // per-repository authorization is off.
+    // Same marker as the single-event path: `None` for root and on an
+    // install with no database users.
     let viewer = viewer_ext.map(|axum::Extension(v)| v.user());
     let skip_webhooks = admission_skips(level_ext, &headers);
     let actor_storage_key = actor.as_ref().map(IdentityKey::storage_key);
@@ -2751,14 +2751,16 @@ async fn process_authorized(
     // failure and be retried until it burnt the entry's attempt budget, which
     // is how this project once spent 10.7M tokens re-sending something that
     // could never succeed. Dropping it here is final by construction.
-    if let Some(viewer) = viewer {
-        let grants = state.reader.grants_for(viewer, proj).await?;
-        if matches!(
-            ai_memory_auth::decide(&grants, viewer, proj, ai_memory_auth::GrantRole::Writer),
+    if let Some(viewer) = viewer
+        && matches!(
+            state
+                .reader
+                .access_for(viewer, proj, ai_memory_auth::GrantRole::Writer)
+                .await?,
             ai_memory_auth::Access::Denied(_)
-        ) {
-            return Err(CaptureNotAuthorized.into());
-        }
+        )
+    {
+        return Err(CaptureNotAuthorized.into());
     }
 
     // Hooks are fire-and-forget and may arrive out of order. Begin the
@@ -3912,6 +3914,12 @@ mod tests {
     async fn a_capture_needs_writer_on_the_repository_it_lands_in() {
         let tmp = TempDir::new().unwrap();
         let state = make_state(&tmp).await;
+        // Grants only decide anything in a restricted project.
+        state
+            .writer
+            .set_new_project_mode(ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
         let cwd = tmp.path().to_path_buf();
 
         // Which repository a capture lands in is resolved from the cwd, not
@@ -3993,6 +4001,12 @@ mod tests {
     async fn an_unauthorized_batch_item_is_consumed_rather_than_retried() {
         let tmp = TempDir::new().unwrap();
         let state = make_state(&tmp).await;
+        // Grants only decide anything in a restricted project.
+        state
+            .writer
+            .set_new_project_mode(ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
         let cwd = tmp.path().to_path_buf();
 
         let probe = SessionId::new().to_string();
@@ -4054,11 +4068,10 @@ mod tests {
         );
     }
 
-    /// With authorization off, captures behave exactly as they always have.
+    /// With no viewer, captures behave exactly as they always have.
     ///
-    /// `None` is what the gated `AuthorizedViewer` marker yields on every
-    /// install that has not switched authorization on, which is all of them
-    /// until an operator does.
+    /// `None` is what the `AuthorizedViewer` marker yields for root and on an
+    /// install with no database users.
     #[tokio::test]
     async fn a_capture_with_no_viewer_is_untouched_by_the_check() {
         let tmp = TempDir::new().unwrap();
@@ -4066,7 +4079,7 @@ mod tests {
         let session = SessionId::new().to_string();
         capture_as(&state, tmp.path(), &session, None)
             .await
-            .expect("authorization off must not change capture");
+            .expect("no viewer must not change capture");
         let stored = state
             .reader
             .observations_for_session(session.parse().unwrap())
@@ -4087,6 +4100,12 @@ mod tests {
     async fn a_capture_opening_a_new_repository_grants_it_to_its_creator() {
         let tmp = TempDir::new().unwrap();
         let state = make_state(&tmp).await;
+        // Grants only decide anything in a restricted project.
+        state
+            .writer
+            .set_new_project_mode(ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
         let repo = tmp.path().join("fresh-checkout");
         std::fs::create_dir_all(&repo).unwrap();
         let cora = user_holding(&state, "cora", state.project_id, None).await;
@@ -9895,6 +9914,14 @@ mod tests {
         use ai_memory_core::{AuthorizedViewer, NewUser, UserRole};
         let tmp = TempDir::new().unwrap();
         let state = make_state(&tmp).await;
+        // Grants only decide anything in a restricted project. The handoff
+        // lives in `scratch`, which starts open whatever the server default
+        // says, so it is restricted explicitly — which an operator may do.
+        state
+            .writer
+            .set_access_mode(state.project_id, ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
         let cwd = tmp.path().to_string_lossy().into_owned();
         state
             .writer

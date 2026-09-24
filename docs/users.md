@@ -677,26 +677,50 @@ Without `--as-user`, hooks install the same way they always have —
 the bearer authenticates, attribution flows from the token's owner
 (root user or DB user) at write time.
 
+## Per-project access
+
+Authentication says *who* is asking; each project's **access mode** decides
+what they may reach (#708):
+
+| Mode | Who reaches the project |
+|---|---|
+| `open` (default) | Every authenticated user — what every project was before access modes existed. |
+| `restricted` | The root operator, and users holding a grant on it. |
+
+Every existing project is `open` after upgrading, so nothing changes until an
+operator restricts one:
+
+```sh
+ai-memory project access --workspace acme --project checkout-api --mode restricted
+ai-memory grant add alice checkout-api --workspace acme --role writer
+```
+
+Both are root-only. Restricting prints the users who have written to the
+project and hold no grant — the people it now refuses — so you can grant the
+ones who should keep access; nothing is granted automatically.
+
+- **Grants** are `reader` < `writer` < `admin`, per project. `admin` on one
+  project confers nothing elsewhere. `ai-memory grant list | add | revoke`
+  manages them; revocation is recorded, never deleted.
+- **Whoever creates a project** is granted `admin` on it, so a creator keeps
+  their project if it is later restricted.
+- **New projects** are `open` unless `[auth] new_projects_restricted = true`
+  (`AI_MEMORY_AUTH__NEW_PROJECTS_RESTRICTED=true`), which makes every project created from then on start `restricted`. The
+  reserved `scratch` project and the global preferences scope always start
+  open, and the global scope can never be restricted: it is shared by
+  construction.
+- **Gates entry, never rows.** Access decides which projects a user reaches;
+  inside a project pages stay shared exactly as before (see below).
+- **Refusals are explicit.** A user outside a restricted project gets a 403
+  naming it, never an empty result; search, listings and the graph leave it
+  out rather than hinting at it. A hook capture into a project the user may
+  not write is dropped and counted (`dropped_unauthorized` in status), not
+  retried.
+- **No database users, no checks.** A single-operator install, and the root
+  bearer token, are never subject to access modes.
+
 ## Limitations
 
-- **Accounts are not a tenancy boundary.** Authentication tells the server
-  *who* is asking; nothing decides *what* they may read. Every authenticated
-  user sees every page in every project in **every workspace on the server** —
-  not just the one they are working in. A server holds many workspaces
-  (`projects.workspace_id` references `workspaces(id)`), but `users` carries no
-  workspace, project or repository reference and there is no grant, ACL or
-  membership table anywhere in the schema, so there is nothing for a read to be
-  checked against. Two accounts created minutes apart, sharing nothing but the
-  server, can each read the other's projects in full — including via
-  `memory_query`, which searches across scopes. All `/admin/*` endpoints are
-  still root-only in multi-user mode.
-
-  This is working as designed for the single-operator and homelab cases
-  ai-memory targets today. **If one server would hold work for more than one
-  team, that is not a supported configuration yet.** Run separate ai-memory
-  servers (per-user data dirs) behind a reverse proxy instead. Per-project
-  authorization is tracked in
-  [#708](https://github.com/akitaonrails/ai-memory/issues/708).
 
 - **No per-page RBAC *within* a project.** This one is deliberate and separate
   from the above: pages are shared inside a project because multi-session and
@@ -719,8 +743,7 @@ the bearer authenticates, attribution flows from the token's owner
   bearer / native `aim_` keys / web sessions, and `/admin/*` stays root-only unless a gateway
   translates accepted OIDC auth into upstream auth that ai-memory accepts.
   ai-memory still has one shared wiki per server and no
-  per-page RBAC — and, per the first bullet above, no per-project
-  authorization either: an accepted OIDC identity can read every project on
-  the server. The Keycloak/OIDC `sid` claim is also not an ai-memory agent
+  per-page RBAC. Per-project access applies to the database user a gateway
+  authenticates as, like any other. The Keycloak/OIDC `sid` claim is also not an ai-memory agent
   session id; session auto-scope needs the lifecycle-hook session id or explicit
   `workspace` + `project` / `scopes`.

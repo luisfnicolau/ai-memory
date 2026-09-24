@@ -23,7 +23,7 @@ pub(crate) struct SearchParams {
 /// Handler for `GET /search?q=…`.
 ///
 /// Searches only the repositories the viewer may read (#708) — see
-/// `ReaderPool::search_pages_with_meta`. No viewer (authorization off, or
+/// `ReaderPool::search_pages_with_meta`. No viewer (no database users, or
 /// root) searches everything, as before.
 pub(crate) async fn handler(
     State(state): State<Arc<WebState>>,
