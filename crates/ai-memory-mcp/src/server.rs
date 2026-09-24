@@ -1878,9 +1878,9 @@ impl AiMemoryServer {
     /// Same argument shape as a read — an explicit workspace/project pair, or
     /// the current-project fallback chain — and that is exactly the trap this
     /// exists to close. `memory_delete_page`, `memory_feedback`,
-    /// `memory_forget_sweep`, `memory_lint`, `memory_auto_improve` and the
-    /// handoff accept/cancel pair all take read-shaped arguments and all
-    /// mutate; every one of them authorized as a reader until this split.
+    /// `memory_forget_sweep`, `memory_lint`, `memory_auto_improve`, the
+    /// handoff accept/cancel pair, and the message queue's pop, cancel and the
+    /// recipient of a send all take read-shaped arguments and all mutate.
     ///
     /// Distinct from [`Self::write_target_ids_with_actor`], which may CREATE
     /// the target. These tools act on something that must already be there.
@@ -4614,11 +4614,14 @@ impl AiMemoryServer {
                 Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
-        // Recipient MUST already exist: resolve through the no-create read path
-        // so a typo fails closed with a scope error naming the target, instead
-        // of dropping a message into a phantom inbox nobody reads.
+        // Recipient MUST already exist: resolved without creating it, so a typo
+        // fails closed with a scope error naming the target instead of dropping
+        // a message into a phantom inbox nobody reads. And it needs `write`:
+        // delivering into a project's inbox puts text into its agents' context,
+        // which is a write to that project — otherwise the mailbox would be a
+        // way around a restricted project's grants (#708).
         let (to_ws, to_proj) = self
-            .effective_ids_for_read_args_with_actor(
+            .effective_ids_for_mutation_args_with_actor(
                 Some(args.to_workspace.as_str()),
                 Some(args.to_project.as_str()),
                 &aps_actor,
@@ -4736,7 +4739,7 @@ impl AiMemoryServer {
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let (ws, proj) = self
-            .effective_ids_for_read_args_with_actor(
+            .effective_ids_for_mutation_args_with_actor(
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
@@ -4799,7 +4802,7 @@ impl AiMemoryServer {
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let (ws, proj) = self
-            .effective_ids_for_read_args_with_actor(
+            .effective_ids_for_mutation_args_with_actor(
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
@@ -6583,6 +6586,140 @@ mod tests {
             result.is_err(),
             "sending to a non-existent recipient project must fail closed, not create it"
         );
+    }
+
+    /// The design's open question 3 (#708): delivering into a restricted
+    /// project's inbox needs `write` on it, or the mailbox is a way around its
+    /// grants. Popping an inbox and cancelling an outbox change a queue, so
+    /// they need `write` on it too; a `read` grant is refused all three.
+    #[tokio::test]
+    async fn a_restricted_projects_queues_need_write() {
+        let (_tmp, store, server, ws, _scratch) = setup_server().await;
+        let team = store
+            .writer
+            .get_or_create_project(ws, "team", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .set_access_mode(team, ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        let human = |name: &'static str| {
+            let writer = store.writer.clone();
+            async move {
+                writer
+                    .create_human_user(
+                        NewUser {
+                            username: name.into(),
+                            name: None,
+                            email: None,
+                        },
+                        ai_memory_core::UserRole::User,
+                        None,
+                        false,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let reader = human("ray").await;
+        let member = human("mia").await;
+        grant_role(store.db_path(), reader, team, "read");
+        grant_role(store.db_path(), member, team, "write");
+        let as_user = |user: ai_memory_core::UserId| {
+            let mut parts = test_parts_default();
+            parts.extensions.insert(AuthLevel::User);
+            parts.extensions.insert(user);
+            parts
+                .extensions
+                .insert(ai_memory_core::AuthorizedViewer(user));
+            OptionalParts(parts)
+        };
+        let send = |user, from: &'static str, to: &'static str| {
+            let server = &server;
+            async move {
+                server
+                    .memory_message_send(
+                        Parameters(MessageSendArgs {
+                            to_workspace: "default".into(),
+                            to_project: to.into(),
+                            body: "please look at this".into(),
+                            subject: None,
+                            from_project: Some(from.into()),
+                            from_workspace: Some("default".into()),
+                        }),
+                        as_user(user),
+                    )
+                    .await
+            }
+        };
+        let pop = |user| {
+            let server = &server;
+            async move {
+                server
+                    .memory_message_pop(
+                        Parameters(MessagePopArgs {
+                            message_id: None,
+                            project: Some("team".into()),
+                            workspace: Some("default".into()),
+                        }),
+                        as_user(user),
+                    )
+                    .await
+            }
+        };
+        let cancel = |user| {
+            let server = &server;
+            async move {
+                server
+                    .memory_message_cancel(
+                        Parameters(MessageCancelArgs {
+                            message_id: None,
+                            project: Some("team".into()),
+                            workspace: Some("default".into()),
+                        }),
+                        as_user(user),
+                    )
+                    .await
+            }
+        };
+        let refused_for_write = |result: Result<CallToolResult, McpError>| {
+            let err = result.expect_err("a read grant must be refused");
+            assert!(format!("{err:?}").contains("needs write"), "{err:?}");
+        };
+
+        // Into the restricted inbox: `read` is not enough, `write` is.
+        refused_for_write(send(reader, "scratch", "team").await);
+        send(member, "scratch", "team")
+            .await
+            .expect("write delivers");
+        // Out of it: popping consumes the team's mail.
+        refused_for_write(pop(reader).await);
+        let json = |result: CallToolResult| -> serde_json::Value {
+            let text = result
+                .content
+                .first()
+                .and_then(|c| c.as_text())
+                .map(|t| t.text.clone())
+                .unwrap();
+            serde_json::from_str(&text).unwrap()
+        };
+        let popped = json(pop(member).await.expect("write pops"));
+        assert!(
+            popped["message"]
+                .to_string()
+                .contains("please look at this"),
+            "{popped}"
+        );
+        // The team's outbox: sending FROM it reads the sender side only, but
+        // clearing it is a change to the team's queue.
+        send(member, "team", "scratch")
+            .await
+            .expect("send from team");
+        refused_for_write(cancel(reader).await);
+        let cancelled = json(cancel(member).await.expect("write cancels"));
+        assert_eq!(cancelled["cancelled"], 1, "{cancelled}");
     }
 
     async fn server_project_json(store: &Store, ws: WorkspaceId, name: &str) -> serde_json::Value {

@@ -710,6 +710,10 @@ ones who should keep access; nothing is granted automatically.
   its workspace takes its grants with it. Every grant, level change and revoke
   is recorded in the audit log (`grant_access` / `revoke_access`, with who did
   it), so "who could reach this, and since when" stays answerable.
+- **Cross-project messages** respect access too: delivering into a restricted
+  project's inbox needs `write` on it (otherwise the mailbox would be a way
+  around its grants), and so do popping its inbox and cancelling its outbox,
+  which change its queues. Listing them needs `read`.
 - **Whoever creates a project** is granted `write` on it, so a creator keeps
   their project if it is later restricted.
 - **New projects** are `open` unless `[auth] new_projects_restricted = true`
