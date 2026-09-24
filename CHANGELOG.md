@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Per-project access for multi-user servers, as designed in
+  [`design-per-project-authz.md`](docs/design-per-project-authz.md). Every
+  project now has an access mode: `open` (the default, and what every existing
+  project stays after upgrading) admits any authenticated user exactly as
+  before; `restricted` admits only the root operator and users holding a grant.
+  Grants are `read` or `write` per project (`project_grants`, V68; the mode is
+  `projects.access_mode`, V69); administration stays with root. The check runs
+  where scopes are resolved, so MCP tools, hook captures and session start, the
+  web UI and `/api/v1` all agree, and search, listings, the graph and the
+  workspace overview leave out projects a user may not read — filtered in the
+  query, before `LIMIT`. A refusal is a 403 that names the project and the
+  level needed, never an empty result. Installs with no database users, and the
+  root token, are never checked. (#708)
+- `ai-memory project access --workspace W --project P --mode open|restricted`
+  (`POST /admin/projects/access`); restricting names the page authors who hold
+  no grant and are now refused, and grants nobody automatically.
+  `ai-memory user grant --user U --workspace W --project P --level read|write`,
+  `ai-memory user revoke …`, `ai-memory user grants [--user U]` and
+  `ai-memory project grants --project P` manage and list grants
+  (`POST /admin/users/{username}/grant|revoke`,
+  `GET /admin/users/{username}/grants`, `GET /admin/projects/grants`). All
+  root-only. (#708)
+- `[auth] new_projects_restricted` (`AI_MEMORY_AUTH__NEW_PROJECTS_RESTRICTED`),
+  default `false`: when set, every project created from then on starts
+  `restricted`. The reserved `scratch` project and the global preferences scope
+  always start open; the global scope cannot be restricted. (#708)
+- Whoever creates a project is granted `write` on it, so a creator keeps their
+  project if it is later restricted. Every grant, level change and revoke is
+  recorded in `audit_log` (`grant_access` / `revoke_access`, with who did it).
+  Grants are removed with their project, workspace or user. (#708)
+- Cross-project messages respect access: sending into a restricted project's
+  inbox, popping it and cancelling its outbox need `write` on it; listing needs
+  `read`. (#708)
+- `identity = "…"` in `.ai-memory.toml` pins the repository identity a
+  checkout's captures route by, outranking `project` and the git remote — see
+  [marker-file.md](docs/marker-file.md#repository-identity). (#708)
+
+### Changed
+- Captures from a checkout with no declared `project` and a git remote now route
+  by the repository's identity — the normalised `upstream` remote, else `origin`
+  — instead of the folder name (`projects.identity`, V67). Two unrelated
+  repositories sharing a folder name now get two projects (the second named
+  after its owner, e.g. `orgb-api`); one repository cloned into differently
+  named folders converges on one project, the first to claim the identity —
+  an existing second project keeps its history but stops receiving captures.
+  Existing projects are claimed in place, so upgrading moves no memory. Checkouts
+  that declare `project` in their marker route by name exactly as before. Every
+  hook client (native, shell, PowerShell, TypeScript) resolves the identity
+  host-side and sends it as `identity` / `identity_src`; credentials in a remote
+  URL never leave the machine. (#708)
+- A capture into a project its author may not write is dropped server-side and
+  counted as `dropped_unauthorized` in status, never stored. The native hook
+  client treats a 403 from the server as final and drops the event instead of
+  retrying it. (#708)
+
 ## [2.4.0] - 2026-09-21
 
 ### Security

@@ -1,8 +1,8 @@
 # Design proposal: per-project authorization for multi-user servers (#708)
 
-**Status: proposal for review — not implemented.** This is the design pass promised
-on #708 before any code lands. It changes a security boundary, so it is deliberately
-separated from implementation.
+**Status: implemented.** This was the design pass promised on #708 before any code
+landed; the implementation follows it. Where it goes beyond the text, see
+[Implementation notes](#implementation-notes) at the end.
 
 ## Problem
 
@@ -103,3 +103,26 @@ Table-driven authorization tests (root / granted-read / granted-write / no-grant
 anonymous × open/restricted projects), a multi-session integration test proving a
 non-granted user is refused a restricted project while a granted teammate is admitted
 (the invariant-#16 shape that unit tests miss), and a migration idempotency test.
+
+## Implementation notes
+
+What the implementation adds to, or settles in, the proposal above:
+
+- **Open question 1** — new projects are `open`; `[auth] new_projects_restricted = true`
+  makes every project created from then on `restricted`. The reserved `scratch` project
+  and the global preferences scope always start open.
+- **Open question 2** — the global preferences scope is readable by every authenticated
+  user and can never be restricted.
+- **Open question 3** — sending into a restricted project's inbox needs `write` on it.
+  Popping its inbox and cancelling its outbox change a queue, so they need `write` too;
+  listing needs `read`.
+- **The creator** is admitted by a `write` grant issued in the same transaction that
+  creates the project, recorded with the creator as `granted_by`.
+- **Audit** — every grant, level change and revoke is written to `audit_log`
+  (`grant_access` / `revoke_access`); the grant table itself holds only what is in force.
+- **Unscoped reads** (search, listings, graph, workspace overview) filter to readable
+  projects inside the query, before `LIMIT`; entry points keyed by a raw id (managed
+  runs, workstreams, consolidation) resolve the id to its project and authorize it.
+- **Listings** the proposal does not name: `ai-memory user grants [--user U]`,
+  `ai-memory project grants --project P`, `GET /admin/users/{username}/grants`,
+  `GET /admin/projects/grants`.
