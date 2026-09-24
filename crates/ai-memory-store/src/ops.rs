@@ -145,9 +145,6 @@ pub struct PurgeSummary {
     pub workstreams_deleted: u64,
     /// Number of `managed_runs` rows deleted (cascades through workstreams).
     pub managed_runs_deleted: u64,
-    /// Grants revoked because the operator passed `--revoke-grants`. Revoked,
-    /// not deleted: their history rows outlive the repository (V68).
-    pub grants_revoked: u64,
     /// Ids of the deleted workstreams. The admin layer uses these typed,
     /// pre-delete identifiers to remove `raw/workstreams/<id>/` after the SQL
     /// transaction commits and to report any filesystem partial failure.
@@ -357,7 +354,7 @@ pub fn get_or_create_project_as(
             &tx,
             creator,
             id,
-            ai_memory_auth::GrantRole::Write,
+            ai_memory_auth::GrantLevel::Write,
             Some(creator),
             Timestamp::now().as_microsecond(),
         )?;
@@ -485,7 +482,7 @@ pub fn resolve_project_by_identity(
                 let may_write = match creator {
                     None => true,
                     Some(user) => matches!(
-                        crate::auth::access(&tx, user, id, ai_memory_auth::GrantRole::Write)?,
+                        crate::auth::access(&tx, user, id, ai_memory_auth::GrantLevel::Write)?,
                         ai_memory_auth::Access::Granted
                     ),
                 };
@@ -535,7 +532,7 @@ pub fn resolve_project_by_identity(
             &tx,
             creator,
             id,
-            ai_memory_auth::GrantRole::Write,
+            ai_memory_auth::GrantLevel::Write,
             Some(creator),
             now,
         )?;
@@ -586,13 +583,6 @@ fn insert_project_with_identity(
 /// projects (`scratch`, the cwd-less fallback; `_global`, the preferences
 /// scope) are exempt even when empty. Returns the deleted names for logging.
 ///
-/// A repository somebody holds a grant on is not hollow, whatever it contains:
-/// it is waiting for its first write, and the grant is a decision somebody
-/// made about it — an operator's, or the creator's, by creating it. Sweeping it would take that access away on a schedule with
-/// nobody watching — and the database now refuses to, so without this the
-/// whole sweep would fail on the first such row. Revoked-only history does not
-/// hold a repository back; its rows survive the delete (V68).
-///
 /// # Errors
 /// Propagates SQLite failures.
 pub fn sweep_hollow_projects(conn: &mut Connection, min_age_days: u32) -> StoreResult<Vec<String>> {
@@ -611,9 +601,7 @@ pub fn sweep_hollow_projects(conn: &mut Connection, min_age_days: u32) -> StoreR
                AND NOT EXISTS (SELECT 1 FROM workstreams  WHERE project_id = projects.id)
                AND NOT EXISTS (SELECT 1 FROM auto_improve_runs      WHERE project_id = projects.id)
                AND NOT EXISTS (SELECT 1 FROM auto_improve_proposals WHERE project_id = projects.id)
-               AND NOT EXISTS (SELECT 1 FROM auto_improve_rejections WHERE project_id = projects.id)
-               AND NOT EXISTS (SELECT 1 FROM memory_grant
-                                WHERE repository_id = projects.id AND revoked_at IS NULL)",
+               AND NOT EXISTS (SELECT 1 FROM auto_improve_rejections WHERE project_id = projects.id)",
         )?;
         let rows = stmt.query_map(
             params![ai_memory_core::GLOBAL_SCOPE_PROJECT, cutoff],
@@ -633,9 +621,7 @@ pub fn sweep_hollow_projects(conn: &mut Connection, min_age_days: u32) -> StoreR
                AND NOT EXISTS (SELECT 1 FROM workstreams  WHERE project_id = projects.id)
                AND NOT EXISTS (SELECT 1 FROM auto_improve_runs      WHERE project_id = projects.id)
                AND NOT EXISTS (SELECT 1 FROM auto_improve_proposals WHERE project_id = projects.id)
-               AND NOT EXISTS (SELECT 1 FROM auto_improve_rejections WHERE project_id = projects.id)
-               AND NOT EXISTS (SELECT 1 FROM memory_grant
-                                WHERE repository_id = projects.id AND revoked_at IS NULL)",
+               AND NOT EXISTS (SELECT 1 FROM auto_improve_rejections WHERE project_id = projects.id)",
             params![ai_memory_core::GLOBAL_SCOPE_PROJECT, cutoff],
         )?;
     }
@@ -4580,10 +4566,7 @@ pub fn clear_bootstrap_progress(conn: &Connection, fingerprint: &str) -> StoreRe
 ///    the on-disk files the caller must clean up after this function returns.
 /// 3. DELETE FROM projects WHERE id = ? — the ON DELETE CASCADE clauses in
 ///    V01 + V02 propagate the delete to pages, sessions, observations,
-///    handoffs, and page_embeddings automatically. Grants are the exception:
-///    they are checked before this step (refused while in force, revoked when
-///    `revoke_grants` is set) and their history rows survive it, because
-///    `memory_grant.repository_id` is `ON DELETE SET NULL` (V68).
+///    handoffs, and page_embeddings automatically.
 /// 4. Commit and return the [`PurgeSummary`].
 ///
 /// The `workspace_project_label` string is passed in by the caller (the
@@ -4594,16 +4577,10 @@ pub fn clear_bootstrap_progress(conn: &Connection, fingerprint: &str) -> StoreRe
 /// cascades out of `projects`, so purging a scope whose lease is still live
 /// would delete the lease row out from under a running agent.
 ///
-/// `revoke_grants` is the separate opt-in for the grant check. `force` does
-/// not imply it: passing one flag to get past a lease must not also, silently,
-/// take away somebody's access.
-///
 /// # Errors
 /// Returns [`StoreError::ManagedRunActive`] when a managed run's lease is
-/// still live and `force` is false, [`StoreError::ActiveGrants`] when grants
-/// are in force and `revoke_grants` is false, or [`StoreError`] if any SQL
-/// statement fails. The transaction is rolled back automatically on error.
-#[allow(clippy::too_many_arguments)] // each guard is a separate operator decision
+/// still live and `force` is false, or [`StoreError`] if any SQL statement
+/// fails. The transaction is rolled back automatically on error.
 pub fn purge_project(
     conn: &mut Connection,
     workspace_id: &WorkspaceId,
@@ -4611,7 +4588,6 @@ pub fn purge_project(
     workspace_project_label: &str,
     author_id: Option<ai_memory_core::UserId>,
     force: bool,
-    revoke_grants: bool,
     compaction: Compaction,
 ) -> StoreResult<PurgeSummary> {
     let tx = conn.transaction()?;
@@ -4662,18 +4638,6 @@ pub fn purge_project(
             workstreams: names.join(", "),
         });
     }
-    // Grants in force refuse the purge unless the operator asked for them to
-    // be revoked. Not `force`: that flag is about a running agent's lease, and
-    // somebody passing it to get past one guard must not silently get past
-    // this one too.
-    let grants_revoked = crate::auth::refuse_or_revoke(
-        &tx,
-        crate::auth::GrantScope::Project(*project_id),
-        workspace_project_label,
-        revoke_grants,
-        author_id,
-        now,
-    )?;
     let pages_deleted = count("SELECT COUNT(*) FROM pages WHERE project_id = ?1", &pid[..])?;
     let sessions_deleted = count(
         "SELECT COUNT(*) FROM sessions WHERE project_id = ?1",
@@ -4779,7 +4743,6 @@ pub fn purge_project(
         embeddings_deleted,
         workstreams_deleted,
         managed_runs_deleted,
-        grants_revoked,
         workstream_ids,
         compacted: compaction == Compaction::Reclaim,
     })
@@ -4796,9 +4759,6 @@ pub struct DeleteWorkspaceSummary {
     pub workstreams_deleted: u64,
     /// `managed_runs` rows removed via cascade.
     pub managed_runs_deleted: u64,
-    /// Grants revoked across the workspace's repositories because the
-    /// operator passed `--revoke-grants`.
-    pub grants_revoked: u64,
     /// Pre-delete identifiers for post-commit raw-segment cleanup.
     pub workstream_ids: Vec<String>,
     /// Whether the freed bytes were reclaimed (`VACUUM` ran). False for a
@@ -4813,21 +4773,13 @@ pub struct DeleteWorkspaceSummary {
 /// observations / handoffs / managed workstreams. The caller removes the
 /// on-disk workspace and raw workstream directories afterwards.
 ///
-/// Grants in force on any of its repositories refuse the delete unless
-/// `revoke_grants` is set, exactly as [`purge_project`] does for one: `force`
-/// gets past "this workspace is not empty", never past somebody's access.
-///
 /// # Errors
 /// [`StoreError::WorkspaceNotEmpty`] when it still holds projects and `force`
-/// is false; [`StoreError::ActiveGrants`] when grants are in force and
-/// `revoke_grants` is false; [`StoreError::NotFound`] when the workspace does
-/// not exist.
+/// is false; [`StoreError::NotFound`] when the workspace does not exist.
 pub fn delete_workspace(
     conn: &mut Connection,
     workspace_id: &WorkspaceId,
     force: bool,
-    revoke_grants: bool,
-    author_id: Option<ai_memory_core::UserId>,
     compaction: Compaction,
 ) -> StoreResult<DeleteWorkspaceSummary> {
     let tx = conn.transaction()?;
@@ -4843,22 +4795,6 @@ pub fn delete_workspace(
     if projects_deleted > 0 && !force {
         return Err(StoreError::WorkspaceNotEmpty(projects_deleted));
     }
-    let workspace_name: String = tx
-        .query_row(
-            "SELECT name FROM workspaces WHERE id = ?1",
-            rusqlite::params![&wid[..]],
-            |row| row.get(0),
-        )
-        .optional()?
-        .unwrap_or_default();
-    let grants_revoked = crate::auth::refuse_or_revoke(
-        &tx,
-        crate::auth::GrantScope::Workspace(*workspace_id),
-        &format!("workspace {workspace_name}"),
-        revoke_grants,
-        author_id,
-        Timestamp::now().as_microsecond(),
-    )?;
     let pages_deleted = count("SELECT COUNT(*) FROM pages WHERE workspace_id = ?1")?;
     let workstreams_deleted = count("SELECT COUNT(*) FROM workstreams WHERE workspace_id = ?1")?;
     let managed_runs_deleted = count(
@@ -4906,7 +4842,6 @@ pub fn delete_workspace(
         pages_deleted,
         workstreams_deleted,
         managed_runs_deleted,
-        grants_revoked,
         workstream_ids,
         compacted: compaction == Compaction::Reclaim,
     })
@@ -5032,6 +4967,13 @@ pub fn move_project_workspace(
         "UPDATE handoffs SET workspace_id = ?1 WHERE project_id = ?2",
         params![&to[..], &pid[..]],
     )? as u64;
+    // Grants carry the workspace in their key (#708). A grant left on the old
+    // workspace would point at a pair that no longer exists, and deleting that
+    // workspace would cascade it away from a project that still exists.
+    tx.execute(
+        "UPDATE project_grants SET workspace_id = ?1 WHERE project_id = ?2",
+        params![&to[..], &pid[..]],
+    )?;
     let audit_log_moved = tx.execute(
         "UPDATE audit_log SET workspace_id = ?1 WHERE project_id = ?2 AND workspace_id = ?3",
         params![&to[..], &pid[..], &from[..]],
@@ -5905,8 +5847,7 @@ pub(crate) mod tests {
         let prepared = open_managed_run(&mut conn, &ws, &proj);
 
         // Non-empty (holds the "scratch" project + a page) → refused w/o force.
-        let err =
-            delete_workspace(&mut conn, &ws, false, false, None, Compaction::Skip).unwrap_err();
+        let err = delete_workspace(&mut conn, &ws, false, Compaction::Skip).unwrap_err();
         assert!(
             matches!(err, StoreError::WorkspaceNotEmpty(n) if n >= 1),
             "expected WorkspaceNotEmpty, got {err:?}"
@@ -5921,8 +5862,7 @@ pub(crate) mod tests {
         assert_eq!(ws_still, 1, "refused delete must not touch the row");
 
         // Force cascades: project + page gone, workspace row gone.
-        let summary =
-            delete_workspace(&mut conn, &ws, true, false, None, Compaction::Skip).unwrap();
+        let summary = delete_workspace(&mut conn, &ws, true, Compaction::Skip).unwrap();
         assert!(
             summary.projects_deleted >= 1 && summary.pages_deleted >= 1,
             "{summary:?}"
@@ -5944,7 +5884,7 @@ pub(crate) mod tests {
 
         // Deleting again → NotFound.
         assert!(matches!(
-            delete_workspace(&mut conn, &ws, true, false, None, Compaction::Skip).unwrap_err(),
+            delete_workspace(&mut conn, &ws, true, Compaction::Skip).unwrap_err(),
             StoreError::NotFound(_)
         ));
     }
@@ -5953,8 +5893,7 @@ pub(crate) mod tests {
     fn delete_workspace_empty_succeeds_without_force() {
         let (_tmp, mut conn, _ws, _proj) = fresh_db();
         let empty = get_or_create_workspace(&mut conn, "orphan-ws").unwrap();
-        let summary =
-            delete_workspace(&mut conn, &empty, false, false, None, Compaction::Skip).unwrap();
+        let summary = delete_workspace(&mut conn, &empty, false, Compaction::Skip).unwrap();
         assert_eq!(summary.projects_deleted, 0);
         assert_eq!(summary.pages_deleted, 0);
         assert_eq!(summary.workstreams_deleted, 0);
@@ -6149,7 +6088,6 @@ pub(crate) mod tests {
             "default/scratch",
             None,
             false,
-            false,
             Compaction::Skip,
         )
         .unwrap();
@@ -6169,7 +6107,7 @@ pub(crate) mod tests {
     fn delete_workspace_tombstones_the_whole_workspace() {
         let (_tmp, mut conn, ws, proj) = fresh_db();
 
-        delete_workspace(&mut conn, &ws, true, false, None, Compaction::Skip).unwrap();
+        delete_workspace(&mut conn, &ws, true, Compaction::Skip).unwrap();
 
         // The whole-workspace tombstone covers every project id in that ws,
         // including ones whose rows are already gone via cascade.
@@ -6191,7 +6129,6 @@ pub(crate) mod tests {
             &proj,
             "default/scratch",
             None,
-            false,
             false,
             Compaction::Skip,
         )
@@ -6226,7 +6163,6 @@ pub(crate) mod tests {
             &proj,
             "default/scratch",
             None,
-            false,
             false,
             Compaction::Reclaim,
         )
@@ -6281,7 +6217,6 @@ pub(crate) mod tests {
             "default/scratch",
             None,
             true,
-            false,
             Compaction::Reclaim,
         )
         .unwrap();
@@ -6311,12 +6246,11 @@ pub(crate) mod tests {
 
         let skipped = {
             let other = get_or_create_workspace(&mut conn, "doomed").unwrap();
-            delete_workspace(&mut conn, &other, false, false, None, Compaction::Skip).unwrap()
+            delete_workspace(&mut conn, &other, false, Compaction::Skip).unwrap()
         };
         assert!(!skipped.compacted, "the default does not VACUUM");
 
-        let summary =
-            delete_workspace(&mut conn, &ws, true, false, None, Compaction::Reclaim).unwrap();
+        let summary = delete_workspace(&mut conn, &ws, true, Compaction::Reclaim).unwrap();
         assert!(summary.compacted, "the summary reports that VACUUM ran");
 
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
@@ -10905,7 +10839,6 @@ pub(crate) mod tests {
             "default/scratch",
             None,
             false,
-            false,
             Compaction::Skip,
         )
         .expect("purge of fresh project should succeed");
@@ -10971,7 +10904,6 @@ pub(crate) mod tests {
             "default/scratch",
             Some(author),
             false,
-            false,
             Compaction::Skip,
         )
         .expect("purge should succeed");
@@ -11027,7 +10959,6 @@ pub(crate) mod tests {
             "default/scratch",
             None,
             false,
-            false,
             Compaction::Skip,
         )
         .expect_err("an active managed run must block the purge");
@@ -11069,7 +11000,6 @@ pub(crate) mod tests {
             "default/scratch",
             None,
             true,
-            false,
             Compaction::Skip,
         )
         .expect("force purges regardless of the live lease");
@@ -11105,7 +11035,6 @@ pub(crate) mod tests {
             &proj,
             "default/scratch",
             None,
-            false,
             false,
             Compaction::Skip,
         )

@@ -92,7 +92,6 @@ id_newtype!(pub ApiCredentialId, "Identifier for one native `aim_` API credentia
 id_newtype!(pub AutoImproveRunId, "Identifier for one auto-improvement review run.");
 id_newtype!(pub AutoImproveProposalId, "Identifier for one staged auto-improvement proposal.");
 id_newtype!(pub PageFeedbackId, "Identifier for one page-feedback signal (`memory_feedback`).");
-id_newtype!(pub MemoryGrantId, "Identifier for one user's access to one repository's memory.");
 
 /// Relative path of a page within the wiki tree.
 ///

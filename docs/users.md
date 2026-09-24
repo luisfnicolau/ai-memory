@@ -702,8 +702,11 @@ ones who should keep access; nothing is granted automatically.
 - **Grants** are `read` or `write`, per project; `write` includes `read`.
   There is no per-project administrator: granting, revoking and restricting
   are the root operator's, like every other administrative act.
-  `ai-memory grant list | add | revoke` manages them; revocation is recorded,
-  never deleted.
+  `ai-memory grant list | add | revoke` manages them. A user holds one level
+  per project; revoking deletes the grant, and purging a project or deleting
+  its workspace takes its grants with it. Every grant, level change and revoke
+  is recorded in the audit log (`grant_access` / `revoke_access`, with who did
+  it), so "who could reach this, and since when" stays answerable.
 - **Whoever creates a project** is granted `write` on it, so a creator keeps
   their project if it is later restricted.
 - **New projects** are `open` unless `[auth] new_projects_restricted = true`

@@ -39,7 +39,7 @@ pub mod error;
 pub mod grant;
 
 pub use error::{AuthenticationFailure, NotGranted};
-pub use grant::{GrantRole, MemoryGrant};
+pub use grant::{GrantLevel, ProjectGrant};
 
 /// How a repository admits users (#708).
 ///
@@ -86,10 +86,10 @@ impl AccessMode {
 #[must_use]
 pub fn decide_with_mode(
     mode: AccessMode,
-    grants: &[MemoryGrant],
+    grants: &[ProjectGrant],
     user: UserId,
     repository: ProjectId,
-    required: GrantRole,
+    required: GrantLevel,
 ) -> Access {
     match mode {
         AccessMode::Open => Access::Granted,
@@ -114,22 +114,18 @@ pub enum Access {
 /// Why access was refused.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Denial {
-    /// This user was never granted this repository.
+    /// This user holds no grant on this project.
     NeverGranted { repository: ProjectId },
-    /// A grant existed and was revoked. Worth distinguishing: "you never had
-    /// this" and "this was taken from you" send a person to different places,
-    /// and only one of them is a surprise worth escalating.
-    Revoked { repository: ProjectId },
-    /// An active grant exists but does not reach the level this operation
-    /// needs — a reader attempting a write.
+    /// A grant exists but does not reach the level this operation needs — a
+    /// read grant attempting a write.
     ///
     /// Carries both levels because the useful message names them: "you have
-    /// read on this repository and this needs write" tells someone exactly
-    /// what to ask for, where "denied" starts a conversation.
-    InsufficientRole {
+    /// read on this project and this needs write" tells someone exactly what
+    /// to ask for, where "denied" starts a conversation.
+    InsufficientLevel {
         repository: ProjectId,
-        held: GrantRole,
-        required: GrantRole,
+        held: GrantLevel,
+        required: GrantLevel,
     },
 }
 
@@ -154,41 +150,31 @@ impl Access {
 /// grants and has no way to widen that, which is the point.
 #[must_use]
 pub fn decide(
-    grants: &[MemoryGrant],
+    grants: &[ProjectGrant],
     user: UserId,
     repository: ProjectId,
-    required: GrantRole,
+    required: GrantLevel,
 ) -> Access {
-    let mut saw_revoked = false;
-    let mut best_held: Option<GrantRole> = None;
-
-    for grant in grants {
-        if grant.user_id != user || grant.repository_id != repository {
-            continue;
-        }
-        if !grant.is_active() {
-            saw_revoked = true;
-            continue;
-        }
-        // The strongest active grant wins. A unique index keeps this to one
-        // row in practice, but the decision must not depend on that: reading
-        // the maximum means a duplicate can only ever be redundant, never a
-        // silent downgrade that depends on row order.
-        best_held = Some(best_held.map_or(grant.role, |held: GrantRole| held.max(grant.role)));
-    }
-
-    match best_held {
+    // The strongest grant wins. The primary key keeps this to one row per
+    // user and project, but the decision must not depend on that: reading the
+    // maximum means a duplicate can only ever be redundant, never a silent
+    // downgrade that depends on row order.
+    let held = grants
+        .iter()
+        .filter(|grant| grant.user_id == user && grant.project_id == repository)
+        .map(|grant| grant.level)
+        .max();
+    match held {
         Some(held) if held.covers(required) => Access::Granted,
         // Held something, but not enough. Deliberately its own answer: "you
         // cannot write here" and "you cannot see this at all" send a person to
         // different places, and telling a reader their memory is empty when it
         // is merely read-only is the kind of lie this design exists to avoid.
-        Some(held) => Access::Denied(Denial::InsufficientRole {
+        Some(held) => Access::Denied(Denial::InsufficientLevel {
             repository,
             held,
             required,
         }),
-        None if saw_revoked => Access::Denied(Denial::Revoked { repository }),
         None => Access::Denied(Denial::NeverGranted { repository }),
     }
 }
@@ -196,56 +182,43 @@ pub fn decide(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ai_memory_core::WorkspaceId;
     use jiff::Timestamp;
 
-    fn grant(user: UserId, repository: ProjectId, revoked: bool) -> MemoryGrant {
-        grant_as(user, repository, revoked, GrantRole::Write)
-    }
-
-    fn grant_as(
-        user: UserId,
-        repository: ProjectId,
-        revoked: bool,
-        role: GrantRole,
-    ) -> MemoryGrant {
-        MemoryGrant {
-            id: ai_memory_core::ids::MemoryGrantId::new(),
+    fn grant_as(user: UserId, repository: ProjectId, level: GrantLevel) -> ProjectGrant {
+        ProjectGrant {
+            workspace_id: WorkspaceId::new(),
+            project_id: repository,
             user_id: user,
-            repository_id: repository,
-            role,
-            granted_by_user_id: Some(user),
+            level,
+            granted_by: Some(user),
             granted_at: Timestamp::UNIX_EPOCH,
-            revoked_at: revoked.then_some(Timestamp::UNIX_EPOCH),
-            revoked_by_user_id: None,
         }
     }
 
     /// The ordering is the whole mechanism, so it is asserted directly rather
     /// than left implicit in the derive.
     #[test]
-    fn a_stronger_role_covers_a_weaker_requirement() {
-        assert!(GrantRole::Write.covers(GrantRole::Read));
-        assert!(GrantRole::Write.covers(GrantRole::Write));
-        assert!(GrantRole::Read.covers(GrantRole::Read));
-
-        assert!(!GrantRole::Read.covers(GrantRole::Write));
+    fn a_stronger_level_covers_a_weaker_requirement() {
+        assert!(GrantLevel::Write.covers(GrantLevel::Read));
+        assert!(GrantLevel::Write.covers(GrantLevel::Write));
+        assert!(GrantLevel::Read.covers(GrantLevel::Read));
+        assert!(!GrantLevel::Read.covers(GrantLevel::Write));
     }
 
-    /// A reader attempting a write is refused, and the refusal names both
-    /// levels — "you have read and this needs write" tells someone what to
-    /// ask for, where a bare denial starts a conversation.
+    /// A read grant attempting a write is refused, and the refusal names both
+    /// levels.
     #[test]
-    fn a_reader_cannot_write_and_is_told_why() {
+    fn a_read_grant_cannot_write_and_is_told_why() {
         let (u, r) = (UserId::new(), ProjectId::new());
-        let grants = vec![grant_as(u, r, false, GrantRole::Read)];
-
-        assert_eq!(decide(&grants, u, r, GrantRole::Read), Access::Granted);
+        let grants = vec![grant_as(u, r, GrantLevel::Read)];
+        assert_eq!(decide(&grants, u, r, GrantLevel::Read), Access::Granted);
         assert_eq!(
-            decide(&grants, u, r, GrantRole::Write),
-            Access::Denied(Denial::InsufficientRole {
+            decide(&grants, u, r, GrantLevel::Write),
+            Access::Denied(Denial::InsufficientLevel {
                 repository: r,
-                held: GrantRole::Read,
-                required: GrantRole::Write,
+                held: GrantLevel::Read,
+                required: GrantLevel::Write,
             })
         );
     }
@@ -256,156 +229,84 @@ mod tests {
     #[test]
     fn insufficient_is_not_the_same_as_never_granted() {
         let (u, other, r) = (UserId::new(), UserId::new(), ProjectId::new());
-        let grants = vec![grant_as(u, r, false, GrantRole::Read)];
-
-        let insufficient = decide(&grants, u, r, GrantRole::Write);
-        let absent = decide(&grants, other, r, GrantRole::Read);
-
+        let grants = vec![grant_as(u, r, GrantLevel::Read)];
+        let insufficient = decide(&grants, u, r, GrantLevel::Write);
+        let absent = decide(&grants, other, r, GrantLevel::Read);
         assert!(matches!(
             insufficient,
-            Access::Denied(Denial::InsufficientRole { .. })
+            Access::Denied(Denial::InsufficientLevel { .. })
         ));
-        assert!(matches!(
+        assert_eq!(
             absent,
-            Access::Denied(Denial::NeverGranted { .. })
-        ));
-        assert_ne!(insufficient, absent);
+            Access::Denied(Denial::NeverGranted { repository: r })
+        );
     }
 
     /// The decision must not depend on row order. A duplicate grant can only
     /// ever be redundant, never a silent downgrade.
     #[test]
-    fn the_strongest_active_grant_wins_whatever_the_order() {
+    fn the_strongest_grant_wins_whatever_the_order() {
         let (u, r) = (UserId::new(), ProjectId::new());
-        let weak_first = vec![
-            grant_as(u, r, false, GrantRole::Read),
-            grant_as(u, r, false, GrantRole::Write),
-        ];
-        let strong_first = vec![
-            grant_as(u, r, false, GrantRole::Write),
-            grant_as(u, r, false, GrantRole::Read),
-        ];
-
-        assert_eq!(decide(&weak_first, u, r, GrantRole::Write), Access::Granted);
-        assert_eq!(
-            decide(&strong_first, u, r, GrantRole::Write),
-            Access::Granted
-        );
+        for grants in [
+            vec![
+                grant_as(u, r, GrantLevel::Read),
+                grant_as(u, r, GrantLevel::Write),
+            ],
+            vec![
+                grant_as(u, r, GrantLevel::Write),
+                grant_as(u, r, GrantLevel::Read),
+            ],
+        ] {
+            assert_eq!(decide(&grants, u, r, GrantLevel::Write), Access::Granted);
+        }
     }
 
-    /// A revoked write grant does not keep conferring write, and a revoked
-    /// grant beside an active weaker one must not resurrect the stronger.
+    /// A grant belongs to one user on one project and reaches nothing else.
     #[test]
-    fn revoking_the_stronger_grant_leaves_only_the_weaker() {
-        let (u, r) = (UserId::new(), ProjectId::new());
-        let grants = vec![
-            grant_as(u, r, true, GrantRole::Write),
-            grant_as(u, r, false, GrantRole::Read),
-        ];
-
-        assert_eq!(decide(&grants, u, r, GrantRole::Read), Access::Granted);
-        assert!(matches!(
-            decide(&grants, u, r, GrantRole::Write),
-            Access::Denied(Denial::InsufficientRole { .. })
-        ));
+    fn a_grant_reaches_neither_another_user_nor_another_project() {
+        let (u, other_user, r, other_project) = (
+            UserId::new(),
+            UserId::new(),
+            ProjectId::new(),
+            ProjectId::new(),
+        );
+        let grants = vec![grant_as(u, r, GrantLevel::Write)];
+        assert!(decide(&grants, u, r, GrantLevel::Write).is_granted());
+        assert!(!decide(&grants, other_user, r, GrantLevel::Read).is_granted());
+        assert!(!decide(&grants, u, other_project, GrantLevel::Read).is_granted());
     }
 
     /// Round-trips through the stored form, and refuses what it does not know
-    /// rather than defaulting — a role this build cannot read must not silently
-    /// become the weakest one, which would lock a team out of its own project.
+    /// rather than defaulting.
     #[test]
-    fn roles_round_trip_and_unknown_values_are_refused() {
-        for role in [GrantRole::Read, GrantRole::Write] {
-            assert_eq!(GrantRole::parse(role.as_str()), Ok(role));
+    fn levels_round_trip_and_unknown_values_are_refused() {
+        for level in [GrantLevel::Read, GrantLevel::Write] {
+            assert_eq!(GrantLevel::parse(level.as_str()), Ok(level));
         }
-        assert!(GrantRole::parse("owner").is_err());
-        assert!(GrantRole::parse("").is_err());
+        assert!(GrantLevel::parse("owner").is_err());
+        assert!(GrantLevel::parse("").is_err());
         assert!(
-            GrantRole::parse("admin").is_err(),
+            GrantLevel::parse("admin").is_err(),
             "there is no per-project admin; administration is root's"
         );
         assert!(
-            GrantRole::parse("Write").is_err(),
+            GrantLevel::parse("Write").is_err(),
             "the stored form is lowercase"
         );
     }
 
+    /// An open project admits everyone at every level; a restricted one asks
+    /// the grants.
     #[test]
-    fn an_active_grant_allows() {
+    fn the_mode_decides_before_the_grants() {
         let (u, r) = (UserId::new(), ProjectId::new());
-        assert_eq!(
-            decide(&[grant(u, r, false)], u, r, GrantRole::Read),
-            Access::Granted
+        assert!(decide_with_mode(AccessMode::Open, &[], u, r, GrantLevel::Write).is_granted());
+        assert!(
+            !decide_with_mode(AccessMode::Restricted, &[], u, r, GrantLevel::Read).is_granted()
         );
-    }
-
-    #[test]
-    fn no_grant_at_all_is_never_granted() {
-        let (u, r) = (UserId::new(), ProjectId::new());
-        assert_eq!(
-            decide(&[], u, r, GrantRole::Read),
-            Access::Denied(Denial::NeverGranted { repository: r })
-        );
-    }
-
-    /// "You never had this" and "this was taken from you" send a person to
-    /// different places. Only one of them is worth escalating.
-    #[test]
-    fn a_revoked_grant_is_reported_as_revoked() {
-        let (u, r) = (UserId::new(), ProjectId::new());
-        assert_eq!(
-            decide(&[grant(u, r, true)], u, r, GrantRole::Read),
-            Access::Denied(Denial::Revoked { repository: r })
-        );
-    }
-
-    /// Revoking and re-granting is ordinary. The active row must win whatever
-    /// order the store returns them in.
-    #[test]
-    fn an_active_grant_wins_over_an_older_revoked_one() {
-        let (u, r) = (UserId::new(), ProjectId::new());
-        let revoked_first = vec![grant(u, r, true), grant(u, r, false)];
-        let active_first = vec![grant(u, r, false), grant(u, r, true)];
-        assert_eq!(
-            decide(&revoked_first, u, r, GrantRole::Read),
-            Access::Granted
-        );
-        assert_eq!(
-            decide(&active_first, u, r, GrantRole::Read),
-            Access::Granted
-        );
-    }
-
-    /// The isolation this whole crate exists for: one person's grant must not
-    /// answer for another's, nor one repository's for another's.
-    #[test]
-    fn a_grant_reaches_neither_another_user_nor_another_repository() {
-        let (ana, bruno) = (UserId::new(), UserId::new());
-        let (api, web) = (ProjectId::new(), ProjectId::new());
-        let grants = vec![grant(ana, api, false)];
-
-        assert_eq!(decide(&grants, ana, api, GrantRole::Read), Access::Granted);
-        assert_eq!(
-            decide(&grants, bruno, api, GrantRole::Read),
-            Access::Denied(Denial::NeverGranted { repository: api })
-        );
-        assert_eq!(
-            decide(&grants, ana, web, GrantRole::Read),
-            Access::Denied(Denial::NeverGranted { repository: web })
-        );
-    }
-
-    /// Grants are decided per user, so a set containing someone else's revoked
-    /// grant must not colour this user's answer.
-    #[test]
-    fn another_users_revocation_does_not_leak_into_this_decision() {
-        let (ana, bruno) = (UserId::new(), UserId::new());
-        let api = ProjectId::new();
-        let grants = vec![grant(bruno, api, true)];
-        assert_eq!(
-            decide(&grants, ana, api, GrantRole::Read),
-            Access::Denied(Denial::NeverGranted { repository: api }),
-            "Ana never had it; Bruno losing it says nothing about her"
+        let grants = vec![grant_as(u, r, GrantLevel::Read)];
+        assert!(
+            decide_with_mode(AccessMode::Restricted, &grants, u, r, GrantLevel::Read).is_granted()
         );
     }
 }

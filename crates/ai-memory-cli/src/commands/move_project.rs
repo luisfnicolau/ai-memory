@@ -16,7 +16,6 @@ struct MoveProjectRequest {
     confirm: bool,
     force: bool,
     on_conflict: String,
-    revoke_grants: bool,
 }
 
 /// Run the `move-project` subcommand.
@@ -66,7 +65,6 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
             confirm: true,
             force: args.force,
             on_conflict: args.on_conflict.clone(),
-            revoke_grants: args.revoke_grants,
         },
     )
     .await?;

@@ -10,7 +10,7 @@
 
 use ai_memory_core::repository_identity::{IdentitySource, RepositoryIdentity};
 use ai_memory_core::{NewUser, ProjectId, UserId, WorkspaceId};
-use ai_memory_store::{GrantRole, IdentityResolution, Store};
+use ai_memory_store::{GrantLevel, IdentityResolution, Store};
 
 fn remote(identity: &str) -> RepositoryIdentity {
     RepositoryIdentity {
@@ -179,7 +179,7 @@ async fn an_outsider_cannot_take_an_unclaimed_projects_identity() {
     let outsider = user(&store, "outsider", 2).await;
     store
         .writer
-        .grant_memory(member, team_project, GrantRole::Write, None)
+        .grant_memory(member, team_project, GrantLevel::Write, None)
         .await
         .unwrap();
 
@@ -244,8 +244,8 @@ async fn a_created_or_split_project_is_granted_to_its_creator() {
     for (who, id) in [(alice, a), (bob, b)] {
         let grants = store.reader.grants_for(who, id).await.unwrap();
         assert_eq!(grants.len(), 1, "{grants:?}");
-        assert_eq!(grants[0].role, GrantRole::Write);
-        assert_eq!(grants[0].granted_by_user_id, Some(who));
+        assert_eq!(grants[0].level, GrantLevel::Write);
+        assert_eq!(grants[0].granted_by, Some(who));
     }
     assert!(store.reader.grants_for(bob, a).await.unwrap().is_empty());
     assert!(store.reader.grants_for(alice, b).await.unwrap().is_empty());

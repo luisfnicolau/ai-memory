@@ -1842,7 +1842,7 @@ impl AiMemoryServer {
         viewer: Option<ai_memory_core::UserId>,
     ) -> Result<(WorkspaceId, ProjectId), McpError> {
         self.scope_resolver_as(viewer)
-            .resolve_current_or_project(explicit_project, actor, ai_memory_auth::GrantRole::Read)
+            .resolve_current_or_project(explicit_project, actor, ai_memory_auth::GrantLevel::Read)
             .await
             .map(ai_memory_store::ResolvedScope::as_tuple)
             .map_err(Self::scope_error)
@@ -1868,7 +1868,7 @@ impl AiMemoryServer {
             explicit_project,
             actor,
             viewer,
-            ai_memory_auth::GrantRole::Read,
+            ai_memory_auth::GrantLevel::Read,
         )
         .await
     }
@@ -1896,7 +1896,7 @@ impl AiMemoryServer {
             explicit_project,
             actor,
             viewer,
-            ai_memory_auth::GrantRole::Write,
+            ai_memory_auth::GrantLevel::Write,
         )
         .await
     }
@@ -1907,7 +1907,7 @@ impl AiMemoryServer {
         explicit_project: Option<&str>,
         actor: &ai_memory_core::ActorKey,
         viewer: Option<ai_memory_core::UserId>,
-        required: ai_memory_auth::GrantRole,
+        required: ai_memory_auth::GrantLevel,
     ) -> Result<(WorkspaceId, ProjectId), McpError> {
         self.scope_resolver_as(viewer)
             .resolve_existing_args(explicit_workspace, explicit_project, actor, required)
@@ -1933,7 +1933,7 @@ impl AiMemoryServer {
                 explicit_workspace,
                 explicit_project,
                 actor,
-                ai_memory_auth::GrantRole::Read,
+                ai_memory_auth::GrantLevel::Read,
             )
             .await
             .map_err(Self::scope_error)?;
@@ -3305,7 +3305,7 @@ impl AiMemoryServer {
                     project_id,
                 },
                 Some(viewer),
-                ai_memory_auth::GrantRole::Write,
+                ai_memory_auth::GrantLevel::Write,
                 &label,
             )
             .await
@@ -11064,8 +11064,8 @@ mod tests {
         assert_eq!(author.email.as_deref(), Some("alice@example.com"));
     }
 
-    /// Insert a grant row directly — the store has no grant write path yet.
-    /// Grant `role` on `repository`, by writing the row directly.
+    /// Grant `role` on `repository` by writing the row directly, so these
+    /// tests exercise the decision without depending on the grant API.
     fn grant_role(
         db: &std::path::Path,
         user: ai_memory_core::UserId,
@@ -11074,38 +11074,20 @@ mod tests {
     ) {
         let conn = rusqlite::Connection::open(db).unwrap();
         conn.execute(
-            "INSERT INTO memory_grant \
-             (id, user_id, repository_id, repository_label, role, granted_by_user_id, \
-              granted_at) \
-             VALUES (?1, ?2, ?3, 'fixture', ?4, ?2, 1)",
+            "INSERT INTO project_grants \
+             (workspace_id, project_id, user_id, level, granted_by, granted_at) \
+             SELECT workspace_id, ?1, ?2, ?3, ?2, 1 FROM projects WHERE id = ?1",
             rusqlite::params![
-                ai_memory_core::ids::MemoryGrantId::new()
-                    .as_bytes()
-                    .to_vec(),
-                user.as_bytes().to_vec(),
                 repository.as_bytes().to_vec(),
-                role,
+                user.as_bytes().to_vec(),
+                role
             ],
         )
         .unwrap();
     }
 
     fn grant_writer(db: &std::path::Path, user: ai_memory_core::UserId, repository: ProjectId) {
-        let conn = rusqlite::Connection::open(db).unwrap();
-        conn.execute(
-            "INSERT INTO memory_grant \
-             (id, user_id, repository_id, repository_label, role, granted_by_user_id, \
-              granted_at) \
-             VALUES (?1, ?2, ?3, 'fixture', 'write', ?2, 1)",
-            rusqlite::params![
-                ai_memory_core::ids::MemoryGrantId::new()
-                    .as_bytes()
-                    .to_vec(),
-                user.as_bytes().to_vec(),
-                repository.as_bytes().to_vec(),
-            ],
-        )
-        .unwrap();
+        grant_role(db, user, repository, "write");
     }
 
     /// A reader-only grant must not be able to change anything.
@@ -13697,12 +13679,12 @@ mod tests {
         // have a page written into it on his behalf.
         store
             .writer
-            .grant_memory(alice, alices, ai_memory_auth::GrantRole::Write, None)
+            .grant_memory(alice, alices, ai_memory_auth::GrantLevel::Write, None)
             .await
             .unwrap();
         store
             .writer
-            .grant_memory(bob, alices, ai_memory_auth::GrantRole::Read, None)
+            .grant_memory(bob, alices, ai_memory_auth::GrantLevel::Read, None)
             .await
             .unwrap();
 

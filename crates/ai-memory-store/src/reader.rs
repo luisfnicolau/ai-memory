@@ -83,9 +83,8 @@ fn now_us() -> i64 {
 /// authorization existed — which is what an install with no database users and
 /// the root operator both need.
 ///
-/// "May read" is an open repository, or a restricted one with any active
-/// grant. `read` is the lowest level, so every grant covers it — the same answer `ai_memory_auth::decide` gives for
-/// `GrantRole::Read`, and a test pins the two together. The global
+/// "May read" is an open repository, or a restricted one with any grant. `read` is the lowest level, so every grant covers it — the same answer `ai_memory_auth::decide` gives for
+/// `GrantLevel::Read`, and a test pins the two together. The global
 /// preferences scope is always readable: it is shared by construction (see
 /// `lookup_global_scope`).
 ///
@@ -171,8 +170,8 @@ fn readable_repository_sql(
     format!(
         " AND ({project_column} IN (SELECT op.id FROM projects op \
                                     WHERE op.access_mode = 'open') \
-               OR {project_column} IN (SELECT mg.repository_id FROM memory_grant mg \
-                                    WHERE mg.user_id = {user} AND mg.revoked_at IS NULL) \
+               OR {project_column} IN (SELECT pg.project_id FROM project_grants pg \
+                                    WHERE pg.user_id = {user}) \
                OR {project_column} IN (SELECT gp.id FROM projects gp \
                                        JOIN workspaces gw ON gw.id = gp.workspace_id \
                                        WHERE gw.name = {workspace} AND gp.name = {project}))"
@@ -1769,7 +1768,7 @@ impl ReaderPool {
         &self,
         user_id: ai_memory_core::UserId,
         repository_id: ProjectId,
-    ) -> StoreResult<Vec<ai_memory_auth::MemoryGrant>> {
+    ) -> StoreResult<Vec<ai_memory_auth::ProjectGrant>> {
         self.with_conn(move |conn| crate::auth::grants_for(conn, user_id, repository_id))
             .await
     }
@@ -1783,7 +1782,7 @@ impl ReaderPool {
         &self,
         user: ai_memory_core::UserId,
         repository_id: ProjectId,
-        required: ai_memory_auth::GrantRole,
+        required: ai_memory_auth::GrantLevel,
     ) -> StoreResult<ai_memory_auth::Access> {
         self.with_conn(move |conn| crate::auth::access(conn, user, repository_id, required))
             .await
@@ -1802,25 +1801,12 @@ impl ReaderPool {
             .await
     }
 
-    /// Every active grant on the server, resolved to names for display.
+    /// Every grant on the server, resolved to names for display.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
-    pub async fn list_active_grants(&self) -> StoreResult<Vec<crate::auth::GrantListing>> {
-        self.with_conn(crate::auth::list_active_grants).await
-    }
-
-    /// Grants in force under `scope`, phrased for an operator — see
-    /// [`crate::auth::active_grants_under`].
-    ///
-    /// # Errors
-    /// Propagates any SQL or pool error.
-    pub async fn active_grants_under(
-        &self,
-        scope: crate::auth::GrantScope,
-    ) -> StoreResult<Vec<String>> {
-        self.with_conn(move |conn| crate::auth::active_grants_under(conn, scope))
-            .await
+    pub async fn list_grants(&self) -> StoreResult<Vec<crate::auth::GrantListing>> {
+        self.with_conn(crate::auth::list_grants).await
     }
 
     /// Run a synchronous closure against a pooled read-only connection.

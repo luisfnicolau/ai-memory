@@ -1,8 +1,8 @@
 -- V69: per-project access mode (#708).
 --
 -- `open` is what every project was before this existed: any authenticated
--- user reaches it. `restricted` admits only holders of a `memory_grant` and
--- the root operator. Every existing project, and every new one unless the
+-- user reaches it. `restricted` admits only holders of a grant
+-- (`project_grants`, V68) and the root operator. Every existing project, and every new one unless the
 -- operator sets `[auth] new_projects_restricted`, is `open`, so an upgrade
 -- changes nobody's access until an operator restricts a project on purpose.
 --

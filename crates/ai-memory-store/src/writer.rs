@@ -392,8 +392,6 @@ pub(crate) enum WriteCmd {
         author_id: Option<ai_memory_core::UserId>,
         /// Purge even when a managed workstream still holds a live run lease.
         force: bool,
-        /// Revoke grants in force instead of refusing the purge.
-        revoke_grants: bool,
         /// Whether to reclaim the freed bytes afterwards (`VACUUM`).
         compaction: crate::ops::Compaction,
         reply: oneshot::Sender<StoreResult<PurgeSummary>>,
@@ -420,10 +418,6 @@ pub(crate) enum WriteCmd {
     DeleteWorkspace {
         workspace_id: WorkspaceId,
         force: bool,
-        /// Revoke grants in force instead of refusing the delete.
-        revoke_grants: bool,
-        /// Operator recorded as the revoker when `revoke_grants` acts.
-        author_id: Option<ai_memory_core::UserId>,
         /// Whether to reclaim the freed bytes afterwards (`VACUUM`).
         compaction: crate::ops::Compaction,
         reply: oneshot::Sender<StoreResult<DeleteWorkspaceSummary>>,
@@ -512,7 +506,7 @@ pub(crate) enum WriteCmd {
     GrantMemory {
         user_id: UserId,
         repository_id: ProjectId,
-        role: ai_memory_auth::GrantRole,
+        role: ai_memory_auth::GrantLevel,
         granted_by: Option<UserId>,
         reply: oneshot::Sender<StoreResult<crate::auth::GrantOutcome>>,
     },
@@ -1790,11 +1784,8 @@ impl WriterHandle {
     /// the distinct page paths that the caller must remove from disk.
     ///
     /// # Errors
-    /// Returns [`StoreError::WriterClosed`] if the actor has shut down,
-    /// [`StoreError::ActiveGrants`] when grants are in force and
-    /// `revoke_grants` is false, or propagates the SQL error from the purge
-    /// transaction.
-    #[allow(clippy::too_many_arguments)] // each guard is a separate operator decision
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error from the purge transaction.
     pub async fn purge_project(
         &self,
         workspace_id: WorkspaceId,
@@ -1802,7 +1793,6 @@ impl WriterHandle {
         label: impl Into<String>,
         author_id: Option<ai_memory_core::UserId>,
         force: bool,
-        revoke_grants: bool,
         compaction: crate::ops::Compaction,
     ) -> StoreResult<PurgeSummary> {
         let (tx, rx) = oneshot::channel();
@@ -1812,7 +1802,6 @@ impl WriterHandle {
             label: label.into(),
             author_id,
             force,
-            revoke_grants,
             compaction,
             reply: tx,
         })
@@ -1862,24 +1851,18 @@ impl WriterHandle {
     ///
     /// # Errors
     /// [`StoreError::WorkspaceNotEmpty`] when it still holds projects and
-    /// `force` is false; [`StoreError::ActiveGrants`] when grants are in force
-    /// and `revoke_grants` is false; [`StoreError::NotFound`] when the
-    /// workspace is absent; [`StoreError::WriterClosed`] if the actor has shut
-    /// down.
+    /// `force` is false; [`StoreError::NotFound`] when the workspace is absent;
+    /// [`StoreError::WriterClosed`] if the actor has shut down.
     pub async fn delete_workspace(
         &self,
         workspace_id: WorkspaceId,
         force: bool,
-        revoke_grants: bool,
-        author_id: Option<ai_memory_core::UserId>,
         compaction: crate::ops::Compaction,
     ) -> StoreResult<DeleteWorkspaceSummary> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::DeleteWorkspace {
             workspace_id,
             force,
-            revoke_grants,
-            author_id,
             compaction,
             reply: tx,
         })
@@ -2249,7 +2232,7 @@ impl WriterHandle {
         &self,
         user_id: UserId,
         repository_id: ProjectId,
-        role: ai_memory_auth::GrantRole,
+        role: ai_memory_auth::GrantLevel,
         granted_by: Option<UserId>,
     ) -> StoreResult<crate::auth::GrantOutcome> {
         let (tx, rx) = oneshot::channel();
@@ -3439,7 +3422,6 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 label,
                 author_id,
                 force,
-                revoke_grants,
                 compaction,
                 reply,
             } => {
@@ -3450,7 +3432,6 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     &label,
                     author_id,
                     force,
-                    revoke_grants,
                     compaction,
                 );
                 send_or_warn(reply, result, "purge_project");
@@ -3480,19 +3461,10 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::DeleteWorkspace {
                 workspace_id,
                 force,
-                revoke_grants,
-                author_id,
                 compaction,
                 reply,
             } => {
-                let result = ops::delete_workspace(
-                    &mut conn,
-                    &workspace_id,
-                    force,
-                    revoke_grants,
-                    author_id,
-                    compaction,
-                );
+                let result = ops::delete_workspace(&mut conn, &workspace_id, force, compaction);
                 send_or_warn(reply, result, "delete_workspace");
             }
             WriteCmd::RenameWorkspace {

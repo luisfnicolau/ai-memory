@@ -124,7 +124,7 @@ async fn authorize_run(
     state: &WorkstreamState,
     run_id: ManagedRunId,
     viewer: Option<ai_memory_core::UserId>,
-    required: ai_memory_auth::GrantRole,
+    required: ai_memory_auth::GrantLevel,
 ) -> Result<(), Response> {
     if viewer.is_none() {
         return Ok(());
@@ -240,7 +240,7 @@ async fn prepare_run(
         request.workspace.trim(),
         request.project.trim(),
         actor_user(actor),
-        ai_memory_auth::GrantRole::Write,
+        ai_memory_auth::GrantLevel::Write,
     )
     .await
     {
@@ -310,7 +310,7 @@ async fn run_status(
         &state,
         run_id,
         actor_user(actor),
-        ai_memory_auth::GrantRole::Read,
+        ai_memory_auth::GrantLevel::Read,
     )
     .await
     {
@@ -348,7 +348,7 @@ async fn heartbeat_run(
         &state,
         run_id,
         actor_user(actor),
-        ai_memory_auth::GrantRole::Write,
+        ai_memory_auth::GrantLevel::Write,
     )
     .await
     {
@@ -378,7 +378,7 @@ async fn cancel_run(
         &state,
         run_id,
         actor_user(actor),
-        ai_memory_auth::GrantRole::Write,
+        ai_memory_auth::GrantLevel::Write,
     )
     .await
     {
@@ -407,7 +407,7 @@ async fn run_context(
         &state,
         run_id,
         actor_user(actor),
-        ai_memory_auth::GrantRole::Write,
+        ai_memory_auth::GrantLevel::Write,
     )
     .await
     {
@@ -453,7 +453,7 @@ async fn accept_run_context(
         &state,
         run_id,
         actor_user(actor),
-        ai_memory_auth::GrantRole::Write,
+        ai_memory_auth::GrantLevel::Write,
     )
     .await
     {
@@ -519,7 +519,7 @@ async fn list_recent_workstreams(
         request.workspace.trim(),
         request.project.trim(),
         actor_user(actor),
-        ai_memory_auth::GrantRole::Read,
+        ai_memory_auth::GrantLevel::Read,
     )
     .await
     {
@@ -637,7 +637,7 @@ async fn rename_workstream(
         request.workspace.trim(),
         request.project.trim(),
         actor_user(actor),
-        ai_memory_auth::GrantRole::Write,
+        ai_memory_auth::GrantLevel::Write,
     )
     .await
     {
@@ -703,7 +703,7 @@ async fn search_events(
             &state.reader,
             scope,
             Some(viewer),
-            ai_memory_auth::GrantRole::Read,
+            ai_memory_auth::GrantLevel::Read,
         )
         .await
         {
@@ -738,7 +738,7 @@ async fn link_run(
         &state,
         run_id,
         actor_user(actor),
-        ai_memory_auth::GrantRole::Write,
+        ai_memory_auth::GrantLevel::Write,
     )
     .await
     {
@@ -786,7 +786,7 @@ async fn finish_run(
         &state,
         run_id,
         actor_user(actor),
-        ai_memory_auth::GrantRole::Write,
+        ai_memory_auth::GrantLevel::Write,
     )
     .await
     {
@@ -2003,13 +2003,13 @@ mod tests {
         let carol = human("carol").await;
         store
             .writer
-            .grant_memory(alice, repository, ai_memory_auth::GrantRole::Write, None)
+            .grant_memory(alice, repository, ai_memory_auth::GrantLevel::Write, None)
             .await
             .unwrap();
         // Carol may read the repository but not act on its runs.
         store
             .writer
-            .grant_memory(carol, repository, ai_memory_auth::GrantRole::Read, None)
+            .grant_memory(carol, repository, ai_memory_auth::GrantLevel::Read, None)
             .await
             .unwrap();
         let as_viewer = |user| Some(Extension(AuthorizedViewer(user)));

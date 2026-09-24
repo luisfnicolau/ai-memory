@@ -1,11 +1,10 @@
-//! The grants that authorize a user against a repository (#708).
+//! Per-project access: grants and access modes (#708).
 //!
 //! Storage only. The decision itself lives in `ai-memory-auth`, which has no
 //! database dependency and can therefore be tested exhaustively without one.
 
-use ai_memory_auth::{GrantRole, MemoryGrant};
-use ai_memory_core::ids::MemoryGrantId;
-use ai_memory_core::{ProjectId, UserId};
+use ai_memory_auth::{GrantLevel, ProjectGrant};
+use ai_memory_core::{ProjectId, UserId, WorkspaceId};
 use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -13,20 +12,6 @@ use crate::error::StoreResult;
 
 fn ts(micros: i64) -> Timestamp {
     Timestamp::from_microsecond(micros).unwrap_or(Timestamp::UNIX_EPOCH)
-}
-
-/// SQL for a repository's `workspace/project` label, given the placeholder
-/// bound to its id.
-///
-/// Computed in the statement rather than passed in, so a grant can never be
-/// written with a label that disagrees with the row it points at. A missing
-/// project yields NULL, which the `NOT NULL` column refuses — the same outcome
-/// the foreign key would give, with no window where a caller's string wins.
-fn repository_label_sql(id_param: &str) -> String {
-    format!(
-        "(SELECT w.name || '/' || p.name FROM projects p \
-          JOIN workspaces w ON w.id = p.workspace_id WHERE p.id = {id_param})"
-    )
 }
 
 /// The access mode of a repository, or `None` when there is no such project.
@@ -67,7 +52,7 @@ pub fn access(
     conn: &Connection,
     user: UserId,
     repository_id: ProjectId,
-    required: ai_memory_auth::GrantRole,
+    required: ai_memory_auth::GrantLevel,
 ) -> StoreResult<ai_memory_auth::Access> {
     let mode =
         access_mode_of(conn, repository_id)?.unwrap_or(ai_memory_auth::AccessMode::Restricted);
@@ -123,9 +108,8 @@ pub fn authors_without_grant(
            JOIN users u ON u.id = p.author_id \
           WHERE p.project_id = ?1 \
             AND u.role <> 'root' AND u.disabled_at IS NULL \
-            AND NOT EXISTS (SELECT 1 FROM memory_grant mg \
-                             WHERE mg.user_id = u.id AND mg.repository_id = ?1 \
-                               AND mg.revoked_at IS NULL) \
+            AND NOT EXISTS (SELECT 1 FROM project_grants pg \
+                             WHERE pg.user_id = u.id AND pg.project_id = ?1) \
           ORDER BY u.username",
     )?;
     let names = stmt
@@ -134,14 +118,11 @@ pub fn authors_without_grant(
     Ok(names)
 }
 
-/// Every grant this user holds on this repository, revoked ones included.
-///
-/// Revoked rows come back deliberately: the decision distinguishes "you never
-/// had this" from "this was taken from you", and only the second is a surprise
-/// worth escalating.
+/// The grant this user holds on this project, if any — at most one, the
+/// table's primary key being `(workspace, project, user)`.
 ///
 /// A row that cannot be parsed is **skipped and logged**, never repaired into
-/// something plausible. Fabricating an id or a user for a malformed row in an
+/// something plausible. Fabricating a level for a malformed row in an
 /// authorization table risks inventing access that nobody granted; dropping it
 /// can only ever deny, which is the safe direction to fail.
 ///
@@ -150,68 +131,49 @@ pub fn authors_without_grant(
 pub fn grants_for(
     conn: &Connection,
     user_id: UserId,
-    repository_id: ProjectId,
-) -> StoreResult<Vec<MemoryGrant>> {
+    project_id: ProjectId,
+) -> StoreResult<Vec<ProjectGrant>> {
     let mut stmt = conn.prepare(
-        "SELECT id, user_id, repository_id, role, granted_by_user_id, granted_at, \
-                revoked_at, revoked_by_user_id \
-           FROM memory_grant WHERE user_id = ?1 AND repository_id = ?2 \
-          ORDER BY granted_at",
+        "SELECT workspace_id, level, granted_by, granted_at \
+           FROM project_grants WHERE user_id = ?1 AND project_id = ?2",
     )?;
-    let rows = stmt.query_map(
-        params![user_id.as_bytes(), repository_id.as_bytes()],
-        |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, Option<Vec<u8>>>(4)?,
-                row.get::<_, i64>(5)?,
-                row.get::<_, Option<i64>>(6)?,
-                row.get::<_, Option<Vec<u8>>>(7)?,
-            ))
-        },
-    )?;
-
+    let rows = stmt.query_map(params![user_id.as_bytes(), project_id.as_bytes()], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<Vec<u8>>>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    })?;
     let mut grants = Vec::new();
     for row in rows {
-        let (id, uid, rid, role, by, at, revoked_at, revoked_by) = row?;
-
-        // An ABSENT granter is the documented seeded case and parses fine.
-        // A granter that is present but unreadable does not: the rule is that
-        // a value we cannot read is never guessed at, and skipping can only
-        // ever deny.
+        let (workspace, level, by, at) = row?;
+        // An ABSENT granter is the root-token case and parses fine. One that
+        // is present but unreadable does not: a value we cannot read is never
+        // guessed at, and skipping can only ever deny.
         let granter = match &by {
             None => Some(None),
             Some(raw) => UserId::from_slice(raw).ok().map(Some),
         };
-        let parsed = MemoryGrantId::from_slice(&id)
+        let parsed = WorkspaceId::from_slice(&workspace)
             .ok()
-            .zip(UserId::from_slice(&uid).ok())
-            .zip(ProjectId::from_slice(&rid).ok())
             .zip(granter)
-            .zip(GrantRole::parse(&role).ok());
-
-        let Some(((((id, uid), rid), by), role)) = parsed else {
-            // Skipping denies; repairing could invent access.
+            .zip(GrantLevel::parse(&level).ok());
+        let Some(((workspace_id, granted_by), level)) = parsed else {
             tracing::error!(
-                role = %role,
-                "skipping a malformed memory_grant row; access will be denied \
+                %level,
+                "skipping a malformed project_grants row; access will be denied \
                  as though it were absent",
             );
             continue;
         };
-
-        grants.push(MemoryGrant {
-            id,
-            user_id: uid,
-            repository_id: rid,
-            role,
-            granted_by_user_id: by,
+        grants.push(ProjectGrant {
+            workspace_id,
+            project_id,
+            user_id,
+            level,
+            granted_by,
             granted_at: ts(at),
-            revoked_at: revoked_at.map(ts),
-            revoked_by_user_id: revoked_by.and_then(|b| UserId::from_slice(&b).ok()),
         });
     }
     Ok(grants)
@@ -223,234 +185,148 @@ pub fn grants_for(
 /// that" instead of reporting a change it did not make.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GrantOutcome {
-    /// There was no active grant; one was created.
+    /// There was no grant; one was created.
     Granted,
-    /// An active grant existed at a different level. It was revoked and a new
-    /// one issued, so the change is visible in the history rather than
-    /// overwriting it.
-    RoleChanged {
+    /// A grant existed at a different level and was changed.
+    LevelChanged {
         /// The level held before this call.
-        from: GrantRole,
+        from: GrantLevel,
     },
-    /// An active grant at exactly this level already existed. Nothing written.
+    /// A grant at exactly this level already existed. Nothing written.
     Unchanged,
 }
 
-/// Grant `user_id` `role` on `repository_id`.
-///
-/// Changing an existing grant's level revokes the old row and inserts a new
-/// one rather than updating in place. An authorization table whose rows mutate
-/// cannot answer "what could they reach last Tuesday", which is the question
-/// that matters after an incident. It also keeps the active-pair unique index
-/// honest: there is exactly one unrevoked row per pair at every instant.
+/// Record a grant change in `audit_log`, the durable answer to "who could
+/// reach this, since when, and who decided". The grant table itself only
+/// holds what is in force now.
+fn audit_grant(
+    conn: &Connection,
+    op: &str,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    by: Option<UserId>,
+    detail: &serde_json::Value,
+    now: i64,
+) -> StoreResult<()> {
+    conn.execute(
+        "INSERT INTO audit_log (at, op, workspace_id, project_id, page_id, author_id, detail) \
+         VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6)",
+        params![
+            now,
+            op,
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            by.map(|by| by.as_bytes().to_vec()),
+            detail.to_string(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Grant `user_id` `level` on `project_id`, or change the level they hold.
 ///
 /// `granted_by` is `None` for the root bearer token, and `user_id` itself for
-/// the grant a
-/// creator receives with the repository they create — see the column comment
-/// in V68.
+/// the grant a creator receives with the project they create — see V68.
+/// Every change is recorded in `audit_log` (`grant_access`, with the previous
+/// level when there was one).
 ///
 /// # Errors
-/// Propagates any SQL error.
+/// [`crate::StoreError::NotFound`] when the project does not exist; otherwise
+/// propagates any SQL error.
 pub fn grant(
     conn: &Connection,
     user_id: UserId,
-    repository_id: ProjectId,
-    role: GrantRole,
+    project_id: ProjectId,
+    level: GrantLevel,
     granted_by: Option<UserId>,
     now: i64,
 ) -> StoreResult<GrantOutcome> {
-    let active = grants_for(conn, user_id, repository_id)?
-        .into_iter()
-        .find(MemoryGrant::is_active);
-
-    let outcome = match active {
-        Some(held) if held.role == role => return Ok(GrantOutcome::Unchanged),
-        Some(held) => {
-            // A level change is a revocation plus a new grant. `granted_by` is
-            // the revoker too: the person making the change is the person
-            // taking the old level away.
-            revoke(conn, user_id, repository_id, granted_by, now)?;
-            GrantOutcome::RoleChanged { from: held.role }
-        }
+    let held = grants_for(conn, user_id, project_id)?.into_iter().next();
+    let outcome = match &held {
+        Some(held) if held.level == level => return Ok(GrantOutcome::Unchanged),
+        Some(held) => GrantOutcome::LevelChanged { from: held.level },
         None => GrantOutcome::Granted,
     };
-
+    let workspace_id: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT workspace_id FROM projects WHERE id = ?1",
+            params![project_id.as_bytes()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let workspace_id = workspace_id
+        .and_then(|bytes| WorkspaceId::from_slice(&bytes).ok())
+        .ok_or_else(|| crate::StoreError::NotFound(format!("project {project_id}")))?;
     conn.execute(
-        &format!(
-            "INSERT INTO memory_grant \
-             (id, user_id, repository_id, repository_label, role, granted_by_user_id, granted_at) \
-             VALUES (?1, ?2, ?3, {}, ?4, ?5, ?6)",
-            repository_label_sql("?3")
-        ),
+        "INSERT INTO project_grants \
+         (workspace_id, project_id, user_id, level, granted_by, granted_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+         ON CONFLICT (workspace_id, project_id, user_id) DO UPDATE SET \
+           level = excluded.level, granted_by = excluded.granted_by, \
+           granted_at = excluded.granted_at",
         params![
-            MemoryGrantId::new().as_bytes(),
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
             user_id.as_bytes(),
-            repository_id.as_bytes(),
-            role.as_str(),
+            level.as_str(),
             granted_by.map(|by| by.as_bytes().to_vec()),
             now,
         ],
     )?;
+    let previous = held.map(|held| held.level.as_str());
+    audit_grant(
+        conn,
+        "grant_access",
+        workspace_id,
+        project_id,
+        granted_by,
+        &serde_json::json!({
+            "user_id": user_id.to_string(),
+            "level": level.as_str(),
+            "previous": previous,
+        }),
+        now,
+    )?;
     Ok(outcome)
 }
 
-/// Revoke whatever `user_id` actively holds on `repository_id`.
+/// Take away whatever `user_id` holds on `project_id`.
 ///
 /// Returns whether anything was actually revoked, so revoking twice is
-/// harmless and still reports honestly.
-///
-/// `revoked_by` is `None` when the operator acts through the root bearer
-/// token, which has no `users` row — see the column comment in V68. It must
-/// not be able to prevent a revocation: taking access away is the operation
-/// that most needs to work when something has gone wrong.
+/// harmless and still reports honestly. The revocation is recorded in
+/// `audit_log` (`revoke_access`); `revoked_by` is `None` for the root bearer
+/// token, and must never be able to prevent a revocation — taking access away
+/// is what most needs to work when something has gone wrong.
 ///
 /// # Errors
 /// Propagates any SQL error.
 pub fn revoke(
     conn: &Connection,
     user_id: UserId,
-    repository_id: ProjectId,
+    project_id: ProjectId,
     revoked_by: Option<UserId>,
     now: i64,
 ) -> StoreResult<bool> {
-    let changed = conn.execute(
-        "UPDATE memory_grant SET revoked_at = ?3, revoked_by_user_id = ?4 \
-          WHERE user_id = ?1 AND repository_id = ?2 AND revoked_at IS NULL",
-        params![
-            user_id.as_bytes(),
-            repository_id.as_bytes(),
-            now,
-            revoked_by.map(|by| by.as_bytes().to_vec()),
-        ],
+    let Some(held) = grants_for(conn, user_id, project_id)?.into_iter().next() else {
+        return Ok(false);
+    };
+    conn.execute(
+        "DELETE FROM project_grants WHERE user_id = ?1 AND project_id = ?2",
+        params![user_id.as_bytes(), project_id.as_bytes()],
     )?;
-    Ok(changed > 0)
-}
-
-/// Which repositories a destructive operation covers.
-#[derive(Debug, Clone, Copy)]
-pub enum GrantScope {
-    /// One repository.
-    Project(ProjectId),
-    /// Every repository in a workspace.
-    Workspace(ai_memory_core::WorkspaceId),
-}
-
-impl GrantScope {
-    /// The `WHERE` predicate on `memory_grant` rows this scope covers, bound
-    /// to `?1`.
-    const fn predicate(self) -> &'static str {
-        match self {
-            Self::Project(_) => "memory_grant.repository_id = ?1",
-            Self::Workspace(_) => {
-                "memory_grant.repository_id IN (SELECT id FROM projects WHERE workspace_id = ?1)"
-            }
-        }
-    }
-
-    fn id_bytes(self) -> Vec<u8> {
-        match self {
-            Self::Project(id) => id.as_bytes().to_vec(),
-            Self::Workspace(id) => id.as_bytes().to_vec(),
-        }
-    }
-}
-
-/// Grants still in force under `scope`, as "`user` (`role`) on `repository`"
-/// phrases for an operator to read.
-///
-/// A destructive operation calls this before it deletes anything, so the
-/// refusal can say exactly whose access is in the way rather than "a
-/// constraint failed".
-///
-/// # Errors
-/// Propagates any SQL error.
-pub fn active_grants_under(conn: &Connection, scope: GrantScope) -> StoreResult<Vec<String>> {
-    let sql = format!(
-        "SELECT users.username, memory_grant.role, workspaces.name || '/' || projects.name \
-           FROM memory_grant \
-           JOIN users      ON users.id = memory_grant.user_id \
-           JOIN projects   ON projects.id = memory_grant.repository_id \
-           JOIN workspaces ON workspaces.id = projects.workspace_id \
-          WHERE memory_grant.revoked_at IS NULL AND {} \
-          ORDER BY workspaces.name, projects.name, users.username",
-        scope.predicate()
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params![scope.id_bytes()], |row| {
-        Ok(format!(
-            "{} ({}) on {}",
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    })?;
-    rows.collect::<Result<_, _>>()
-        .map_err(crate::StoreError::from)
-}
-
-/// Revoke every grant still in force under `scope`, recording who did it.
-///
-/// This is what `--revoke-grants` runs, inside the same transaction as the
-/// destructive operation it precedes: the revocations and the delete commit
-/// together or not at all, so there is no state where access was taken away
-/// but the repository survived, or the reverse.
-///
-/// `revoked_by` is `None` for the root bearer token, as in [`revoke`].
-///
-/// # Errors
-/// Propagates any SQL error.
-pub fn revoke_all_under(
-    conn: &Connection,
-    scope: GrantScope,
-    revoked_by: Option<UserId>,
-    now: i64,
-) -> StoreResult<u64> {
-    let sql = format!(
-        "UPDATE memory_grant SET revoked_at = ?2, revoked_by_user_id = ?3 \
-          WHERE revoked_at IS NULL AND {}",
-        scope.predicate()
-    );
-    let changed = conn.execute(
-        &sql,
-        params![
-            scope.id_bytes(),
-            now,
-            revoked_by.map(|by| by.as_bytes().to_vec())
-        ],
+    audit_grant(
+        conn,
+        "revoke_access",
+        held.workspace_id,
+        project_id,
+        revoked_by,
+        &serde_json::json!({
+            "user_id": user_id.to_string(),
+            "level": held.level.as_str(),
+        }),
+        now,
     )?;
-    Ok(u64::try_from(changed).unwrap_or(0))
-}
-
-/// The grant check every destructive operation runs before deleting a
-/// repository: refuse while access is in force, or revoke it first when the
-/// operator has said to.
-///
-/// Returns how many grants were revoked (0 when there were none). Call it
-/// inside the operation's transaction, before the `DELETE`.
-///
-/// # Errors
-/// [`crate::StoreError::ActiveGrants`] when grants are in force and
-/// `revoke_grants` is false; otherwise propagates SQL errors.
-pub(crate) fn refuse_or_revoke(
-    conn: &Connection,
-    scope: GrantScope,
-    label: &str,
-    revoke_grants: bool,
-    revoked_by: Option<UserId>,
-    now: i64,
-) -> StoreResult<u64> {
-    let holders = active_grants_under(conn, scope)?;
-    if holders.is_empty() {
-        return Ok(0);
-    }
-    if !revoke_grants {
-        return Err(crate::StoreError::ActiveGrants {
-            scope: label.to_owned(),
-            count: holders.len(),
-            holders: holders.join(", "),
-        });
-    }
-    revoke_all_under(conn, scope, revoked_by, now)
+    Ok(true)
 }
 
 /// One row of the operator's grant listing, resolved to names.
@@ -458,31 +334,28 @@ pub(crate) fn refuse_or_revoke(
 pub struct GrantListing {
     /// Who holds it.
     pub username: String,
-    /// The workspace the repository lives in.
+    /// The workspace the project lives in.
     pub workspace: String,
-    /// The repository, by the name an operator would type.
-    pub repository: String,
+    /// The project, by the name an operator would type.
+    pub project: String,
     /// What they hold.
-    pub role: GrantRole,
-    /// Whether it is still in force.
-    pub active: bool,
+    pub level: GrantLevel,
 }
 
-/// Every active grant on the server, ordered for human reading.
+/// Every grant on the server, ordered for human reading.
 ///
 /// Names rather than ids: a listing an operator cannot read without three
 /// further queries is not a listing.
 ///
 /// # Errors
 /// Propagates any SQL error.
-pub fn list_active_grants(conn: &Connection) -> StoreResult<Vec<GrantListing>> {
+pub fn list_grants(conn: &Connection) -> StoreResult<Vec<GrantListing>> {
     let mut stmt = conn.prepare(
-        "SELECT users.username, workspaces.name, projects.name, memory_grant.role \
-           FROM memory_grant \
-           JOIN users      ON users.id = memory_grant.user_id \
-           JOIN projects   ON projects.id = memory_grant.repository_id \
-           JOIN workspaces ON workspaces.id = projects.workspace_id \
-          WHERE memory_grant.revoked_at IS NULL \
+        "SELECT users.username, workspaces.name, projects.name, project_grants.level \
+           FROM project_grants \
+           JOIN users      ON users.id = project_grants.user_id \
+           JOIN projects   ON projects.id = project_grants.project_id \
+           JOIN workspaces ON workspaces.id = project_grants.workspace_id \
           ORDER BY workspaces.name, projects.name, users.username",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -495,21 +368,18 @@ pub fn list_active_grants(conn: &Connection) -> StoreResult<Vec<GrantListing>> {
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (username, workspace, repository, role) = row?;
-        let Ok(role) = GrantRole::parse(&role) else {
+        let (username, workspace, project, level) = row?;
+        let Ok(level) = GrantLevel::parse(&level) else {
             // Same rule as `grants_for`: a row we cannot read is not repaired
-            // into something plausible. Here it is only a display, but showing
-            // an operator a level that is not what the check will use is worse
-            // than showing them nothing.
-            tracing::error!(%username, %repository, "skipping a malformed memory_grant row in listing");
+            // into something plausible, even for display.
+            tracing::error!(%username, %project, "skipping a malformed project_grants row in listing");
             continue;
         };
         out.push(GrantListing {
             username,
             workspace,
-            repository,
-            role,
-            active: true,
+            project,
+            level,
         });
     }
     Ok(out)
@@ -586,56 +456,77 @@ mod tests {
         }
     }
 
-    fn all_rows(store: &Store, user: UserId, repository: ProjectId) -> Vec<MemoryGrant> {
+    fn all_rows(store: &Store, user: UserId, project: ProjectId) -> Vec<ProjectGrant> {
         let conn = Connection::open(store.db_path()).unwrap();
-        grants_for(&conn, user, repository).unwrap()
+        grants_for(&conn, user, project).unwrap()
     }
 
+    /// `(author_id, detail)` of every audit row with this `op`, oldest first.
+    fn audit_rows(store: &Store, op: &str) -> Vec<(Option<Vec<u8>>, serde_json::Value)> {
+        let conn = Connection::open(store.db_path()).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT author_id, detail FROM audit_log WHERE op = ?1 ORDER BY id")
+            .unwrap();
+        stmt.query_map(params![op], |row| {
+            let detail: String = row.get(1)?;
+            Ok((row.get(0)?, serde_json::from_str(&detail).unwrap()))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    }
+
+    /// One row per user and project: a level change updates it, and every
+    /// change — not a repeat — lands in the audit log with who made it.
     #[tokio::test]
-    async fn granting_reports_what_it_did_and_a_level_change_keeps_history() {
+    async fn granting_reports_what_it_did_and_every_change_is_audited() {
         let f = fixture().await;
         let w = &f.store.writer;
 
         assert_eq!(
-            w.grant_memory(f.alice, f.client, GrantRole::Read, Some(f.bob))
+            w.grant_memory(f.alice, f.client, GrantLevel::Read, Some(f.bob))
                 .await
                 .unwrap(),
             GrantOutcome::Granted
         );
-        // The same level again is not reported as a change.
         assert_eq!(
-            w.grant_memory(f.alice, f.client, GrantRole::Read, Some(f.bob))
+            w.grant_memory(f.alice, f.client, GrantLevel::Read, Some(f.bob))
                 .await
                 .unwrap(),
-            GrantOutcome::Unchanged
+            GrantOutcome::Unchanged,
+            "the same level again is not a change"
         );
         assert_eq!(
-            w.grant_memory(f.alice, f.client, GrantRole::Write, Some(f.bob))
+            w.grant_memory(f.alice, f.client, GrantLevel::Write, Some(f.bob))
                 .await
                 .unwrap(),
-            GrantOutcome::RoleChanged {
-                from: GrantRole::Read
+            GrantOutcome::LevelChanged {
+                from: GrantLevel::Read
             }
         );
 
-        // A level change is a revocation plus a new grant, never an UPDATE:
-        // both rows survive, exactly one is in force, and the old one records
-        // who took it away.
         let rows = all_rows(&f.store, f.alice, f.client);
-        assert_eq!(rows.len(), 2);
-        let active: Vec<_> = rows.iter().filter(|g| g.is_active()).collect();
-        assert_eq!(active.len(), 1);
-        assert_eq!(active[0].role, GrantRole::Write);
-        let old = rows.iter().find(|g| !g.is_active()).unwrap();
-        assert_eq!(old.role, GrantRole::Read);
-        assert_eq!(old.revoked_by_user_id, Some(f.bob));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].level, GrantLevel::Write);
+        assert_eq!(rows[0].granted_by, Some(f.bob));
+
+        let audit = audit_rows(&f.store, "grant_access");
+        assert_eq!(audit.len(), 2, "grant and level change, not the repeat");
+        assert_eq!(audit[0].0, Some(f.bob.as_bytes().to_vec()));
+        assert_eq!(audit[0].1["level"], "read");
+        assert_eq!(audit[1].1["level"], "write");
+        assert_eq!(audit[1].1["previous"], "read");
+        assert_eq!(audit[1].1["user_id"], f.alice.to_string());
     }
 
+    /// Revoking deletes the grant and records it; revoking again is honest
+    /// about there being nothing to take. A revoked user reads exactly like one
+    /// never granted.
     #[tokio::test]
-    async fn revoking_is_honest_about_whether_anything_was_held() {
+    async fn revoking_is_honest_and_audited() {
         let f = fixture().await;
         let w = &f.store.writer;
-        w.grant_memory(f.alice, f.client, GrantRole::Write, Some(f.bob))
+        w.grant_memory(f.alice, f.client, GrantLevel::Write, Some(f.bob))
             .await
             .unwrap();
 
@@ -650,14 +541,16 @@ mod tests {
                 .unwrap()
         );
 
-        // The decision now reads it as revoked, not as never granted.
-        let grants = all_rows(&f.store, f.alice, f.client);
+        assert!(all_rows(&f.store, f.alice, f.client).is_empty());
         assert_eq!(
-            ai_memory_auth::decide(&grants, f.alice, f.client, GrantRole::Read),
-            ai_memory_auth::Access::Denied(ai_memory_auth::Denial::Revoked {
+            ai_memory_auth::decide(&[], f.alice, f.client, GrantLevel::Read),
+            ai_memory_auth::Access::Denied(ai_memory_auth::Denial::NeverGranted {
                 repository: f.client
             })
         );
+        let audit = audit_rows(&f.store, "revoke_access");
+        assert_eq!(audit.len(), 1, "the no-op second revoke writes nothing");
+        assert_eq!(audit[0].1["level"], "write");
     }
 
     #[tokio::test]
@@ -667,16 +560,19 @@ mod tests {
         // needs to work when something has gone wrong.
         let f = fixture().await;
         let w = &f.store.writer;
-        w.grant_memory(f.alice, f.client, GrantRole::Write, None)
+        w.grant_memory(f.alice, f.client, GrantLevel::Write, None)
             .await
             .unwrap();
+        assert_eq!(all_rows(&f.store, f.alice, f.client)[0].granted_by, None);
         assert!(w.revoke_memory(f.alice, f.client, None).await.unwrap());
-
-        let rows = all_rows(&f.store, f.alice, f.client);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].granted_by_user_id, None);
-        assert_eq!(rows[0].revoked_by_user_id, None);
-        assert!(!rows[0].is_active());
+        assert!(all_rows(&f.store, f.alice, f.client).is_empty());
+        for op in ["grant_access", "revoke_access"] {
+            assert_eq!(
+                audit_rows(&f.store, op)[0].0,
+                None,
+                "{op} by the root token"
+            );
+        }
     }
 
     async fn page(store: &Store, repository: ProjectId, path: &str, body: &str) {
@@ -713,13 +609,13 @@ mod tests {
     }
 
     /// The search filter is written in SQL as "any active grant"; the guard
-    /// on every other path is `decide(.., GrantRole::Read)`. They agree only
+    /// on every other path is `decide(.., GrantLevel::Read)`. They agree only
     /// because reader is the lowest level. This pins that, so adding a level
     /// below reader breaks a test rather than quietly widening search.
     #[test]
     fn every_grant_level_can_read_which_is_what_the_search_filter_assumes() {
-        for role in [GrantRole::Read, GrantRole::Write] {
-            assert!(role.covers(GrantRole::Read), "{role:?}");
+        for role in [GrantLevel::Read, GrantLevel::Write] {
+            assert!(role.covers(GrantLevel::Read), "{role:?}");
         }
     }
 
@@ -745,7 +641,7 @@ mod tests {
         .await;
         f.store
             .writer
-            .grant_memory(f.alice, f.client, GrantRole::Read, None)
+            .grant_memory(f.alice, f.client, GrantLevel::Read, None)
             .await
             .unwrap();
 
@@ -847,7 +743,7 @@ mod tests {
 
         f.store
             .writer
-            .grant_memory(f.bob, f.personal, GrantRole::Read, None)
+            .grant_memory(f.bob, f.personal, GrantLevel::Read, None)
             .await
             .unwrap();
 
@@ -874,236 +770,106 @@ mod tests {
     async fn the_listing_shows_names_and_only_what_is_in_force() {
         let f = fixture().await;
         let w = &f.store.writer;
-        w.grant_memory(f.alice, f.client, GrantRole::Write, None)
+        w.grant_memory(f.alice, f.client, GrantLevel::Write, None)
             .await
             .unwrap();
-        w.grant_memory(f.bob, f.personal, GrantRole::Read, None)
+        w.grant_memory(f.bob, f.personal, GrantLevel::Read, None)
             .await
             .unwrap();
         w.revoke_memory(f.bob, f.personal, None).await.unwrap();
 
-        let listing = f.store.reader.list_active_grants().await.unwrap();
+        let listing = f.store.reader.list_grants().await.unwrap();
         assert_eq!(
             listing,
             vec![GrantListing {
                 username: "alice".into(),
                 workspace: "default".into(),
-                repository: "client-work".into(),
-                role: GrantRole::Write,
-                active: true,
+                project: "client-work".into(),
+                level: GrantLevel::Write,
             }]
         );
     }
 
-    /// `(repository_id, repository_label, revoked, revoked_by_user_id)`.
-    type HistoryRow = (Option<Vec<u8>>, String, bool, Option<Vec<u8>>);
-
-    /// Every row the table holds for `user`, including history whose
-    /// repository has been deleted and no longer matches any id.
-    fn history_of(store: &Store, user: UserId) -> Vec<HistoryRow> {
-        let conn = Connection::open(store.db_path()).unwrap();
-        let mut stmt = conn
-            .prepare(
-                "SELECT repository_id, repository_label, revoked_at IS NOT NULL, revoked_by_user_id \
-                   FROM memory_grant WHERE user_id = ?1 ORDER BY granted_at",
-            )
+    /// A grant never outlives its project: purging it takes the grants too, as
+    /// the design's CASCADE says, and the audit log still says who had access.
+    #[tokio::test]
+    async fn purging_a_project_takes_its_grants_and_keeps_the_audit_trail() {
+        let f = fixture().await;
+        f.store
+            .writer
+            .grant_memory(f.alice, f.client, GrantLevel::Write, None)
+            .await
             .unwrap();
-        stmt.query_map(params![user.as_bytes()], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap()
-    }
-
-    async fn purge(
-        f: &Fixture,
-        repository: ProjectId,
-        revoke_grants: bool,
-    ) -> StoreResult<crate::PurgeSummary> {
         f.store
             .writer
             .purge_project(
                 f.ws,
-                repository,
+                f.client,
                 "default/client-work",
-                Some(f.bob),
+                None,
                 false,
-                revoke_grants,
                 crate::Compaction::Skip,
             )
             .await
-    }
-
-    #[tokio::test]
-    async fn purging_a_repository_people_can_reach_refuses_and_names_them() {
-        let f = fixture().await;
-        f.store
-            .writer
-            .grant_memory(f.alice, f.client, GrantRole::Write, None)
-            .await
-            .unwrap();
-
-        let err = purge(&f, f.client, false).await.unwrap_err();
-        let message = err.to_string();
-        assert!(
-            matches!(err, crate::StoreError::ActiveGrants { count: 1, .. }),
-            "{message}"
-        );
-        assert!(
-            message.contains("alice (write) on default/client-work"),
-            "{message}"
-        );
-        assert!(message.contains("--revoke-grants"), "{message}");
-
-        // Refused means nothing happened: the repository and the access are
-        // exactly as they were.
-        assert!(
-            f.store
-                .reader
-                .find_project(f.ws, "client-work".into())
-                .await
-                .unwrap()
-                .is_some()
-        );
-        assert!(all_rows(&f.store, f.alice, f.client)[0].is_active());
-    }
-
-    #[tokio::test]
-    async fn revoke_grants_revokes_first_and_the_history_outlives_the_repository() {
-        let f = fixture().await;
-        f.store
-            .writer
-            .grant_memory(f.alice, f.client, GrantRole::Write, None)
-            .await
-            .unwrap();
-
-        let summary = purge(&f, f.client, true).await.unwrap();
-        assert_eq!(summary.grants_revoked, 1);
-
-        // Revoked, not deleted: the row survives the repository, says which
-        // repository it was, and records who took the access away.
-        let history = history_of(&f.store, f.alice);
-        assert_eq!(history.len(), 1);
-        let (repository, label, revoked, revoked_by) = &history[0];
-        assert_eq!(repository, &None, "the repository is gone");
-        assert_eq!(label, "default/client-work");
-        assert!(revoked);
-        assert_eq!(revoked_by.as_deref(), Some(&f.bob.as_bytes()[..]));
-    }
-
-    #[tokio::test]
-    async fn a_repository_with_only_revoked_history_purges_and_keeps_it() {
-        let f = fixture().await;
-        let w = &f.store.writer;
-        w.grant_memory(f.alice, f.client, GrantRole::Read, None)
-            .await
-            .unwrap();
-        w.revoke_memory(f.alice, f.client, None).await.unwrap();
-
-        // Nothing in force, so nothing to refuse — and nothing to erase.
-        let summary = purge(&f, f.client, false).await.unwrap();
-        assert_eq!(summary.grants_revoked, 0);
-        let history = history_of(&f.store, f.alice);
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].0, None);
-        assert_eq!(history[0].1, "default/client-work");
-    }
-
-    #[tokio::test]
-    async fn the_database_itself_refuses_to_orphan_access_or_erase_a_users_history() {
-        // Whatever a future code path does, SQL that would silently take
-        // access away or erase who-could-see-what fails at the database.
-        let f = fixture().await;
-        f.store
-            .writer
-            .grant_memory(f.alice, f.client, GrantRole::Write, None)
-            .await
-            .unwrap();
+            .expect("a grant in force does not stand in a purge's way");
         let conn = Connection::open(f.store.db_path()).unwrap();
-        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
-
-        let project = conn.execute(
-            "DELETE FROM projects WHERE id = ?1",
-            params![f.client.as_bytes()],
-        );
-        assert!(
-            project.is_err(),
-            "an active grant must block deleting its repository"
-        );
-
-        let user = conn.execute(
-            "DELETE FROM users WHERE id = ?1",
-            params![f.alice.as_bytes()],
-        );
-        assert!(user.is_err(), "grant history must block deleting its user");
-
-        assert_eq!(all_rows(&f.store, f.alice, f.client).len(), 1);
+        let left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_grants WHERE project_id = ?1",
+                params![f.client.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0);
+        assert_eq!(audit_rows(&f.store, "grant_access").len(), 1);
     }
 
+    /// Deleting a workspace cascades through its projects to their grants.
     #[tokio::test]
-    async fn deleting_a_workspace_runs_the_same_check_and_keeps_the_same_history() {
+    async fn deleting_a_workspace_takes_its_grants() {
         let f = fixture().await;
         let w = &f.store.writer;
         let team = w.get_or_create_workspace("team-b").await.unwrap();
-        let repo = w.get_or_create_project(team, "api", None).await.unwrap();
-        w.grant_memory(f.alice, repo, GrantRole::Write, None)
+        let api = w.get_or_create_project(team, "api", None).await.unwrap();
+        w.grant_memory(f.alice, api, GrantLevel::Write, None)
             .await
             .unwrap();
-
-        // `force` gets past "not empty", never past somebody's access.
-        let err = w
-            .delete_workspace(team, true, false, None, crate::Compaction::Skip)
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("alice (write) on team-b/api"),
-            "{err}"
-        );
-
-        let summary = w
-            .delete_workspace(team, true, true, Some(f.bob), crate::Compaction::Skip)
+        w.delete_workspace(team, true, crate::Compaction::Skip)
             .await
             .unwrap();
-        assert_eq!(summary.grants_revoked, 1);
-        // The workspace row is gone before the cascaded project delete fires
-        // the label trigger, so the grant-time label is what survives.
-        let history = history_of(&f.store, f.alice);
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].0, None);
-        assert_eq!(history[0].1, "team-b/api");
-        assert!(history[0].2);
+        assert!(all_rows(&f.store, f.alice, api).is_empty());
     }
 
+    /// The hollow-project sweep is upstream's, unchanged: an empty project is
+    /// swept after its age cutoff whether or not someone holds a grant on it,
+    /// and the grant goes with it.
     #[tokio::test]
-    async fn a_repository_somebody_can_reach_is_never_swept_as_hollow() {
+    async fn an_empty_project_is_swept_even_when_someone_holds_a_grant() {
         let f = fixture().await;
         let w = &f.store.writer;
-        // `personal` is empty: no pages, no sessions. Hollow by every other
-        // measure, and the sweep runs on a schedule with nobody watching.
-        w.grant_memory(f.alice, f.personal, GrantRole::Write, None)
+        let probe = w.get_or_create_project(f.ws, "probe", None).await.unwrap();
+        w.grant_memory(f.alice, probe, GrantLevel::Write, None)
             .await
             .unwrap();
-        let swept = w.sweep_hollow_projects(0).await.unwrap();
-        assert!(!swept.contains(&"personal".to_owned()), "{swept:?}");
-        assert!(all_rows(&f.store, f.alice, f.personal)[0].is_active());
-
-        // Revoked history does not hold it back, and survives the sweep.
-        w.revoke_memory(f.alice, f.personal, None).await.unwrap();
-        let swept = w.sweep_hollow_projects(0).await.unwrap();
-        assert!(swept.contains(&"personal".to_owned()), "{swept:?}");
-        let history = history_of(&f.store, f.alice);
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].1, "default/personal");
+        let mut conn = Connection::open(f.store.db_path()).unwrap();
+        conn.execute(
+            "UPDATE projects SET created_at = 0 WHERE id = ?1",
+            params![probe.as_bytes()],
+        )
+        .unwrap();
+        let swept = crate::ops::sweep_hollow_projects(&mut conn, 1).unwrap();
+        assert!(swept.contains(&"probe".to_owned()), "{swept:?}");
+        assert!(all_rows(&f.store, f.alice, probe).is_empty());
     }
 
     #[tokio::test]
-    async fn rename_and_a_true_move_keep_the_grants_with_the_repository() {
+    async fn rename_and_a_true_move_keep_the_grants_with_the_project() {
         // Both keep the project id, so the grants stay attached to the same
-        // content with no action needed — the id, not the name, is the key.
+        // content — the id, not the name, is the key. A move to another
+        // workspace carries the grant's workspace along with it.
         let f = fixture().await;
         let w = &f.store.writer;
-        w.grant_memory(f.alice, f.client, GrantRole::Write, None)
+        w.grant_memory(f.alice, f.client, GrantLevel::Write, None)
             .await
             .unwrap();
 
@@ -1116,13 +882,20 @@ mod tests {
             .unwrap();
 
         let grants = all_rows(&f.store, f.alice, f.client);
+        assert_eq!(grants[0].workspace_id, elsewhere);
         assert_eq!(
-            ai_memory_auth::decide(&grants, f.alice, f.client, GrantRole::Write),
+            ai_memory_auth::decide(&grants, f.alice, f.client, GrantLevel::Write),
             ai_memory_auth::Access::Granted
         );
-        let listing = f.store.reader.list_active_grants().await.unwrap();
+        let listing = f.store.reader.list_grants().await.unwrap();
         assert_eq!(listing[0].workspace, "elsewhere");
-        assert_eq!(listing[0].repository, "client-renamed");
+        assert_eq!(listing[0].project, "client-renamed");
+
+        // And deleting the workspace it left does not take it.
+        w.delete_workspace(f.ws, true, crate::Compaction::Skip)
+            .await
+            .unwrap();
+        assert_eq!(all_rows(&f.store, f.alice, f.client).len(), 1);
     }
 
     /// Both forms of "may read" are built from one SQL template, but they
@@ -1134,10 +907,10 @@ mod tests {
         let f = fixture().await;
         let w = &f.store.writer;
         let global = crate::create_global_scope(w).await.unwrap();
-        w.grant_memory(f.alice, f.client, GrantRole::Read, None)
+        w.grant_memory(f.alice, f.client, GrantLevel::Read, None)
             .await
             .unwrap();
-        w.grant_memory(f.bob, f.personal, GrantRole::Write, None)
+        w.grant_memory(f.bob, f.personal, GrantLevel::Write, None)
             .await
             .unwrap();
         w.revoke_memory(f.bob, f.personal, None).await.unwrap();
@@ -1209,10 +982,10 @@ mod tests {
     async fn the_workspace_handoff_comes_only_from_readable_repositories() {
         let f = fixture().await;
         let w = &f.store.writer;
-        w.grant_memory(f.alice, f.client, GrantRole::Read, None)
+        w.grant_memory(f.alice, f.client, GrantLevel::Read, None)
             .await
             .unwrap();
-        w.grant_memory(f.bob, f.personal, GrantRole::Read, None)
+        w.grant_memory(f.bob, f.personal, GrantLevel::Read, None)
             .await
             .unwrap();
         w.insert_handoff(unowned_handoff(f.ws, f.personal, "bob's older baton"))
@@ -1257,7 +1030,7 @@ mod tests {
         let f = fixture().await;
         f.store
             .writer
-            .grant_memory(f.alice, f.client, GrantRole::Read, None)
+            .grant_memory(f.alice, f.client, GrantLevel::Read, None)
             .await
             .unwrap();
         for repo in [f.client, f.personal] {

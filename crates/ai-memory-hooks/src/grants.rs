@@ -6,7 +6,7 @@
 //! it — entirely. These resolve the id to its repository first, then ask the
 //! same question the resolvers ask.
 
-use ai_memory_auth::GrantRole;
+use ai_memory_auth::GrantLevel;
 use ai_memory_core::{ProjectId, UserId, WorkspaceId};
 use ai_memory_store::{ReaderPool, ResolvedScope, ScopeResolutionError, authorize_scope};
 
@@ -24,7 +24,7 @@ pub(crate) async fn authorize_resolved(
     reader: &ReaderPool,
     scope: Option<(WorkspaceId, ProjectId)>,
     viewer: Option<UserId>,
-    required: GrantRole,
+    required: GrantLevel,
 ) -> Result<(), ScopeResolutionError> {
     let (Some(viewer), Some((workspace_id, project_id))) = (viewer, scope) else {
         return Ok(());

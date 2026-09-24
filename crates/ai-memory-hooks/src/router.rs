@@ -1351,7 +1351,7 @@ async fn fetch_and_accept_handoff(
         &state.reader,
         Some((ws, proj)),
         viewer,
-        ai_memory_auth::GrantRole::Read,
+        ai_memory_auth::GrantLevel::Read,
     )
     .await?;
     // Session-start handoff delivery is a foreground action. Publish it so
@@ -1558,7 +1558,7 @@ async fn fetch_managed_context(
             &state.reader,
             scope,
             viewer,
-            ai_memory_auth::GrantRole::Write,
+            ai_memory_auth::GrantLevel::Write,
         )
         .await?;
     }
@@ -2755,7 +2755,7 @@ async fn process_authorized(
         && matches!(
             state
                 .reader
-                .access_for(viewer, proj, ai_memory_auth::GrantRole::Write)
+                .access_for(viewer, proj, ai_memory_auth::GrantLevel::Write)
                 .await?,
             ai_memory_auth::Access::Denied(_)
         )
@@ -3939,14 +3939,14 @@ mod tests {
             &state,
             "ray",
             landed,
-            Some(ai_memory_store::GrantRole::Read),
+            Some(ai_memory_store::GrantLevel::Read),
         )
         .await;
         let writer = user_holding(
             &state,
             "wren",
             landed,
-            Some(ai_memory_store::GrantRole::Write),
+            Some(ai_memory_store::GrantLevel::Write),
         )
         .await;
         let stranger = user_holding(&state, "sam", landed, None).await;
@@ -4021,7 +4021,7 @@ mod tests {
             &state,
             "ray",
             landed,
-            Some(ai_memory_store::GrantRole::Read),
+            Some(ai_memory_store::GrantLevel::Read),
         )
         .await;
 
@@ -4125,8 +4125,8 @@ mod tests {
         assert_ne!(created, state.project_id);
         let grants = state.reader.grants_for(cora, created).await.unwrap();
         assert_eq!(grants.len(), 1, "{grants:?}");
-        assert_eq!(grants[0].role, ai_memory_store::GrantRole::Write);
-        assert_eq!(grants[0].granted_by_user_id, Some(cora));
+        assert_eq!(grants[0].level, ai_memory_store::GrantLevel::Write);
+        assert_eq!(grants[0].granted_by, Some(cora));
 
         let second = SessionId::new().to_string();
         capture_as(&state, &repo, &second, Some(cora))
@@ -4328,7 +4328,7 @@ mod tests {
         state: &HookState,
         username: &str,
         repository: ProjectId,
-        role: Option<ai_memory_store::GrantRole>,
+        role: Option<ai_memory_store::GrantLevel>,
     ) -> ai_memory_core::UserId {
         let id = state
             .writer
@@ -7908,7 +7908,6 @@ mod tests {
                 "default/heal-project",
                 None,
                 false,
-                false,
                 ai_memory_store::Compaction::Skip,
             )
             .await
@@ -8731,7 +8730,6 @@ mod tests {
                 proj,
                 "default/repo-root-project",
                 None,
-                false,
                 false,
                 ai_memory_store::Compaction::Skip,
             )
@@ -9965,7 +9963,7 @@ mod tests {
             .grant_memory(
                 alice,
                 state.project_id,
-                ai_memory_auth::GrantRole::Read,
+                ai_memory_auth::GrantLevel::Read,
                 None,
             )
             .await

@@ -1,17 +1,10 @@
-//! A grant: permission for one user to reach one repository's memory.
+//! A grant: permission for one user to reach one project's memory (#708).
 
-use ai_memory_core::ids::MemoryGrantId;
-use ai_memory_core::{ProjectId, UserId};
+use ai_memory_core::{ProjectId, UserId, WorkspaceId};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
-/// One user's access to one repository's memory.
-///
-/// **What is granted is access to the *memory* of a repository, not to the
-/// repository.** Code access belongs to GitHub, and lore neither checks it nor
-/// claims to. Conflating the two would let this system imply a permission it
-/// has no way to verify.
-/// What a grant lets its holder do in one project (#708).
+/// What a grant lets its holder do in one project.
 ///
 /// Two levels, and `Write` contains `Read`: a call site names the level an
 /// operation needs and the comparison is `held >= required`.
@@ -21,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// always have; delegating them per project is out of scope for v1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum GrantRole {
+pub enum GrantLevel {
     /// Query and read the project's pages, observations, status and
     /// briefing. Captures from this user are refused rather than silently
     /// dropped.
@@ -31,7 +24,7 @@ pub enum GrantRole {
     Write,
 }
 
-impl GrantRole {
+impl GrantLevel {
     /// The stored form.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -63,43 +56,32 @@ impl GrantRole {
     }
 }
 
+/// One user's access to one project's memory — a row of `project_grants`.
+///
+/// What is granted is access to the project's *memory*, not to the code it
+/// may describe: whoever hosts the repository decides that, and ai-memory
+/// neither checks nor implies it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MemoryGrant {
-    pub id: MemoryGrantId,
+pub struct ProjectGrant {
+    /// The workspace the project lives in.
+    pub workspace_id: WorkspaceId,
+    /// Which project's memory.
+    pub project_id: ProjectId,
     /// Who may reach it. A person, not a device: revoking one laptop's key
     /// must not cost them access from another.
     pub user_id: UserId,
-    /// Which repository's memory. `projects(id)` in the schema; the data model
-    /// calls the entity `repository` (ARD-08 amendment).
-    pub repository_id: ProjectId,
-    /// What this grant permits. See [`GrantRole`].
-    pub role: GrantRole,
-    /// The operator who granted it, so "who let them in" has an answer that is
-    /// not "the database".
+    /// What this grant permits. See [`GrantLevel`].
+    pub level: GrantLevel,
+    /// Who granted it, so "who let them in" has an answer that is not "the
+    /// database".
     ///
     /// `None` when there is no `users` row behind the decision: the operator
     /// used the root bearer token, which authenticates from configuration.
     /// Naming a person there would invent a decision that was never made.
     ///
     /// Equal to `user_id` for exactly one kind of grant: the `write` a user
-    /// receives with a repository they create, where the act was theirs.
-    pub granted_by_user_id: Option<UserId>,
-    /// When it was granted, or when it was seeded.
+    /// receives with a project they create, where the act was theirs.
+    pub granted_by: Option<UserId>,
+    /// When it was granted, or last changed level.
     pub granted_at: Timestamp,
-    /// `None` while active. Revocation stamps a time rather than deleting the
-    /// row: nothing is deleted, and an audit trail that forgets who lost
-    /// access and when is not one.
-    pub revoked_at: Option<Timestamp>,
-    /// Who revoked it, on the same terms as [`Self::granted_by_user_id`]:
-    /// `None` when the operator used the root token. Only
-    /// [`Self::revoked_at`] decides whether the grant is in force.
-    pub revoked_by_user_id: Option<UserId>,
-}
-
-impl MemoryGrant {
-    /// Whether this grant currently permits anything.
-    #[must_use]
-    pub fn is_active(&self) -> bool {
-        self.revoked_at.is_none()
-    }
 }

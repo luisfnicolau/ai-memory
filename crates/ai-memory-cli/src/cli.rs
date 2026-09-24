@@ -1083,15 +1083,6 @@ pub struct PurgeProjectArgs {
     /// this the purge refuses rather than deleting a running session's lease.
     #[arg(long)]
     pub force: bool,
-    /// Revoke the grants in force on this repository instead of refusing.
-    ///
-    /// Without it, a repository that people still hold access to is not
-    /// purged: the refusal names who holds what, so nobody loses access as a
-    /// side effect. With it, those grants are revoked in the same transaction
-    /// as the purge and the grant history is kept. `--force` does not imply
-    /// this.
-    #[arg(long)]
-    pub revoke_grants: bool,
     /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
     /// `workspace`, else `default`.
     #[arg(long)]
@@ -1202,14 +1193,6 @@ pub struct MoveProjectArgs {
     /// lands under a de-duplicated path).
     #[arg(long, value_parser = ["block", "overwrite", "duplicate"], default_value = "block")]
     pub on_conflict: String,
-    /// Merge path only: revoke the grants in force on the source repository
-    /// instead of refusing. A merge purges the source, and grants do not
-    /// follow it into the destination — that would widen someone's access to
-    /// the destination's other content. Re-grant on the destination with
-    /// `ai-memory grant add` if they should keep access. A move into a fresh
-    /// workspace keeps the project id, and its grants, and ignores this.
-    #[arg(long)]
-    pub revoke_grants: bool,
 }
 
 /// Arguments for `move-session`.

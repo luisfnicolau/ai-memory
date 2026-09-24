@@ -401,7 +401,7 @@ async fn resolve_scopes(
         &names,
         MAX_SEARCH_SCOPES,
         viewer,
-        ai_memory_auth::GrantRole::Read,
+        ai_memory_auth::GrantLevel::Read,
     )
     .await
     .map(|scopes| {
@@ -527,7 +527,7 @@ async fn overview_handler(
         return Err(scope_error_response(ScopeResolutionError::NotAuthorized {
             repository: workspace,
             held: None,
-            required: ai_memory_auth::GrantRole::Read,
+            required: ai_memory_auth::GrantLevel::Read,
         }));
     }
 
@@ -1077,7 +1077,7 @@ fn viewer_of(
 /// Resolve a workspace/project pair the viewer is allowed to read.
 ///
 /// Every `/api/v1` route is a GET, so the whole surface needs exactly
-/// [`ai_memory_auth::GrantRole::Read`] and no caller has to choose a level.
+/// [`ai_memory_auth::GrantLevel::Read`] and no caller has to choose a level.
 async fn lookup_project(
     state: &WebState,
     workspace: &str,
@@ -1089,7 +1089,7 @@ async fn lookup_project(
         workspace,
         project,
         viewer,
-        ai_memory_auth::GrantRole::Read,
+        ai_memory_auth::GrantLevel::Read,
     )
     .await
     .map(ai_memory_store::ResolvedScope::as_tuple)

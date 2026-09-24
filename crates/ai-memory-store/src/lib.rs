@@ -17,11 +17,11 @@ use rusqlite::Connection;
 mod api_credentials;
 mod auth;
 // Re-exported because this crate's own public API demands one: every
-// guarded resolver takes a `GrantRole`, so a crate that depends on the
+// guarded resolver takes a `GrantLevel`, so a crate that depends on the
 // store must be able to name the level it needs without also depending
 // on `ai-memory-auth` directly.
-pub use ai_memory_auth::{AccessMode, GrantRole};
-pub use auth::{GrantListing, GrantOutcome, GrantScope};
+pub use ai_memory_auth::{AccessMode, GrantLevel};
+pub use auth::{GrantListing, GrantOutcome};
 mod auto_improve;
 pub mod belief;
 pub mod decay;

@@ -136,9 +136,9 @@ pub enum ScopeResolutionError {
         /// The repository as a person would name it.
         repository: String,
         /// What the caller holds today, if anything.
-        held: Option<ai_memory_auth::GrantRole>,
+        held: Option<ai_memory_auth::GrantLevel>,
         /// What the operation needed.
-        required: ai_memory_auth::GrantRole,
+        required: ai_memory_auth::GrantLevel,
     },
     /// Only one of workspace/project was provided.
     WorkspaceProjectPairRequired,
@@ -363,7 +363,7 @@ pub async fn authorize_scope(
     reader: &ReaderPool,
     scope: ResolvedScope,
     authorized_user: Option<ai_memory_core::UserId>,
-    required: ai_memory_auth::GrantRole,
+    required: ai_memory_auth::GrantLevel,
     repository_label: &str,
 ) -> Result<ResolvedScope, ScopeResolutionError> {
     let Some(user) = authorized_user else {
@@ -373,7 +373,7 @@ pub async fn authorize_scope(
         ai_memory_auth::Access::Granted => Ok(scope),
         ai_memory_auth::Access::Denied(denial) => {
             let held = match denial {
-                ai_memory_auth::Denial::InsufficientRole { held, .. } => Some(held),
+                ai_memory_auth::Denial::InsufficientLevel { held, .. } => Some(held),
                 _ => None,
             };
             Err(ScopeResolutionError::NotAuthorized {
@@ -394,7 +394,7 @@ pub async fn lookup_existing_scope_guarded(
     workspace: &str,
     project: &str,
     authorized_user: Option<ai_memory_core::UserId>,
-    required: ai_memory_auth::GrantRole,
+    required: ai_memory_auth::GrantLevel,
 ) -> Result<ResolvedScope, ScopeResolutionError> {
     let scope = lookup_existing_scope(reader, workspace, project).await?;
     authorize_scope(reader, scope, authorized_user, required, project).await
@@ -425,7 +425,7 @@ pub async fn create_explicit_scope_guarded(
     workspace: &str,
     project: &str,
     authorized_user: Option<ai_memory_core::UserId>,
-    required: ai_memory_auth::GrantRole,
+    required: ai_memory_auth::GrantLevel,
 ) -> Result<ResolvedScope, ScopeResolutionError> {
     let Some(creator) = authorized_user else {
         return create_explicit_scope(writer, workspace, project).await;
@@ -461,7 +461,7 @@ pub async fn resolve_many_existing_scopes_guarded(
     scopes: &[ScopeName],
     max: usize,
     authorized_user: Option<ai_memory_core::UserId>,
-    required: ai_memory_auth::GrantRole,
+    required: ai_memory_auth::GrantLevel,
 ) -> Result<Vec<ResolvedScope>, ScopeResolutionError> {
     let resolved = resolve_many_existing_scopes_labelled(reader, scopes, max).await?;
     if authorized_user.is_none() {
@@ -625,7 +625,7 @@ impl<'a> ScopeResolver<'a> {
     async fn guard(
         &self,
         scope: ResolvedScope,
-        required: ai_memory_auth::GrantRole,
+        required: ai_memory_auth::GrantLevel,
         label: Option<&str>,
     ) -> Result<ResolvedScope, ScopeResolutionError> {
         if self.viewer.is_none() {
@@ -673,7 +673,7 @@ impl<'a> ScopeResolver<'a> {
         &self,
         workspace: &str,
         project: &str,
-        required: ai_memory_auth::GrantRole,
+        required: ai_memory_auth::GrantLevel,
     ) -> Result<ResolvedScope, ScopeResolutionError> {
         let scope = lookup_existing_scope(self.reader, workspace, project).await?;
         self.guard(scope, required, Some(project)).await
@@ -695,7 +695,7 @@ impl<'a> ScopeResolver<'a> {
         explicit_workspace: Option<&str>,
         explicit_project: Option<&str>,
         actor: &ActorKey,
-        required: ai_memory_auth::GrantRole,
+        required: ai_memory_auth::GrantLevel,
     ) -> Result<ResolvedScope, ScopeResolutionError> {
         self.resolve_read_args_traced(explicit_workspace, explicit_project, actor, required)
             .await
@@ -708,7 +708,7 @@ impl<'a> ScopeResolver<'a> {
         explicit_workspace: Option<&str>,
         explicit_project: Option<&str>,
         actor: &ActorKey,
-        required: ai_memory_auth::GrantRole,
+        required: ai_memory_auth::GrantLevel,
     ) -> Result<(ResolvedScope, ScopeSource), ScopeResolutionError> {
         match (
             trimmed_opt(explicit_workspace),
@@ -738,7 +738,7 @@ impl<'a> ScopeResolver<'a> {
         &self,
         explicit_project: Option<&str>,
         actor: &ActorKey,
-        required: ai_memory_auth::GrantRole,
+        required: ai_memory_auth::GrantLevel,
     ) -> Result<ResolvedScope, ScopeResolutionError> {
         let scope = self
             .resolve_current_or_project_unguarded(explicit_project, actor)
@@ -858,7 +858,7 @@ impl<'a> ScopeResolver<'a> {
                         workspace_id,
                         project_id,
                     },
-                    ai_memory_auth::GrantRole::Write,
+                    ai_memory_auth::GrantLevel::Write,
                     None,
                 )
                 .await;
@@ -888,7 +888,7 @@ impl<'a> ScopeResolver<'a> {
         if created {
             return Ok(scope);
         }
-        self.guard(scope, ai_memory_auth::GrantRole::Write, Some(project))
+        self.guard(scope, ai_memory_auth::GrantLevel::Write, Some(project))
             .await
     }
 
@@ -907,7 +907,7 @@ impl<'a> ScopeResolver<'a> {
             scopes,
             max,
             self.viewer,
-            ai_memory_auth::GrantRole::Read,
+            ai_memory_auth::GrantLevel::Read,
         )
         .await
     }
@@ -922,7 +922,7 @@ mod tests {
     use super::*;
     use crate::Store;
 
-    use ai_memory_auth::GrantRole;
+    use ai_memory_auth::GrantLevel;
     use ai_memory_core::NewUser;
 
     /// Insert a grant row directly.
@@ -935,26 +935,15 @@ mod tests {
     fn grant_row(
         db: &std::path::Path,
         user: ai_memory_core::UserId,
-        repository: ProjectId,
-        role: &str,
-        revoked_by: Option<ai_memory_core::UserId>,
+        project: ProjectId,
+        level: &str,
     ) {
         let conn = rusqlite::Connection::open(db).unwrap();
         conn.execute(
-            "INSERT INTO memory_grant \
-             (id, user_id, repository_id, repository_label, role, granted_by_user_id, \
-              granted_at, revoked_at, revoked_by_user_id) \
-             VALUES (?1, ?2, ?3, 'fixture', ?4, ?2, 1, ?5, ?6)",
-            rusqlite::params![
-                ai_memory_core::ids::MemoryGrantId::new()
-                    .as_bytes()
-                    .to_vec(),
-                user.as_bytes().to_vec(),
-                repository.as_bytes().to_vec(),
-                role,
-                revoked_by.map(|_| 2_i64),
-                revoked_by.map(|id| id.as_bytes().to_vec()),
-            ],
+            "INSERT INTO project_grants \
+             (workspace_id, project_id, user_id, level, granted_by, granted_at) \
+             SELECT workspace_id, ?1, ?2, ?3, ?2, 1 FROM projects WHERE id = ?1",
+            rusqlite::params![project.as_bytes().to_vec(), user.as_bytes().to_vec(), level],
         )
         .unwrap();
     }
@@ -1017,7 +1006,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let (ws, project, alice, _) = guard_fixture(&store).await;
-        grant_row(store.db_path(), alice, project, "read", None);
+        grant_row(store.db_path(), alice, project, "read");
         let resolver = ScopeResolver::new(&store.reader, ws, project, Some(alice));
         let actor = ActorKey::default();
 
@@ -1026,20 +1015,20 @@ mod tests {
             ("current-project fallback", None, None),
         ] {
             resolver
-                .resolve_existing_args(workspace, name, &actor, GrantRole::Read)
+                .resolve_existing_args(workspace, name, &actor, GrantLevel::Read)
                 .await
                 .unwrap_or_else(|e| panic!("{label}: a reader may read: {e}"));
 
             let err = resolver
-                .resolve_existing_args(workspace, name, &actor, GrantRole::Write)
+                .resolve_existing_args(workspace, name, &actor, GrantLevel::Write)
                 .await
                 .unwrap_err();
             assert!(
                 matches!(
                     err,
                     ScopeResolutionError::NotAuthorized {
-                        held: Some(GrantRole::Read),
-                        required: GrantRole::Write,
+                        held: Some(GrantLevel::Read),
+                        required: GrantLevel::Write,
                         ..
                     }
                 ),
@@ -1062,7 +1051,7 @@ mod tests {
             "default",
             "client-work",
             None,
-            GrantRole::Write,
+            GrantLevel::Write,
         )
         .await
         .unwrap();
@@ -1080,7 +1069,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let (_, project, alice, bob) = guard_fixture(&store).await;
-        grant_row(store.db_path(), alice, project, "read", None);
+        grant_row(store.db_path(), alice, project, "read");
 
         // Alice holds read: reading passes, writing does not.
         lookup_existing_scope_guarded(
@@ -1088,7 +1077,7 @@ mod tests {
             "default",
             "client-work",
             Some(alice),
-            GrantRole::Read,
+            GrantLevel::Read,
         )
         .await
         .unwrap();
@@ -1097,7 +1086,7 @@ mod tests {
             "default",
             "client-work",
             Some(alice),
-            GrantRole::Write,
+            GrantLevel::Write,
         )
         .await
         .unwrap_err();
@@ -1105,8 +1094,8 @@ mod tests {
             err,
             ScopeResolutionError::NotAuthorized {
                 repository: "client-work".to_owned(),
-                held: Some(GrantRole::Read),
-                required: GrantRole::Write,
+                held: Some(GrantLevel::Read),
+                required: GrantLevel::Write,
             }
         );
 
@@ -1117,7 +1106,7 @@ mod tests {
             "default",
             "client-work",
             Some(bob),
-            GrantRole::Read,
+            GrantLevel::Read,
         )
         .await
         .unwrap_err();
@@ -1126,7 +1115,7 @@ mod tests {
             ScopeResolutionError::NotAuthorized {
                 repository: "client-work".to_owned(),
                 held: None,
-                required: GrantRole::Read,
+                required: GrantLevel::Read,
             }
         );
     }
@@ -1136,7 +1125,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let (ws, project, alice, bob) = guard_fixture(&store).await;
-        grant_row(store.db_path(), alice, project, "read", None);
+        grant_row(store.db_path(), alice, project, "read");
 
         // "Create" must not be a way around the read guard: the project is
         // already there, so Bob's write is refused exactly as a read would be.
@@ -1146,7 +1135,7 @@ mod tests {
             "default",
             "client-work",
             Some(bob),
-            GrantRole::Write,
+            GrantLevel::Write,
         )
         .await
         .unwrap_err();
@@ -1162,14 +1151,14 @@ mod tests {
             "default",
             "client-work",
             Some(alice),
-            GrantRole::Write,
+            GrantLevel::Write,
         )
         .await
         .unwrap_err();
         assert!(matches!(
             err,
             ScopeResolutionError::NotAuthorized {
-                held: Some(GrantRole::Read),
+                held: Some(GrantLevel::Read),
                 ..
             }
         ));
@@ -1183,7 +1172,7 @@ mod tests {
             "default",
             "brand-new",
             Some(bob),
-            GrantRole::Write,
+            GrantLevel::Write,
         )
         .await
         .unwrap();
@@ -1195,14 +1184,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(grants.len(), 1, "{grants:?}");
-        assert_eq!(grants[0].role, GrantRole::Write);
-        assert_eq!(grants[0].granted_by_user_id, Some(bob));
+        assert_eq!(grants[0].level, GrantLevel::Write);
+        assert_eq!(grants[0].granted_by, Some(bob));
         lookup_existing_scope_guarded(
             &store.reader,
             "default",
             "brand-new",
             Some(bob),
-            GrantRole::Read,
+            GrantLevel::Read,
         )
         .await
         .expect("the creator reads back what they created");
@@ -1216,7 +1205,7 @@ mod tests {
             "default",
             "brand-new",
             Some(alice),
-            GrantRole::Write,
+            GrantLevel::Write,
         )
         .await
         .unwrap_err();
@@ -1248,7 +1237,7 @@ mod tests {
             "default",
             "unguarded",
             None,
-            GrantRole::Write,
+            GrantLevel::Write,
         )
         .await
         .unwrap();
@@ -1262,7 +1251,7 @@ mod tests {
         );
         let conn = rusqlite::Connection::open(store.db_path()).unwrap();
         let any: i64 = conn
-            .query_row("SELECT COUNT(*) FROM memory_grant", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM project_grants", [], |row| row.get(0))
             .unwrap();
         assert_eq!(any, 0);
     }
@@ -1292,8 +1281,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(grants.len(), 1, "{grants:?}");
-        assert_eq!(grants[0].role, GrantRole::Write);
-        assert_eq!(grants[0].granted_by_user_id, Some(bob));
+        assert_eq!(grants[0].level, GrantLevel::Write);
+        assert_eq!(grants[0].granted_by, Some(bob));
 
         // Writing to it again is a write to an existing repository he holds
         // write on; no second grant is issued.
@@ -1333,7 +1322,7 @@ mod tests {
             .get_or_create_project(ws, "other-team", None)
             .await
             .unwrap();
-        grant_row(store.db_path(), alice, granted, "read", None);
+        grant_row(store.db_path(), alice, granted, "read");
 
         let names = vec![
             ScopeName::new("default", "client-work"),
@@ -1344,7 +1333,7 @@ mod tests {
             &names,
             25,
             Some(alice),
-            GrantRole::Read,
+            GrantLevel::Read,
         )
         .await
         .unwrap_err();
@@ -1354,14 +1343,14 @@ mod tests {
             ScopeResolutionError::NotAuthorized {
                 repository: "other-team".to_owned(),
                 held: None,
-                required: GrantRole::Read,
+                required: GrantLevel::Read,
             }
         );
         assert_ne!(granted, refused);
 
         // Every scope granted: the call succeeds and de-duplication still
         // applies, so the labels cannot be zipped back positionally.
-        grant_row(store.db_path(), alice, refused, "read", None);
+        grant_row(store.db_path(), alice, refused, "read");
         let resolved = resolve_many_existing_scopes_guarded(
             &store.reader,
             &[
@@ -1371,7 +1360,7 @@ mod tests {
             ],
             25,
             Some(alice),
-            GrantRole::Read,
+            GrantLevel::Read,
         )
         .await
         .unwrap();
@@ -1379,18 +1368,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_revoked_grant_denies_and_does_not_read_as_never_granted() {
+    async fn a_revoked_grant_denies_like_one_never_granted() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let (_, project, alice, bob) = guard_fixture(&store).await;
-        grant_row(store.db_path(), alice, project, "write", Some(bob));
+        store
+            .writer
+            .grant_memory(alice, project, GrantLevel::Write, Some(bob))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .writer
+                .revoke_memory(alice, project, Some(bob))
+                .await
+                .unwrap()
+        );
 
         let err = lookup_existing_scope_guarded(
             &store.reader,
             "default",
             "client-work",
             Some(alice),
-            GrantRole::Read,
+            GrantLevel::Read,
         )
         .await
         .unwrap_err();
@@ -1399,7 +1399,7 @@ mod tests {
             ScopeResolutionError::NotAuthorized {
                 repository: "client-work".to_owned(),
                 held: None,
-                required: GrantRole::Read,
+                required: GrantLevel::Read,
             }
         );
     }
@@ -1437,7 +1437,12 @@ mod tests {
             .unwrap();
         let resolver = ScopeResolver::new(&store.reader, ws, project, None);
         let err = resolver
-            .resolve_existing_args(Some("default"), None, &ActorKey::default(), GrantRole::Read)
+            .resolve_existing_args(
+                Some("default"),
+                None,
+                &ActorKey::default(),
+                GrantLevel::Read,
+            )
             .await
             .unwrap_err();
         assert_eq!(err, ScopeResolutionError::WorkspaceProjectPairRequired);
@@ -1474,13 +1479,13 @@ mod tests {
         let resolver = ScopeResolver::new(&store.reader, default_ws, default_scratch, None)
             .with_active_project(&active_project);
         let scope = resolver
-            .resolve_existing_args(None, Some("scratch"), &actor, GrantRole::Read)
+            .resolve_existing_args(None, Some("scratch"), &actor, GrantLevel::Read)
             .await
             .unwrap();
         assert_eq!(scope.as_tuple(), (active_ws, active_scratch));
 
         let err = resolver
-            .resolve_existing_args(None, Some("missing"), &actor, GrantRole::Read)
+            .resolve_existing_args(None, Some("missing"), &actor, GrantLevel::Read)
             .await
             .unwrap_err();
         assert_eq!(
@@ -1809,7 +1814,7 @@ mod tests {
             let resolver = ScopeResolver::new(&store.reader, default_ws, default_scratch, None)
                 .with_active_project(&active_project);
             let result = resolver
-                .resolve_existing_args(case.workspace, case.project, &actor, GrantRole::Read)
+                .resolve_existing_args(case.workspace, case.project, &actor, GrantLevel::Read)
                 .await;
             match (&result, &case.expected) {
                 (Ok(scope), Expected::Resolved(ws, proj)) => {
@@ -2062,7 +2067,7 @@ mod tests {
             .with_active_project(&active_project);
 
         let scope = resolver
-            .resolve_existing_args(None, None, &stranger, GrantRole::Read)
+            .resolve_existing_args(None, None, &stranger, GrantLevel::Read)
             .await
             .unwrap();
         assert_eq!(scope.as_tuple(), (default_ws, default_proj));
@@ -2094,7 +2099,7 @@ mod tests {
         ] {
             let read = ScopeResolver::new(&store.reader, default_ws, default_proj, None)
                 .with_active_project(&active_project)
-                .resolve_existing_args(None, None, &actor, GrantRole::Read)
+                .resolve_existing_args(None, None, &actor, GrantLevel::Read)
                 .await
                 .unwrap();
             assert_eq!(
@@ -2125,7 +2130,7 @@ mod tests {
                 None,
                 Some("real-work"),
                 &ActorKey::default(),
-                GrantRole::Read,
+                GrantLevel::Read,
             )
             .await
             .unwrap();
@@ -2248,7 +2253,7 @@ mod tests {
                     case.workspace,
                     case.project,
                     case.actor,
-                    ai_memory_auth::GrantRole::Read,
+                    ai_memory_auth::GrantLevel::Read,
                 )
                 .await
                 .unwrap();
@@ -2259,7 +2264,7 @@ mod tests {
                     case.workspace,
                     case.project,
                     case.actor,
-                    ai_memory_auth::GrantRole::Read,
+                    ai_memory_auth::GrantLevel::Read,
                 )
                 .await
                 .unwrap();

@@ -3163,7 +3163,7 @@ async fn namespace_path_lists_its_pages() {
 /// browser and find it from the search box.
 #[tokio::test]
 async fn web_reads_honour_grants_in_a_restricted_project() {
-    use ai_memory_auth::GrantRole;
+    use ai_memory_auth::GrantLevel;
     use ai_memory_core::{AuthorizedViewer, NewUser, UserId, UserRole};
 
     let (_tmp, store, wiki) = setup().await;
@@ -3213,7 +3213,7 @@ async fn web_reads_honour_grants_in_a_restricted_project() {
     let bob = human("bob").await;
     store
         .writer
-        .grant_memory(alice, client, GrantRole::Read, None)
+        .grant_memory(alice, client, GrantLevel::Read, None)
         .await
         .unwrap();
 
@@ -3298,7 +3298,7 @@ async fn web_reads_honour_grants_in_a_restricted_project() {
 /// viewer.
 #[tokio::test]
 async fn metadata_shows_only_what_the_viewer_may_read() {
-    use ai_memory_auth::GrantRole;
+    use ai_memory_auth::GrantLevel;
     use ai_memory_core::{AuthorizedViewer, NewUser, UserId, UserRole};
 
     let (_tmp, store, wiki) = setup().await;
@@ -3387,7 +3387,7 @@ async fn metadata_shows_only_what_the_viewer_may_read() {
         (carol, alpha),
         (carol, beta),
     ] {
-        w.grant_memory(user, repo, GrantRole::Read, None)
+        w.grant_memory(user, repo, GrantLevel::Read, None)
             .await
             .unwrap();
     }

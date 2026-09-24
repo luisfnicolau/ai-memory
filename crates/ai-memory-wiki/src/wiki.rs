@@ -4883,7 +4883,6 @@ mod tests {
                 "default/scratch",
                 None,
                 false,
-                false,
                 ai_memory_store::Compaction::Skip,
             )
             .await

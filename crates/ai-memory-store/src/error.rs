@@ -113,27 +113,6 @@ pub enum StoreError {
         workstreams: String,
     },
 
-    /// A destructive operation was refused because a repository it would
-    /// delete still has grants in force (#708).
-    ///
-    /// Refused rather than cascaded: deleting the repository would take that
-    /// access away with no record of the decision. The operator revokes first,
-    /// or passes `--revoke-grants` to have the operation revoke them in the
-    /// same transaction. Either way the grant history survives the delete.
-    #[error(
-        "{scope} still has {count} active grant(s): {holders}. Revoke them first \
-         (ai-memory grant revoke), or pass --revoke-grants to revoke them as part \
-         of this operation; the grant history is kept either way"
-    )]
-    ActiveGrants {
-        /// The repository or workspace the operation targeted.
-        scope: String,
-        /// How many grants are in force.
-        count: usize,
-        /// `user (role) on workspace/project`, comma-separated.
-        holders: String,
-    },
-
     /// A workspace rename was rejected because the destination name is already
     /// in use by another workspace (`workspaces.name` is UNIQUE).
     #[error("workspace name '{0}' is already taken")]
