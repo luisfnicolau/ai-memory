@@ -413,7 +413,7 @@ fn ingest_rate_key(env: &HookEnvelope, actor_user: Option<&str>) -> String {
     )
 }
 
-/// A capture whose author holds no `writer` grant on the repository it
+/// A capture whose author may not write the project it
 /// resolved to.
 ///
 /// A distinct type rather than a string, because the two call paths have to
@@ -889,7 +889,7 @@ async fn handle_hook_batch(
                 // its attempt budget ran out and stall every item behind it.
                 // Same treatment a capture-policy drop already gets.
                 state.ingest_metrics.record_dropped_unauthorized();
-                warn!("hook batch capture dropped: author holds no writer grant");
+                warn!("hook batch capture dropped: author may not write this project");
                 accepted_indices.push(idx);
                 continue;
             }
@@ -1351,7 +1351,7 @@ async fn fetch_and_accept_handoff(
         &state.reader,
         Some((ws, proj)),
         viewer,
-        ai_memory_auth::GrantRole::Reader,
+        ai_memory_auth::GrantRole::Read,
     )
     .await?;
     // Session-start handoff delivery is a foreground action. Publish it so
@@ -1558,7 +1558,7 @@ async fn fetch_managed_context(
             &state.reader,
             scope,
             viewer,
-            ai_memory_auth::GrantRole::Writer,
+            ai_memory_auth::GrantRole::Write,
         )
         .await?;
     }
@@ -2548,7 +2548,7 @@ async fn process_envelope(
             // "my configuration is discarding these" from "somebody has been
             // working all day and none of it is being kept".
             state.ingest_metrics.record_dropped_unauthorized();
-            warn!("capture dropped: author holds no writer grant on the repository");
+            warn!("capture dropped: author may not write this project");
         } else if matches!(
             e.downcast_ref::<StoreError>(),
             Some(StoreError::SessionCollision)
@@ -2740,7 +2740,7 @@ async fn process_authorized(
         }
     };
 
-    // A capture is a write, so it needs `writer` — the same rule the MCP write
+    // A capture is a write, so it needs `write` — the same rule the MCP write
     // tools follow. The check lands here, rather than in the handler, because
     // here is the first moment the repository is known: the handler answers
     // 202 before this resolution runs, and resolving it up there would put a
@@ -2755,7 +2755,7 @@ async fn process_authorized(
         && matches!(
             state
                 .reader
-                .access_for(viewer, proj, ai_memory_auth::GrantRole::Writer)
+                .access_for(viewer, proj, ai_memory_auth::GrantRole::Write)
                 .await?,
             ai_memory_auth::Access::Denied(_)
         )
@@ -3902,7 +3902,7 @@ mod tests {
     }
 
     /// Build a minimal `HookState` backed by a real on-disk store.
-    /// A capture is a write, so it needs `writer`.
+    /// A capture is a write, so it needs `write`.
     ///
     /// Captures wrote observations into whichever repository a working
     /// directory resolved to, with no grant check at all — the one mutating
@@ -3939,19 +3939,19 @@ mod tests {
             &state,
             "ray",
             landed,
-            Some(ai_memory_store::GrantRole::Reader),
+            Some(ai_memory_store::GrantRole::Read),
         )
         .await;
         let writer = user_holding(
             &state,
             "wren",
             landed,
-            Some(ai_memory_store::GrantRole::Writer),
+            Some(ai_memory_store::GrantRole::Write),
         )
         .await;
         let stranger = user_holding(&state, "sam", landed, None).await;
 
-        // A reader-only grant, and no grant at all, are both refused.
+        // A read-only grant, and no grant at all, are both refused.
         for (who, user) in [("reader", reader), ("stranger", stranger)] {
             let session = SessionId::new().to_string();
             let err = capture_as(&state, &cwd, &session, Some(user))
@@ -4021,7 +4021,7 @@ mod tests {
             &state,
             "ray",
             landed,
-            Some(ai_memory_store::GrantRole::Reader),
+            Some(ai_memory_store::GrantRole::Read),
         )
         .await;
 
@@ -4125,7 +4125,7 @@ mod tests {
         assert_ne!(created, state.project_id);
         let grants = state.reader.grants_for(cora, created).await.unwrap();
         assert_eq!(grants.len(), 1, "{grants:?}");
-        assert_eq!(grants[0].role, ai_memory_store::GrantRole::Admin);
+        assert_eq!(grants[0].role, ai_memory_store::GrantRole::Write);
         assert_eq!(grants[0].granted_by_user_id, Some(cora));
 
         let second = SessionId::new().to_string();
@@ -9965,7 +9965,7 @@ mod tests {
             .grant_memory(
                 alice,
                 state.project_id,
-                ai_memory_auth::GrantRole::Reader,
+                ai_memory_auth::GrantRole::Read,
                 None,
             )
             .await

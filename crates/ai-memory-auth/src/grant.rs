@@ -11,29 +11,24 @@ use serde::{Deserialize, Serialize};
 /// repository.** Code access belongs to GitHub, and lore neither checks it nor
 /// claims to. Conflating the two would let this system imply a permission it
 /// has no way to verify.
-/// What a grant lets its holder do.
+/// What a grant lets its holder do in one project (#708).
 ///
-/// Ordered, and each level contains the one below it: an `Admin` can do
-/// anything a `Writer` can, and a `Writer` anything a `Reader` can. That
-/// ordering is the whole mechanism — a call site names the level an operation
-/// needs, and the comparison is `held >= required`.
+/// Two levels, and `Write` contains `Read`: a call site names the level an
+/// operation needs and the comparison is `held >= required`.
 ///
-/// Three levels rather than two because the third is what makes a server
-/// usable by more than one team. Without `Admin`, every grant on every project
-/// has to go through a server-wide `root`, so onboarding a new person to one
-/// team's project needs the person who runs the server. `Admin` is deliberately
-/// scoped to a single repository: it confers nothing anywhere else.
+/// There is no per-project administrator. Granting and revoking, and every
+/// other administrative act, belong to the server's `root` operator, as they
+/// always have; delegating them per project is out of scope for v1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GrantRole {
-    /// Read this repository's memory. Cannot write pages, and captures from
-    /// this user are refused rather than silently dropped.
-    Reader,
-    /// Read and write. What a developer working in the repository needs, and
-    /// the level a grant carries when nobody says otherwise.
-    Writer,
-    /// Read, write, and grant this repository to other people.
-    Admin,
+    /// Query and read the project's pages, observations, status and
+    /// briefing. Captures from this user are refused rather than silently
+    /// dropped.
+    Read,
+    /// Everything `Read` allows, plus writing: pages, captures, consolidation,
+    /// handoffs, messages, deletion.
+    Write,
 }
 
 impl GrantRole {
@@ -41,24 +36,22 @@ impl GrantRole {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Reader => "reader",
-            Self::Writer => "writer",
-            Self::Admin => "admin",
+            Self::Read => "read",
+            Self::Write => "write",
         }
     }
 
     /// Parse the stored form. Unknown values are refused rather than defaulted:
-    /// a role this build does not understand must not silently become the
-    /// weakest one, because a downgrade of `admin` to `reader` locks a team out
-    /// of its own project, and defaulting the other way is worse.
+    /// a level this build does not understand must not silently become one it
+    /// does — reading `write` as `read` locks a team out of its own project,
+    /// and defaulting the other way widens access nobody granted.
     ///
     /// # Errors
     /// Returns the unrecognised string.
     pub fn parse(value: &str) -> Result<Self, String> {
         match value {
-            "reader" => Ok(Self::Reader),
-            "writer" => Ok(Self::Writer),
-            "admin" => Ok(Self::Admin),
+            "read" => Ok(Self::Read),
+            "write" => Ok(Self::Write),
             other => Err(other.to_string()),
         }
     }
@@ -88,7 +81,7 @@ pub struct MemoryGrant {
     /// used the root bearer token, which authenticates from configuration.
     /// Naming a person there would invent a decision that was never made.
     ///
-    /// Equal to `user_id` for exactly one kind of grant: the `admin` a user
+    /// Equal to `user_id` for exactly one kind of grant: the `write` a user
     /// receives with a repository they create, where the act was theirs.
     pub granted_by_user_id: Option<UserId>,
     /// When it was granted, or when it was seeded.

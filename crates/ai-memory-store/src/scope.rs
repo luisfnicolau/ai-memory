@@ -226,21 +226,21 @@ impl fmt::Display for ScopeResolutionError {
                 held,
                 required,
             } => {
-                // Name both levels: "you have reader and this needs writer"
-                // tells somebody what to ask for, where a bare denial starts a
-                // conversation.
+                // Name both levels: "you have read access and this needs
+                // write" tells somebody what to ask for, where a bare denial
+                // starts a conversation.
                 match held {
                     Some(held) => write!(
                         f,
-                        "not authorized for {repository}: you have {} and this needs {}. \
-                         Ask someone with admin on it to raise your access.",
+                        "not authorized for {repository}: you have {} access and this needs {}. \
+                         Ask the server operator to raise your access.",
                         held.as_str(),
                         required.as_str()
                     ),
                     None => write!(
                         f,
                         "not authorized for {repository}. This is an access problem, not an \
-                         empty memory — ask an operator to grant you {} on it.",
+                         empty memory — ask the server operator to grant you {} access on it.",
                         required.as_str()
                     ),
                 }
@@ -408,7 +408,7 @@ pub async fn lookup_existing_scope_guarded(
 ///   same as any other write. Otherwise "create" would be a way to reach a
 ///   repository the guard would have refused on the read path.
 /// - The repository does not exist yet: this call creates it, and the creator
-///   is granted `admin` on it in the same transaction, recorded as their own
+///   is granted `write` on it in the same transaction, recorded as their own
 ///   granter — without that, the creator could not read back what they had
 ///   just made.
 ///
@@ -858,7 +858,7 @@ impl<'a> ScopeResolver<'a> {
                         workspace_id,
                         project_id,
                     },
-                    ai_memory_auth::GrantRole::Writer,
+                    ai_memory_auth::GrantRole::Write,
                     None,
                 )
                 .await;
@@ -875,7 +875,7 @@ impl<'a> ScopeResolver<'a> {
         };
         // A write to an existing repository is checked exactly as a read of it
         // would be, so "create" cannot be a way in. One this call creates
-        // grants its creator `admin` in the same transaction, so there is
+        // grants its creator `write` in the same transaction, so there is
         // nothing to check — see [`create_explicit_scope_guarded`] for why the
         // writer, not a lookup beforehand, decides which case this is.
         let (project_id, created) = writer
@@ -888,7 +888,7 @@ impl<'a> ScopeResolver<'a> {
         if created {
             return Ok(scope);
         }
-        self.guard(scope, ai_memory_auth::GrantRole::Writer, Some(project))
+        self.guard(scope, ai_memory_auth::GrantRole::Write, Some(project))
             .await
     }
 
@@ -907,7 +907,7 @@ impl<'a> ScopeResolver<'a> {
             scopes,
             max,
             self.viewer,
-            ai_memory_auth::GrantRole::Reader,
+            ai_memory_auth::GrantRole::Read,
         )
         .await
     }
@@ -1017,7 +1017,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let (ws, project, alice, _) = guard_fixture(&store).await;
-        grant_row(store.db_path(), alice, project, "reader", None);
+        grant_row(store.db_path(), alice, project, "read", None);
         let resolver = ScopeResolver::new(&store.reader, ws, project, Some(alice));
         let actor = ActorKey::default();
 
@@ -1026,20 +1026,20 @@ mod tests {
             ("current-project fallback", None, None),
         ] {
             resolver
-                .resolve_existing_args(workspace, name, &actor, GrantRole::Reader)
+                .resolve_existing_args(workspace, name, &actor, GrantRole::Read)
                 .await
                 .unwrap_or_else(|e| panic!("{label}: a reader may read: {e}"));
 
             let err = resolver
-                .resolve_existing_args(workspace, name, &actor, GrantRole::Writer)
+                .resolve_existing_args(workspace, name, &actor, GrantRole::Write)
                 .await
                 .unwrap_err();
             assert!(
                 matches!(
                     err,
                     ScopeResolutionError::NotAuthorized {
-                        held: Some(GrantRole::Reader),
-                        required: GrantRole::Writer,
+                        held: Some(GrantRole::Read),
+                        required: GrantRole::Write,
                         ..
                     }
                 ),
@@ -1062,7 +1062,7 @@ mod tests {
             "default",
             "client-work",
             None,
-            GrantRole::Admin,
+            GrantRole::Write,
         )
         .await
         .unwrap();
@@ -1080,26 +1080,24 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let (_, project, alice, bob) = guard_fixture(&store).await;
-        grant_row(store.db_path(), alice, project, "writer", None);
+        grant_row(store.db_path(), alice, project, "read", None);
 
-        // Alice holds writer: reader and writer pass, admin does not.
-        for required in [GrantRole::Reader, GrantRole::Writer] {
-            lookup_existing_scope_guarded(
-                &store.reader,
-                "default",
-                "client-work",
-                Some(alice),
-                required,
-            )
-            .await
-            .unwrap();
-        }
+        // Alice holds read: reading passes, writing does not.
+        lookup_existing_scope_guarded(
+            &store.reader,
+            "default",
+            "client-work",
+            Some(alice),
+            GrantRole::Read,
+        )
+        .await
+        .unwrap();
         let err = lookup_existing_scope_guarded(
             &store.reader,
             "default",
             "client-work",
             Some(alice),
-            GrantRole::Admin,
+            GrantRole::Write,
         )
         .await
         .unwrap_err();
@@ -1107,8 +1105,8 @@ mod tests {
             err,
             ScopeResolutionError::NotAuthorized {
                 repository: "client-work".to_owned(),
-                held: Some(GrantRole::Writer),
-                required: GrantRole::Admin,
+                held: Some(GrantRole::Read),
+                required: GrantRole::Write,
             }
         );
 
@@ -1119,7 +1117,7 @@ mod tests {
             "default",
             "client-work",
             Some(bob),
-            GrantRole::Reader,
+            GrantRole::Read,
         )
         .await
         .unwrap_err();
@@ -1128,7 +1126,7 @@ mod tests {
             ScopeResolutionError::NotAuthorized {
                 repository: "client-work".to_owned(),
                 held: None,
-                required: GrantRole::Reader,
+                required: GrantRole::Read,
             }
         );
     }
@@ -1138,7 +1136,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let (ws, project, alice, bob) = guard_fixture(&store).await;
-        grant_row(store.db_path(), alice, project, "reader", None);
+        grant_row(store.db_path(), alice, project, "read", None);
 
         // "Create" must not be a way around the read guard: the project is
         // already there, so Bob's write is refused exactly as a read would be.
@@ -1148,7 +1146,7 @@ mod tests {
             "default",
             "client-work",
             Some(bob),
-            GrantRole::Writer,
+            GrantRole::Write,
         )
         .await
         .unwrap_err();
@@ -1157,21 +1155,21 @@ mod tests {
             ScopeResolutionError::NotAuthorized { held: None, .. }
         ));
 
-        // Alice holds reader, which does not cover a write.
+        // Alice holds read, which does not cover a write.
         let err = create_explicit_scope_guarded(
             &store.reader,
             &store.writer,
             "default",
             "client-work",
             Some(alice),
-            GrantRole::Writer,
+            GrantRole::Write,
         )
         .await
         .unwrap_err();
         assert!(matches!(
             err,
             ScopeResolutionError::NotAuthorized {
-                held: Some(GrantRole::Reader),
+                held: Some(GrantRole::Read),
                 ..
             }
         ));
@@ -1185,7 +1183,7 @@ mod tests {
             "default",
             "brand-new",
             Some(bob),
-            GrantRole::Writer,
+            GrantRole::Write,
         )
         .await
         .unwrap();
@@ -1197,14 +1195,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(grants.len(), 1, "{grants:?}");
-        assert_eq!(grants[0].role, GrantRole::Admin);
+        assert_eq!(grants[0].role, GrantRole::Write);
         assert_eq!(grants[0].granted_by_user_id, Some(bob));
         lookup_existing_scope_guarded(
             &store.reader,
             "default",
             "brand-new",
             Some(bob),
-            GrantRole::Reader,
+            GrantRole::Read,
         )
         .await
         .expect("the creator reads back what they created");
@@ -1218,7 +1216,7 @@ mod tests {
             "default",
             "brand-new",
             Some(alice),
-            GrantRole::Writer,
+            GrantRole::Write,
         )
         .await
         .unwrap_err();
@@ -1250,7 +1248,7 @@ mod tests {
             "default",
             "unguarded",
             None,
-            GrantRole::Writer,
+            GrantRole::Write,
         )
         .await
         .unwrap();
@@ -1270,7 +1268,7 @@ mod tests {
     }
 
     /// The MCP write path creates through the resolver, not the free function,
-    /// and must behave the same: the creator gets admin, and a name somebody
+    /// and must behave the same: the creator gets write, and a name somebody
     /// else already created is checked rather than handed back.
     #[tokio::test]
     async fn write_args_grant_the_creator_and_check_everyone_else() {
@@ -1294,11 +1292,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(grants.len(), 1, "{grants:?}");
-        assert_eq!(grants[0].role, GrantRole::Admin);
+        assert_eq!(grants[0].role, GrantRole::Write);
         assert_eq!(grants[0].granted_by_user_id, Some(bob));
 
         // Writing to it again is a write to an existing repository he holds
-        // admin on; no second grant is issued.
+        // write on; no second grant is issued.
         as_bob
             .resolve_write_args(Some("default"), Some("bobs-repo"), &actor)
             .await
@@ -1335,7 +1333,7 @@ mod tests {
             .get_or_create_project(ws, "other-team", None)
             .await
             .unwrap();
-        grant_row(store.db_path(), alice, granted, "reader", None);
+        grant_row(store.db_path(), alice, granted, "read", None);
 
         let names = vec![
             ScopeName::new("default", "client-work"),
@@ -1346,7 +1344,7 @@ mod tests {
             &names,
             25,
             Some(alice),
-            GrantRole::Reader,
+            GrantRole::Read,
         )
         .await
         .unwrap_err();
@@ -1356,14 +1354,14 @@ mod tests {
             ScopeResolutionError::NotAuthorized {
                 repository: "other-team".to_owned(),
                 held: None,
-                required: GrantRole::Reader,
+                required: GrantRole::Read,
             }
         );
         assert_ne!(granted, refused);
 
         // Every scope granted: the call succeeds and de-duplication still
         // applies, so the labels cannot be zipped back positionally.
-        grant_row(store.db_path(), alice, refused, "reader", None);
+        grant_row(store.db_path(), alice, refused, "read", None);
         let resolved = resolve_many_existing_scopes_guarded(
             &store.reader,
             &[
@@ -1373,7 +1371,7 @@ mod tests {
             ],
             25,
             Some(alice),
-            GrantRole::Reader,
+            GrantRole::Read,
         )
         .await
         .unwrap();
@@ -1385,14 +1383,14 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let (_, project, alice, bob) = guard_fixture(&store).await;
-        grant_row(store.db_path(), alice, project, "admin", Some(bob));
+        grant_row(store.db_path(), alice, project, "write", Some(bob));
 
         let err = lookup_existing_scope_guarded(
             &store.reader,
             "default",
             "client-work",
             Some(alice),
-            GrantRole::Reader,
+            GrantRole::Read,
         )
         .await
         .unwrap_err();
@@ -1401,7 +1399,7 @@ mod tests {
             ScopeResolutionError::NotAuthorized {
                 repository: "client-work".to_owned(),
                 held: None,
-                required: GrantRole::Reader,
+                required: GrantRole::Read,
             }
         );
     }
@@ -1439,12 +1437,7 @@ mod tests {
             .unwrap();
         let resolver = ScopeResolver::new(&store.reader, ws, project, None);
         let err = resolver
-            .resolve_existing_args(
-                Some("default"),
-                None,
-                &ActorKey::default(),
-                GrantRole::Reader,
-            )
+            .resolve_existing_args(Some("default"), None, &ActorKey::default(), GrantRole::Read)
             .await
             .unwrap_err();
         assert_eq!(err, ScopeResolutionError::WorkspaceProjectPairRequired);
@@ -1481,13 +1474,13 @@ mod tests {
         let resolver = ScopeResolver::new(&store.reader, default_ws, default_scratch, None)
             .with_active_project(&active_project);
         let scope = resolver
-            .resolve_existing_args(None, Some("scratch"), &actor, GrantRole::Reader)
+            .resolve_existing_args(None, Some("scratch"), &actor, GrantRole::Read)
             .await
             .unwrap();
         assert_eq!(scope.as_tuple(), (active_ws, active_scratch));
 
         let err = resolver
-            .resolve_existing_args(None, Some("missing"), &actor, GrantRole::Reader)
+            .resolve_existing_args(None, Some("missing"), &actor, GrantRole::Read)
             .await
             .unwrap_err();
         assert_eq!(
@@ -1816,7 +1809,7 @@ mod tests {
             let resolver = ScopeResolver::new(&store.reader, default_ws, default_scratch, None)
                 .with_active_project(&active_project);
             let result = resolver
-                .resolve_existing_args(case.workspace, case.project, &actor, GrantRole::Reader)
+                .resolve_existing_args(case.workspace, case.project, &actor, GrantRole::Read)
                 .await;
             match (&result, &case.expected) {
                 (Ok(scope), Expected::Resolved(ws, proj)) => {
@@ -2069,7 +2062,7 @@ mod tests {
             .with_active_project(&active_project);
 
         let scope = resolver
-            .resolve_existing_args(None, None, &stranger, GrantRole::Reader)
+            .resolve_existing_args(None, None, &stranger, GrantRole::Read)
             .await
             .unwrap();
         assert_eq!(scope.as_tuple(), (default_ws, default_proj));
@@ -2101,7 +2094,7 @@ mod tests {
         ] {
             let read = ScopeResolver::new(&store.reader, default_ws, default_proj, None)
                 .with_active_project(&active_project)
-                .resolve_existing_args(None, None, &actor, GrantRole::Reader)
+                .resolve_existing_args(None, None, &actor, GrantRole::Read)
                 .await
                 .unwrap();
             assert_eq!(
@@ -2132,7 +2125,7 @@ mod tests {
                 None,
                 Some("real-work"),
                 &ActorKey::default(),
-                GrantRole::Reader,
+                GrantRole::Read,
             )
             .await
             .unwrap();
@@ -2255,7 +2248,7 @@ mod tests {
                     case.workspace,
                     case.project,
                     case.actor,
-                    ai_memory_auth::GrantRole::Reader,
+                    ai_memory_auth::GrantRole::Read,
                 )
                 .await
                 .unwrap();
@@ -2266,7 +2259,7 @@ mod tests {
                     case.workspace,
                     case.project,
                     case.actor,
-                    ai_memory_auth::GrantRole::Reader,
+                    ai_memory_auth::GrantRole::Read,
                 )
                 .await
                 .unwrap();

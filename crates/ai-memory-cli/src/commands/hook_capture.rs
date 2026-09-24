@@ -409,7 +409,7 @@ pub enum PostOutcome {
     /// (#493).
     Unreachable,
     /// `403` — the server understood the request and will never accept it.
-    /// Today that means the author holds no `writer` grant on the repository
+    /// Today that means the author may not write the project
     /// the event belongs to.
     ///
     /// Terminal, and that is the whole point of separating it from

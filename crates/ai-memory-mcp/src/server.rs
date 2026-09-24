@@ -1842,7 +1842,7 @@ impl AiMemoryServer {
         viewer: Option<ai_memory_core::UserId>,
     ) -> Result<(WorkspaceId, ProjectId), McpError> {
         self.scope_resolver_as(viewer)
-            .resolve_current_or_project(explicit_project, actor, ai_memory_auth::GrantRole::Reader)
+            .resolve_current_or_project(explicit_project, actor, ai_memory_auth::GrantRole::Read)
             .await
             .map(ai_memory_store::ResolvedScope::as_tuple)
             .map_err(Self::scope_error)
@@ -1868,7 +1868,7 @@ impl AiMemoryServer {
             explicit_project,
             actor,
             viewer,
-            ai_memory_auth::GrantRole::Reader,
+            ai_memory_auth::GrantRole::Read,
         )
         .await
     }
@@ -1896,7 +1896,7 @@ impl AiMemoryServer {
             explicit_project,
             actor,
             viewer,
-            ai_memory_auth::GrantRole::Writer,
+            ai_memory_auth::GrantRole::Write,
         )
         .await
     }
@@ -1933,7 +1933,7 @@ impl AiMemoryServer {
                 explicit_workspace,
                 explicit_project,
                 actor,
-                ai_memory_auth::GrantRole::Reader,
+                ai_memory_auth::GrantRole::Read,
             )
             .await
             .map_err(Self::scope_error)?;
@@ -3285,7 +3285,7 @@ impl AiMemoryServer {
         // consolidator's own target, not a guess — before anything runs,
         // dry runs included: a dry run reports the resolved path and the
         // admission verdict, which is itself information about that
-        // repository. Writing a page needs `writer`.
+        // repository. Writing a page needs `write`.
         if let Some(viewer) = Self::viewer_from_parts(Some(&parts))
             && let Some((workspace_id, project_id)) = consolidator
                 .session_target(session_id)
@@ -3305,7 +3305,7 @@ impl AiMemoryServer {
                     project_id,
                 },
                 Some(viewer),
-                ai_memory_auth::GrantRole::Writer,
+                ai_memory_auth::GrantRole::Write,
                 &label,
             )
             .await
@@ -11096,7 +11096,7 @@ mod tests {
             "INSERT INTO memory_grant \
              (id, user_id, repository_id, repository_label, role, granted_by_user_id, \
               granted_at) \
-             VALUES (?1, ?2, ?3, 'fixture', 'writer', ?2, 1)",
+             VALUES (?1, ?2, ?3, 'fixture', 'write', ?2, 1)",
             rusqlite::params![
                 ai_memory_core::ids::MemoryGrantId::new()
                     .as_bytes()
@@ -11112,7 +11112,7 @@ mod tests {
     ///
     /// This is the bug this branch exists for. Every tool below takes the same
     /// read-shaped arguments as `memory_read_page`, and every one of them
-    /// mutates; they all resolved through the read path, so `reader` was
+    /// mutates; they all resolved through the read path, so `read` was
     /// enough to delete a page. The table is the audit: if a tool moves
     /// between the two lists, that is a deliberate policy change and this test
     /// is where it has to be argued.
@@ -11150,7 +11150,7 @@ mod tests {
             )
             .await
             .unwrap();
-        grant_role(store.db_path(), reader_user, proj, "reader");
+        grant_role(store.db_path(), reader_user, proj, "read");
 
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
         let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
@@ -11228,7 +11228,7 @@ mod tests {
             .expect_err("a reader must not delete a page");
         let message = err.message.to_string();
         assert!(
-            message.contains("you have reader and this needs writer"),
+            message.contains("you have read access and this needs write"),
             "the refusal must name both levels: {message}"
         );
 
@@ -11246,7 +11246,7 @@ mod tests {
             .await
             .expect_err("a reader must not record feedback");
         assert!(
-            err.message.to_string().contains("needs writer"),
+            err.message.to_string().contains("needs write"),
             "{}",
             err.message
         );
@@ -11300,7 +11300,7 @@ mod tests {
             )
             .await
             .unwrap();
-        grant_role(store.db_path(), scribe, proj, "writer");
+        grant_role(store.db_path(), scribe, proj, "write");
 
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
         let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
@@ -11400,7 +11400,7 @@ mod tests {
         let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
             .with_wiki(wiki);
 
-        // Alice holds writer on this repository, so her write lands.
+        // Alice holds write on this repository, so her write lands.
         let mut alice_parts = test_parts_default();
         alice_parts.extensions.insert(AuthLevel::User);
         alice_parts.extensions.insert(alice);
@@ -11424,7 +11424,7 @@ mod tests {
                 OptionalParts(alice_parts),
             )
             .await
-            .expect("alice holds writer on her own repository");
+            .expect("alice holds write on her own repository");
 
         let read_as = |viewer: Option<ai_memory_core::UserId>| {
             let server = &server;
@@ -13693,16 +13693,16 @@ mod tests {
         };
         let alice = human("alice").await;
         let bob = human("bob").await;
-        // Bob holds reader on alice's repository: enough to read it, not to
+        // Bob holds read on alice's repository: enough to read it, not to
         // have a page written into it on his behalf.
         store
             .writer
-            .grant_memory(alice, alices, ai_memory_auth::GrantRole::Writer, None)
+            .grant_memory(alice, alices, ai_memory_auth::GrantRole::Write, None)
             .await
             .unwrap();
         store
             .writer
-            .grant_memory(bob, alices, ai_memory_auth::GrantRole::Reader, None)
+            .grant_memory(bob, alices, ai_memory_auth::GrantRole::Read, None)
             .await
             .unwrap();
 
@@ -13752,7 +13752,7 @@ mod tests {
                 "dry={dry}: {message}"
             );
             assert!(
-                message.contains("writer"),
+                message.contains("write"),
                 "names the level needed: {message}"
             );
         }

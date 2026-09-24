@@ -78,12 +78,12 @@ async fn fixture() -> Fixture {
     let outsider = user(&store, "otto", 3).await;
     store
         .writer
-        .grant_memory(reader, project, GrantRole::Reader, None)
+        .grant_memory(reader, project, GrantRole::Read, None)
         .await
         .unwrap();
     store
         .writer
-        .grant_memory(writer, project, GrantRole::Writer, None)
+        .grant_memory(writer, project, GrantRole::Write, None)
         .await
         .unwrap();
     Fixture {
@@ -115,20 +115,20 @@ async fn every_caller_against_both_modes() {
             .unwrap();
         let open = mode == AccessMode::Open;
         for (who, user, read, write) in [
-            ("reader grant", f.reader, true, open),
-            ("writer grant", f.writer, true, true),
+            ("read grant", f.reader, true, open),
+            ("write grant", f.writer, true, true),
             ("no grant", f.outsider, open, open),
         ] {
             let reads = f
                 .store
                 .reader
-                .access_for(user, f.project, GrantRole::Reader)
+                .access_for(user, f.project, GrantRole::Read)
                 .await
                 .unwrap();
             let writes = f
                 .store
                 .reader
-                .access_for(user, f.project, GrantRole::Writer)
+                .access_for(user, f.project, GrantRole::Write)
                 .await
                 .unwrap();
             assert_eq!(granted(reads), read, "{who} reading a {mode:?} project");
@@ -140,7 +140,7 @@ async fn every_caller_against_both_modes() {
             "default",
             "client-work",
             None,
-            GrantRole::Writer,
+            GrantRole::Write,
         )
         .await
         .unwrap_or_else(|e| panic!("root refused on a {mode:?} project: {e}"));
@@ -176,7 +176,7 @@ async fn a_restricted_project_admits_the_team_and_refuses_the_outsider() {
         "default",
         "client-work",
         Some(f.reader),
-        GrantRole::Reader,
+        GrantRole::Read,
     )
     .await
     .expect("a granted teammate is admitted");
@@ -197,7 +197,7 @@ async fn a_restricted_project_admits_the_team_and_refuses_the_outsider() {
         "default",
         "client-work",
         Some(f.outsider),
-        GrantRole::Reader,
+        GrantRole::Read,
     )
     .await
     .unwrap_err();
@@ -245,7 +245,7 @@ async fn new_projects_follow_the_server_default_and_admit_their_creator() {
     assert!(matches!(
         f.store
             .reader
-            .access_for(f.reader, open_one, GrantRole::Writer)
+            .access_for(f.reader, open_one, GrantRole::Write)
             .await
             .unwrap(),
         Access::Granted
@@ -263,7 +263,7 @@ async fn new_projects_follow_the_server_default_and_admit_their_creator() {
         matches!(
             f.store
                 .reader
-                .access_for(f.outsider, locked, GrantRole::Writer)
+                .access_for(f.outsider, locked, GrantRole::Write)
                 .await
                 .unwrap(),
             Access::Granted
@@ -274,7 +274,7 @@ async fn new_projects_follow_the_server_default_and_admit_their_creator() {
         matches!(
             f.store
                 .reader
-                .access_for(f.reader, locked, GrantRole::Reader)
+                .access_for(f.reader, locked, GrantRole::Read)
                 .await
                 .unwrap(),
             Access::Denied(_)
@@ -291,7 +291,7 @@ async fn new_projects_follow_the_server_default_and_admit_their_creator() {
         matches!(
             f.store
                 .reader
-                .access_for(f.reader, plain, GrantRole::Reader)
+                .access_for(f.reader, plain, GrantRole::Read)
                 .await
                 .unwrap(),
             Access::Denied(_)
@@ -310,7 +310,7 @@ async fn new_projects_follow_the_server_default_and_admit_their_creator() {
             matches!(
                 f.store
                     .reader
-                    .access_for(f.reader, id, GrantRole::Writer)
+                    .access_for(f.reader, id, GrantRole::Write)
                     .await
                     .unwrap(),
                 Access::Granted
@@ -322,7 +322,7 @@ async fn new_projects_follow_the_server_default_and_admit_their_creator() {
     assert!(matches!(
         f.store
             .reader
-            .access_for(f.reader, open_one, GrantRole::Writer)
+            .access_for(f.reader, open_one, GrantRole::Write)
             .await
             .unwrap(),
         Access::Granted

@@ -682,7 +682,7 @@ pub struct GrantTargetArgs {
 pub struct GrantAddArgs {
     #[command(flatten)]
     pub target: GrantTargetArgs,
-    /// `reader`, `writer` or `admin`. Required: a level left unsaid is not
+    /// `read` or `write`. Required: a level left unsaid is not
     /// guessed at.
     #[arg(long)]
     pub role: String,

@@ -766,7 +766,7 @@ impl WriterHandle {
     }
 
     /// [`Self::get_or_create_project`] on behalf of `creator`, who is granted
-    /// `admin` in the same transaction when this call creates the row. Returns
+    /// `write` in the same transaction when this call creates the row. Returns
     /// whether it did: a caller that gets `false` must authorize against the
     /// existing repository — see [`ops::get_or_create_project_as`].
     ///

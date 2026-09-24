@@ -33,7 +33,7 @@ pub struct IngestMetrics {
     /// subagent drop. Still a 202: the client must not retry these.
     dropped_by_policy: AtomicU64,
     /// Events accepted but not stored because the authenticated user holds no
-    /// `writer` grant on the repository the capture resolved to.
+    /// `write` access to the project the capture resolved to.
     ///
     /// Separate from `dropped_by_policy` on purpose. A policy drop is the
     /// operator's own configuration working as intended; this one means

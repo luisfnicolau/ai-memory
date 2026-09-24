@@ -124,7 +124,7 @@ pub enum Denial {
     /// needs — a reader attempting a write.
     ///
     /// Carries both levels because the useful message names them: "you have
-    /// reader on this repository and this needs writer" tells someone exactly
+    /// read on this repository and this needs write" tells someone exactly
     /// what to ask for, where "denied" starts a conversation.
     InsufficientRole {
         repository: ProjectId,
@@ -199,7 +199,7 @@ mod tests {
     use jiff::Timestamp;
 
     fn grant(user: UserId, repository: ProjectId, revoked: bool) -> MemoryGrant {
-        grant_as(user, repository, revoked, GrantRole::Writer)
+        grant_as(user, repository, revoked, GrantRole::Write)
     }
 
     fn grant_as(
@@ -224,30 +224,28 @@ mod tests {
     /// than left implicit in the derive.
     #[test]
     fn a_stronger_role_covers_a_weaker_requirement() {
-        assert!(GrantRole::Admin.covers(GrantRole::Writer));
-        assert!(GrantRole::Admin.covers(GrantRole::Reader));
-        assert!(GrantRole::Writer.covers(GrantRole::Reader));
-        assert!(GrantRole::Reader.covers(GrantRole::Reader));
+        assert!(GrantRole::Write.covers(GrantRole::Read));
+        assert!(GrantRole::Write.covers(GrantRole::Write));
+        assert!(GrantRole::Read.covers(GrantRole::Read));
 
-        assert!(!GrantRole::Reader.covers(GrantRole::Writer));
-        assert!(!GrantRole::Writer.covers(GrantRole::Admin));
+        assert!(!GrantRole::Read.covers(GrantRole::Write));
     }
 
     /// A reader attempting a write is refused, and the refusal names both
-    /// levels — "you have reader and this needs writer" tells someone what to
+    /// levels — "you have read and this needs write" tells someone what to
     /// ask for, where a bare denial starts a conversation.
     #[test]
     fn a_reader_cannot_write_and_is_told_why() {
         let (u, r) = (UserId::new(), ProjectId::new());
-        let grants = vec![grant_as(u, r, false, GrantRole::Reader)];
+        let grants = vec![grant_as(u, r, false, GrantRole::Read)];
 
-        assert_eq!(decide(&grants, u, r, GrantRole::Reader), Access::Granted);
+        assert_eq!(decide(&grants, u, r, GrantRole::Read), Access::Granted);
         assert_eq!(
-            decide(&grants, u, r, GrantRole::Writer),
+            decide(&grants, u, r, GrantRole::Write),
             Access::Denied(Denial::InsufficientRole {
                 repository: r,
-                held: GrantRole::Reader,
-                required: GrantRole::Writer,
+                held: GrantRole::Read,
+                required: GrantRole::Write,
             })
         );
     }
@@ -258,10 +256,10 @@ mod tests {
     #[test]
     fn insufficient_is_not_the_same_as_never_granted() {
         let (u, other, r) = (UserId::new(), UserId::new(), ProjectId::new());
-        let grants = vec![grant_as(u, r, false, GrantRole::Reader)];
+        let grants = vec![grant_as(u, r, false, GrantRole::Read)];
 
-        let insufficient = decide(&grants, u, r, GrantRole::Admin);
-        let absent = decide(&grants, other, r, GrantRole::Reader);
+        let insufficient = decide(&grants, u, r, GrantRole::Write);
+        let absent = decide(&grants, other, r, GrantRole::Read);
 
         assert!(matches!(
             insufficient,
@@ -280,34 +278,34 @@ mod tests {
     fn the_strongest_active_grant_wins_whatever_the_order() {
         let (u, r) = (UserId::new(), ProjectId::new());
         let weak_first = vec![
-            grant_as(u, r, false, GrantRole::Reader),
-            grant_as(u, r, false, GrantRole::Admin),
+            grant_as(u, r, false, GrantRole::Read),
+            grant_as(u, r, false, GrantRole::Write),
         ];
         let strong_first = vec![
-            grant_as(u, r, false, GrantRole::Admin),
-            grant_as(u, r, false, GrantRole::Reader),
+            grant_as(u, r, false, GrantRole::Write),
+            grant_as(u, r, false, GrantRole::Read),
         ];
 
-        assert_eq!(decide(&weak_first, u, r, GrantRole::Admin), Access::Granted);
+        assert_eq!(decide(&weak_first, u, r, GrantRole::Write), Access::Granted);
         assert_eq!(
-            decide(&strong_first, u, r, GrantRole::Admin),
+            decide(&strong_first, u, r, GrantRole::Write),
             Access::Granted
         );
     }
 
-    /// A revoked admin grant does not keep conferring admin, and a revoked
+    /// A revoked write grant does not keep conferring write, and a revoked
     /// grant beside an active weaker one must not resurrect the stronger.
     #[test]
     fn revoking_the_stronger_grant_leaves_only_the_weaker() {
         let (u, r) = (UserId::new(), ProjectId::new());
         let grants = vec![
-            grant_as(u, r, true, GrantRole::Admin),
-            grant_as(u, r, false, GrantRole::Reader),
+            grant_as(u, r, true, GrantRole::Write),
+            grant_as(u, r, false, GrantRole::Read),
         ];
 
-        assert_eq!(decide(&grants, u, r, GrantRole::Reader), Access::Granted);
+        assert_eq!(decide(&grants, u, r, GrantRole::Read), Access::Granted);
         assert!(matches!(
-            decide(&grants, u, r, GrantRole::Admin),
+            decide(&grants, u, r, GrantRole::Write),
             Access::Denied(Denial::InsufficientRole { .. })
         ));
     }
@@ -317,13 +315,17 @@ mod tests {
     /// become the weakest one, which would lock a team out of its own project.
     #[test]
     fn roles_round_trip_and_unknown_values_are_refused() {
-        for role in [GrantRole::Reader, GrantRole::Writer, GrantRole::Admin] {
+        for role in [GrantRole::Read, GrantRole::Write] {
             assert_eq!(GrantRole::parse(role.as_str()), Ok(role));
         }
         assert!(GrantRole::parse("owner").is_err());
         assert!(GrantRole::parse("").is_err());
         assert!(
-            GrantRole::parse("Admin").is_err(),
+            GrantRole::parse("admin").is_err(),
+            "there is no per-project admin; administration is root's"
+        );
+        assert!(
+            GrantRole::parse("Write").is_err(),
             "the stored form is lowercase"
         );
     }
@@ -332,7 +334,7 @@ mod tests {
     fn an_active_grant_allows() {
         let (u, r) = (UserId::new(), ProjectId::new());
         assert_eq!(
-            decide(&[grant(u, r, false)], u, r, GrantRole::Reader),
+            decide(&[grant(u, r, false)], u, r, GrantRole::Read),
             Access::Granted
         );
     }
@@ -341,7 +343,7 @@ mod tests {
     fn no_grant_at_all_is_never_granted() {
         let (u, r) = (UserId::new(), ProjectId::new());
         assert_eq!(
-            decide(&[], u, r, GrantRole::Reader),
+            decide(&[], u, r, GrantRole::Read),
             Access::Denied(Denial::NeverGranted { repository: r })
         );
     }
@@ -352,7 +354,7 @@ mod tests {
     fn a_revoked_grant_is_reported_as_revoked() {
         let (u, r) = (UserId::new(), ProjectId::new());
         assert_eq!(
-            decide(&[grant(u, r, true)], u, r, GrantRole::Reader),
+            decide(&[grant(u, r, true)], u, r, GrantRole::Read),
             Access::Denied(Denial::Revoked { repository: r })
         );
     }
@@ -365,11 +367,11 @@ mod tests {
         let revoked_first = vec![grant(u, r, true), grant(u, r, false)];
         let active_first = vec![grant(u, r, false), grant(u, r, true)];
         assert_eq!(
-            decide(&revoked_first, u, r, GrantRole::Reader),
+            decide(&revoked_first, u, r, GrantRole::Read),
             Access::Granted
         );
         assert_eq!(
-            decide(&active_first, u, r, GrantRole::Reader),
+            decide(&active_first, u, r, GrantRole::Read),
             Access::Granted
         );
     }
@@ -382,16 +384,13 @@ mod tests {
         let (api, web) = (ProjectId::new(), ProjectId::new());
         let grants = vec![grant(ana, api, false)];
 
+        assert_eq!(decide(&grants, ana, api, GrantRole::Read), Access::Granted);
         assert_eq!(
-            decide(&grants, ana, api, GrantRole::Reader),
-            Access::Granted
-        );
-        assert_eq!(
-            decide(&grants, bruno, api, GrantRole::Reader),
+            decide(&grants, bruno, api, GrantRole::Read),
             Access::Denied(Denial::NeverGranted { repository: api })
         );
         assert_eq!(
-            decide(&grants, ana, web, GrantRole::Reader),
+            decide(&grants, ana, web, GrantRole::Read),
             Access::Denied(Denial::NeverGranted { repository: web })
         );
     }
@@ -404,7 +403,7 @@ mod tests {
         let api = ProjectId::new();
         let grants = vec![grant(bruno, api, true)];
         assert_eq!(
-            decide(&grants, ana, api, GrantRole::Reader),
+            decide(&grants, ana, api, GrantRole::Read),
             Access::Denied(Denial::NeverGranted { repository: api }),
             "Ana never had it; Bruno losing it says nothing about her"
         );

@@ -693,7 +693,7 @@ pub struct AuthSettings {
     ///
     /// Off by default: a new project is open to every authenticated user, as
     /// every project was before per-project access existed. On, a new project
-    /// admits only its creator — who is granted `admin` on it — and root,
+    /// admits only its creator — who is granted `write` on it — and root,
     /// until someone grants others. Existing projects are never changed by
     /// this; an operator restricts one with `ai-memory project access`. The
     /// reserved `scratch` and global-preferences projects are always open.

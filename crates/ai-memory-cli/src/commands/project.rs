@@ -55,7 +55,7 @@ async fn access(ep: &ServerEndpoint, args: ProjectAccessArgs) -> Result<()> {
             println!("  {name}");
         }
         println!(
-            "Grant the ones who should keep access: ai-memory grant add <user> {} --workspace {} --role writer",
+            "Grant the ones who should keep access: ai-memory grant add <user> {} --workspace {} --role write",
             args.project, args.workspace
         );
     }

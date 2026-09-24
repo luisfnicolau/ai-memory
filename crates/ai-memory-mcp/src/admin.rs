@@ -1727,7 +1727,7 @@ const OPERATOR: Option<ai_memory_core::UserId> = None;
 /// Unused while [`OPERATOR`] is `None` — `authorize_scope` returns early on an
 /// absent user — but stating it keeps the call sites readable and makes the
 /// switch to a named user a one-line change.
-const OPERATOR_ROLE: ai_memory_auth::GrantRole = ai_memory_auth::GrantRole::Admin;
+const OPERATOR_ROLE: ai_memory_auth::GrantRole = ai_memory_auth::GrantRole::Write;
 
 /// Resolve workspace + project IDs, creating them if absent. Returns
 /// either the IDs or a ready-to-return error response.
@@ -7809,12 +7809,12 @@ async fn handle_grant(
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     require_root(level)?;
     // Refuse rather than default. A grant whose level was mistyped must not
-    // quietly become `writer`: the operator meant *something*, and guessing
+    // quietly become `write`: the operator meant *something*, and guessing
     // which in an authorization table is how access gets wider than intended.
     let role = request
         .role
         .as_deref()
-        .ok_or_else(|| validation_error("role is required: reader, writer or admin".into()))
+        .ok_or_else(|| validation_error("role is required: read or write".into()))
         .and_then(|raw| ai_memory_auth::GrantRole::parse(raw.trim()).map_err(validation_error))?;
     let (user, project) = grant_target(&state, &request).await?;
     let outcome = state
@@ -7877,7 +7877,7 @@ struct ProjectAccessRequest {
 /// `POST /admin/projects/access` — set a project `open` or `restricted` (#708).
 ///
 /// Restricting admits only root and grant holders from the next request on —
-/// the creator holds `admin` from the moment they created it. The response
+/// the creator holds `write` from the moment they created it. The response
 /// names the page authors who hold no grant and so lose access, so the
 /// operator can grant the ones who should keep it. Nothing is granted
 /// automatically: restricting is the action meant to narrow access, and it must
@@ -9073,7 +9073,7 @@ mod tests {
             "default",
             "scratch",
             None,
-            ai_memory_auth::GrantRole::Reader,
+            ai_memory_auth::GrantRole::Read,
         )
         .await
         .unwrap();
@@ -12632,13 +12632,27 @@ mod tests {
             StatusCode::BAD_REQUEST,
             "unknown level must not be guessed at"
         );
+        // There is no per-project administrator: administration is root's.
+        let (status, _) = admin_call(
+            &router,
+            "POST",
+            "/admin/grants",
+            "root-token",
+            target(Some("admin")),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "admin is not a grant level"
+        );
 
         let (status, json) = admin_call(
             &router,
             "POST",
             "/admin/grants",
             "root-token",
-            target(Some("writer")),
+            target(Some("write")),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -12650,7 +12664,7 @@ mod tests {
             "POST",
             "/admin/grants",
             "root-token",
-            target(Some("writer")),
+            target(Some("write")),
         )
         .await;
         assert_eq!(
@@ -12663,11 +12677,11 @@ mod tests {
             "POST",
             "/admin/grants",
             "root-token",
-            target(Some("reader")),
+            target(Some("read")),
         )
         .await;
         assert_eq!(json["changed"], true);
-        assert_eq!(json["previous"], "writer");
+        assert_eq!(json["previous"], "write");
 
         // A typo in the repository is a 404, and does not create it: asking
         // twice still finds nothing.
@@ -12681,7 +12695,7 @@ mod tests {
                     "username": "alice",
                     "workspace": "default",
                     "project": "client-wrok",
-                    "role": "reader",
+                    "role": "read",
                 })),
             )
             .await;
@@ -12696,7 +12710,7 @@ mod tests {
                 "username": "alice",
                 "workspace": "default",
                 "project": "client-work",
-                "role": "reader",
+                "role": "read",
             }])
         );
 
@@ -12747,7 +12761,7 @@ mod tests {
                 "username": "alice",
                 "workspace": workspace,
                 "project": project,
-                "role": "writer",
+                "role": "write",
             })),
         )
         .await;
@@ -12785,7 +12799,7 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT, "{json}");
         let error = json["error"].as_str().unwrap();
         assert!(
-            error.contains("alice (writer) on default/client-work"),
+            error.contains("alice (write) on default/client-work"),
             "{error}"
         );
 
@@ -12855,7 +12869,7 @@ mod tests {
             json["error"]
                 .as_str()
                 .unwrap()
-                .contains("alice (writer) on team-a/shared"),
+                .contains("alice (write) on team-a/shared"),
             "{json}"
         );
         // Refusing after the copy would leave the content in both places.
@@ -12920,7 +12934,7 @@ mod tests {
             json["error"]
                 .as_str()
                 .unwrap()
-                .contains("alice (writer) on team-c/api"),
+                .contains("alice (write) on team-c/api"),
             "{json}"
         );
 
@@ -12952,7 +12966,7 @@ mod tests {
                     "username": "alice",
                     "workspace": "default",
                     "project": "client-work",
-                    "role": "admin",
+                    "role": "write",
                 })
             });
             let (status, _) = admin_call(&router, method, uri, "not-root", body).await;

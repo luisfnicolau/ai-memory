@@ -84,8 +84,8 @@ fn now_us() -> i64 {
 /// the root operator both need.
 ///
 /// "May read" is an open repository, or a restricted one with any active
-/// grant. `reader` is the lowest level, so every grant covers it — the same answer `ai_memory_auth::decide` gives for
-/// `GrantRole::Reader`, and a test pins the two together. The global
+/// grant. `read` is the lowest level, so every grant covers it — the same answer `ai_memory_auth::decide` gives for
+/// `GrantRole::Read`, and a test pins the two together. The global
 /// preferences scope is always readable: it is shared by construction (see
 /// `lookup_global_scope`).
 ///

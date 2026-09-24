@@ -54,19 +54,15 @@ CREATE TABLE memory_grant (
     -- why it is written at grant time and not only at deletion.
     repository_label      TEXT NOT NULL,
 
-    -- `reader` < `writer` < `admin`, each containing the one below. A call site
-    -- names the level an operation needs and the check is `held >= required`.
+    -- `read` < `write`, `write` containing `read`. A call site names the level
+    -- an operation needs and the check is `held >= required`. There is no
+    -- per-project administrator: granting is the server operator's, as every
+    -- administrative act already is.
     --
-    -- `admin` is scoped to this repository alone and confers nothing elsewhere.
-    -- It exists so that onboarding somebody to one team's project does not
-    -- require the person who runs the server; without it, every grant on every
-    -- project funnels through a global `root`, which does not survive more than
-    -- a handful of teams.
-    --
-    -- Defaults to `writer`: a grant with nothing said about it means "this
+    -- Defaults to `write`: a grant with nothing said about it means "this
     -- person works here", which is what the common case wants.
-    role                  TEXT NOT NULL DEFAULT 'writer'
-                              CHECK (role IN ('reader', 'writer', 'admin')),
+    role                  TEXT NOT NULL DEFAULT 'write'
+                              CHECK (role IN ('read', 'write')),
 
     -- The `users` row behind the decision, when there is one. NULL when there
     -- is not, which happens in exactly one way, and deliberately: the
@@ -79,7 +75,7 @@ CREATE TABLE memory_grant (
     -- the one table an access review reads.
     --
     -- The one grant that does name its grantee is the creator's: whoever
-    -- creates a repository is granted `admin` on it in the same transaction,
+    -- creates a repository is granted `write` on it in the same transaction,
     -- and the act that produced that grant was theirs. So
     -- `granted_by_user_id = user_id` reads as exactly one thing — "acquired by
     -- creating the repository" — and never as an access somebody else decided.

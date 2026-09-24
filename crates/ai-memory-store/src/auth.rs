@@ -597,24 +597,24 @@ mod tests {
         let w = &f.store.writer;
 
         assert_eq!(
-            w.grant_memory(f.alice, f.client, GrantRole::Reader, Some(f.bob))
+            w.grant_memory(f.alice, f.client, GrantRole::Read, Some(f.bob))
                 .await
                 .unwrap(),
             GrantOutcome::Granted
         );
         // The same level again is not reported as a change.
         assert_eq!(
-            w.grant_memory(f.alice, f.client, GrantRole::Reader, Some(f.bob))
+            w.grant_memory(f.alice, f.client, GrantRole::Read, Some(f.bob))
                 .await
                 .unwrap(),
             GrantOutcome::Unchanged
         );
         assert_eq!(
-            w.grant_memory(f.alice, f.client, GrantRole::Writer, Some(f.bob))
+            w.grant_memory(f.alice, f.client, GrantRole::Write, Some(f.bob))
                 .await
                 .unwrap(),
             GrantOutcome::RoleChanged {
-                from: GrantRole::Reader
+                from: GrantRole::Read
             }
         );
 
@@ -625,9 +625,9 @@ mod tests {
         assert_eq!(rows.len(), 2);
         let active: Vec<_> = rows.iter().filter(|g| g.is_active()).collect();
         assert_eq!(active.len(), 1);
-        assert_eq!(active[0].role, GrantRole::Writer);
+        assert_eq!(active[0].role, GrantRole::Write);
         let old = rows.iter().find(|g| !g.is_active()).unwrap();
-        assert_eq!(old.role, GrantRole::Reader);
+        assert_eq!(old.role, GrantRole::Read);
         assert_eq!(old.revoked_by_user_id, Some(f.bob));
     }
 
@@ -635,7 +635,7 @@ mod tests {
     async fn revoking_is_honest_about_whether_anything_was_held() {
         let f = fixture().await;
         let w = &f.store.writer;
-        w.grant_memory(f.alice, f.client, GrantRole::Writer, Some(f.bob))
+        w.grant_memory(f.alice, f.client, GrantRole::Write, Some(f.bob))
             .await
             .unwrap();
 
@@ -653,7 +653,7 @@ mod tests {
         // The decision now reads it as revoked, not as never granted.
         let grants = all_rows(&f.store, f.alice, f.client);
         assert_eq!(
-            ai_memory_auth::decide(&grants, f.alice, f.client, GrantRole::Reader),
+            ai_memory_auth::decide(&grants, f.alice, f.client, GrantRole::Read),
             ai_memory_auth::Access::Denied(ai_memory_auth::Denial::Revoked {
                 repository: f.client
             })
@@ -667,7 +667,7 @@ mod tests {
         // needs to work when something has gone wrong.
         let f = fixture().await;
         let w = &f.store.writer;
-        w.grant_memory(f.alice, f.client, GrantRole::Writer, None)
+        w.grant_memory(f.alice, f.client, GrantRole::Write, None)
             .await
             .unwrap();
         assert!(w.revoke_memory(f.alice, f.client, None).await.unwrap());
@@ -713,13 +713,13 @@ mod tests {
     }
 
     /// The search filter is written in SQL as "any active grant"; the guard
-    /// on every other path is `decide(.., GrantRole::Reader)`. They agree only
+    /// on every other path is `decide(.., GrantRole::Read)`. They agree only
     /// because reader is the lowest level. This pins that, so adding a level
     /// below reader breaks a test rather than quietly widening search.
     #[test]
     fn every_grant_level_can_read_which_is_what_the_search_filter_assumes() {
-        for role in [GrantRole::Reader, GrantRole::Writer, GrantRole::Admin] {
-            assert!(role.covers(GrantRole::Reader), "{role:?}");
+        for role in [GrantRole::Read, GrantRole::Write] {
+            assert!(role.covers(GrantRole::Read), "{role:?}");
         }
     }
 
@@ -745,7 +745,7 @@ mod tests {
         .await;
         f.store
             .writer
-            .grant_memory(f.alice, f.client, GrantRole::Reader, None)
+            .grant_memory(f.alice, f.client, GrantRole::Read, None)
             .await
             .unwrap();
 
@@ -847,7 +847,7 @@ mod tests {
 
         f.store
             .writer
-            .grant_memory(f.bob, f.personal, GrantRole::Reader, None)
+            .grant_memory(f.bob, f.personal, GrantRole::Read, None)
             .await
             .unwrap();
 
@@ -874,10 +874,10 @@ mod tests {
     async fn the_listing_shows_names_and_only_what_is_in_force() {
         let f = fixture().await;
         let w = &f.store.writer;
-        w.grant_memory(f.alice, f.client, GrantRole::Admin, None)
+        w.grant_memory(f.alice, f.client, GrantRole::Write, None)
             .await
             .unwrap();
-        w.grant_memory(f.bob, f.personal, GrantRole::Reader, None)
+        w.grant_memory(f.bob, f.personal, GrantRole::Read, None)
             .await
             .unwrap();
         w.revoke_memory(f.bob, f.personal, None).await.unwrap();
@@ -889,7 +889,7 @@ mod tests {
                 username: "alice".into(),
                 workspace: "default".into(),
                 repository: "client-work".into(),
-                role: GrantRole::Admin,
+                role: GrantRole::Write,
                 active: true,
             }]
         );
@@ -940,7 +940,7 @@ mod tests {
         let f = fixture().await;
         f.store
             .writer
-            .grant_memory(f.alice, f.client, GrantRole::Writer, None)
+            .grant_memory(f.alice, f.client, GrantRole::Write, None)
             .await
             .unwrap();
 
@@ -951,7 +951,7 @@ mod tests {
             "{message}"
         );
         assert!(
-            message.contains("alice (writer) on default/client-work"),
+            message.contains("alice (write) on default/client-work"),
             "{message}"
         );
         assert!(message.contains("--revoke-grants"), "{message}");
@@ -974,7 +974,7 @@ mod tests {
         let f = fixture().await;
         f.store
             .writer
-            .grant_memory(f.alice, f.client, GrantRole::Admin, None)
+            .grant_memory(f.alice, f.client, GrantRole::Write, None)
             .await
             .unwrap();
 
@@ -996,7 +996,7 @@ mod tests {
     async fn a_repository_with_only_revoked_history_purges_and_keeps_it() {
         let f = fixture().await;
         let w = &f.store.writer;
-        w.grant_memory(f.alice, f.client, GrantRole::Reader, None)
+        w.grant_memory(f.alice, f.client, GrantRole::Read, None)
             .await
             .unwrap();
         w.revoke_memory(f.alice, f.client, None).await.unwrap();
@@ -1017,7 +1017,7 @@ mod tests {
         let f = fixture().await;
         f.store
             .writer
-            .grant_memory(f.alice, f.client, GrantRole::Writer, None)
+            .grant_memory(f.alice, f.client, GrantRole::Write, None)
             .await
             .unwrap();
         let conn = Connection::open(f.store.db_path()).unwrap();
@@ -1047,7 +1047,7 @@ mod tests {
         let w = &f.store.writer;
         let team = w.get_or_create_workspace("team-b").await.unwrap();
         let repo = w.get_or_create_project(team, "api", None).await.unwrap();
-        w.grant_memory(f.alice, repo, GrantRole::Writer, None)
+        w.grant_memory(f.alice, repo, GrantRole::Write, None)
             .await
             .unwrap();
 
@@ -1057,7 +1057,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            err.to_string().contains("alice (writer) on team-b/api"),
+            err.to_string().contains("alice (write) on team-b/api"),
             "{err}"
         );
 
@@ -1081,7 +1081,7 @@ mod tests {
         let w = &f.store.writer;
         // `personal` is empty: no pages, no sessions. Hollow by every other
         // measure, and the sweep runs on a schedule with nobody watching.
-        w.grant_memory(f.alice, f.personal, GrantRole::Writer, None)
+        w.grant_memory(f.alice, f.personal, GrantRole::Write, None)
             .await
             .unwrap();
         let swept = w.sweep_hollow_projects(0).await.unwrap();
@@ -1103,7 +1103,7 @@ mod tests {
         // content with no action needed — the id, not the name, is the key.
         let f = fixture().await;
         let w = &f.store.writer;
-        w.grant_memory(f.alice, f.client, GrantRole::Writer, None)
+        w.grant_memory(f.alice, f.client, GrantRole::Write, None)
             .await
             .unwrap();
 
@@ -1117,7 +1117,7 @@ mod tests {
 
         let grants = all_rows(&f.store, f.alice, f.client);
         assert_eq!(
-            ai_memory_auth::decide(&grants, f.alice, f.client, GrantRole::Writer),
+            ai_memory_auth::decide(&grants, f.alice, f.client, GrantRole::Write),
             ai_memory_auth::Access::Granted
         );
         let listing = f.store.reader.list_active_grants().await.unwrap();
@@ -1134,10 +1134,10 @@ mod tests {
         let f = fixture().await;
         let w = &f.store.writer;
         let global = crate::create_global_scope(w).await.unwrap();
-        w.grant_memory(f.alice, f.client, GrantRole::Reader, None)
+        w.grant_memory(f.alice, f.client, GrantRole::Read, None)
             .await
             .unwrap();
-        w.grant_memory(f.bob, f.personal, GrantRole::Writer, None)
+        w.grant_memory(f.bob, f.personal, GrantRole::Write, None)
             .await
             .unwrap();
         w.revoke_memory(f.bob, f.personal, None).await.unwrap();
@@ -1209,10 +1209,10 @@ mod tests {
     async fn the_workspace_handoff_comes_only_from_readable_repositories() {
         let f = fixture().await;
         let w = &f.store.writer;
-        w.grant_memory(f.alice, f.client, GrantRole::Reader, None)
+        w.grant_memory(f.alice, f.client, GrantRole::Read, None)
             .await
             .unwrap();
-        w.grant_memory(f.bob, f.personal, GrantRole::Reader, None)
+        w.grant_memory(f.bob, f.personal, GrantRole::Read, None)
             .await
             .unwrap();
         w.insert_handoff(unowned_handoff(f.ws, f.personal, "bob's older baton"))
@@ -1257,7 +1257,7 @@ mod tests {
         let f = fixture().await;
         f.store
             .writer
-            .grant_memory(f.alice, f.client, GrantRole::Reader, None)
+            .grant_memory(f.alice, f.client, GrantRole::Read, None)
             .await
             .unwrap();
         for repo in [f.client, f.personal] {

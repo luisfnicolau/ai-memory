@@ -36,7 +36,7 @@ pub(crate) async fn authorize_read(
         workspace,
         project,
         Some(viewer.user()),
-        ai_memory_auth::GrantRole::Reader,
+        ai_memory_auth::GrantRole::Read,
     )
     .await
     .map(|_| ())

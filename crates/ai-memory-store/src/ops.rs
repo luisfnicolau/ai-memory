@@ -295,7 +295,7 @@ pub(crate) fn initial_access_mode(
 /// [`get_or_create_project`] on behalf of a user, reporting whether this call
 /// created the row.
 ///
-/// When it does and `creator` is set, the creator is granted `admin` on the new
+/// When it does and `creator` is set, the creator is granted `write` on the new
 /// repository in the same transaction, recorded as their own granter. With
 /// authorization on, the creator otherwise could not read back what they had
 /// just made, and a hook capture opening a new repository would create it and
@@ -357,7 +357,7 @@ pub fn get_or_create_project_as(
             &tx,
             creator,
             id,
-            ai_memory_auth::GrantRole::Admin,
+            ai_memory_auth::GrantRole::Write,
             Some(creator),
             Timestamp::now().as_microsecond(),
         )?;
@@ -416,7 +416,7 @@ impl IdentityResolution {
 ///      then `-2`, `-3`, …).
 ///
 /// An identity already on a project is never overwritten. A created project
-/// grants its creator `admin`, as [`get_or_create_project_as`] does. A split
+/// grants its creator `write`, as [`get_or_create_project_as`] does. A split
 /// project gets no `repo_path`: the path belongs to the project the name
 /// matched, and sharing it would let prefix matching route that project's
 /// other captures here.
@@ -485,7 +485,7 @@ pub fn resolve_project_by_identity(
                 let may_write = match creator {
                     None => true,
                     Some(user) => matches!(
-                        crate::auth::access(&tx, user, id, ai_memory_auth::GrantRole::Writer)?,
+                        crate::auth::access(&tx, user, id, ai_memory_auth::GrantRole::Write)?,
                         ai_memory_auth::Access::Granted
                     ),
                 };
@@ -535,7 +535,7 @@ pub fn resolve_project_by_identity(
             &tx,
             creator,
             id,
-            ai_memory_auth::GrantRole::Admin,
+            ai_memory_auth::GrantRole::Write,
             Some(creator),
             now,
         )?;

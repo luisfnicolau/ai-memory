@@ -692,17 +692,19 @@ operator restricts one:
 
 ```sh
 ai-memory project access --workspace acme --project checkout-api --mode restricted
-ai-memory grant add alice checkout-api --workspace acme --role writer
+ai-memory grant add alice checkout-api --workspace acme --role write
 ```
 
 Both are root-only. Restricting prints the users who have written to the
 project and hold no grant — the people it now refuses — so you can grant the
 ones who should keep access; nothing is granted automatically.
 
-- **Grants** are `reader` < `writer` < `admin`, per project. `admin` on one
-  project confers nothing elsewhere. `ai-memory grant list | add | revoke`
-  manages them; revocation is recorded, never deleted.
-- **Whoever creates a project** is granted `admin` on it, so a creator keeps
+- **Grants** are `read` or `write`, per project; `write` includes `read`.
+  There is no per-project administrator: granting, revoking and restricting
+  are the root operator's, like every other administrative act.
+  `ai-memory grant list | add | revoke` manages them; revocation is recorded,
+  never deleted.
+- **Whoever creates a project** is granted `write` on it, so a creator keeps
   their project if it is later restricted.
 - **New projects** are `open` unless `[auth] new_projects_restricted = true`
   (`AI_MEMORY_AUTH__NEW_PROJECTS_RESTRICTED=true`), which makes every project created from then on start `restricted`. The
