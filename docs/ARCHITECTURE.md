@@ -534,9 +534,8 @@ reorg                purge-project        rename-project
 move-project         move-session         uninstall
 auth                 user                 completions
 handoffs             purge-session        compact
-api-key              export-okf           grant
-message              doctor               backfill
-project
+api-key              export-okf           message
+doctor               backfill             project
 ```
 
 Run `ai-memory --help` for the full tree.

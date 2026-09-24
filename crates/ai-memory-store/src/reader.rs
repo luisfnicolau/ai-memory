@@ -1801,12 +1801,16 @@ impl ReaderPool {
             .await
     }
 
-    /// Every grant on the server, resolved to names for display.
+    /// Grants matching `filter`, resolved to names for display.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
-    pub async fn list_grants(&self) -> StoreResult<Vec<crate::auth::GrantListing>> {
-        self.with_conn(crate::auth::list_grants).await
+    pub async fn list_grants(
+        &self,
+        filter: crate::auth::GrantFilter,
+    ) -> StoreResult<Vec<crate::auth::GrantListing>> {
+        self.with_conn(move |conn| crate::auth::list_grants(conn, filter))
+            .await
     }
 
     /// Run a synchronous closure against a pooled read-only connection.

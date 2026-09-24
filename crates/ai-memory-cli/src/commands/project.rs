@@ -19,6 +19,7 @@ pub async fn run(config: &Config, args: ProjectArgs) -> Result<()> {
     let ep = ServerEndpoint::from_config_resolving_auth(config).await;
     match args.command {
         ProjectCommand::Access(args) => access(&ep, args).await,
+        ProjectCommand::Grants(args) => crate::commands::grant::list_for_project(&ep, &args).await,
     }
 }
 
@@ -55,8 +56,9 @@ async fn access(ep: &ServerEndpoint, args: ProjectAccessArgs) -> Result<()> {
             println!("  {name}");
         }
         println!(
-            "Grant the ones who should keep access: ai-memory grant add <user> {} --workspace {} --role write",
-            args.project, args.workspace
+            "Grant the ones who should keep access: ai-memory user grant --user <name> \
+             --workspace {} --project {} --level write",
+            args.workspace, args.project
         );
     }
     Ok(())

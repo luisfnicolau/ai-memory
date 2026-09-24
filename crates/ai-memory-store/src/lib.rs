@@ -21,7 +21,7 @@ mod auth;
 // store must be able to name the level it needs without also depending
 // on `ai-memory-auth` directly.
 pub use ai_memory_auth::{AccessMode, GrantLevel};
-pub use auth::{GrantListing, GrantOutcome};
+pub use auth::{GrantFilter, GrantListing, GrantOutcome};
 mod auto_improve;
 pub mod belief;
 pub mod decay;

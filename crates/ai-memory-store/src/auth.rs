@@ -342,33 +342,61 @@ pub struct GrantListing {
     pub level: GrantLevel,
 }
 
-/// Every grant on the server, ordered for human reading.
+/// Which grants a listing covers.
+#[derive(Debug, Clone, Copy)]
+pub enum GrantFilter {
+    /// Every grant on the server.
+    All,
+    /// What one user reaches.
+    User(UserId),
+    /// Who reaches one project.
+    Project(ProjectId),
+}
+
+/// Grants matching `filter`, ordered for human reading.
 ///
 /// Names rather than ids: a listing an operator cannot read without three
 /// further queries is not a listing.
 ///
 /// # Errors
 /// Propagates any SQL error.
-pub fn list_grants(conn: &Connection) -> StoreResult<Vec<GrantListing>> {
-    let mut stmt = conn.prepare(
+pub fn list_grants(conn: &Connection, filter: GrantFilter) -> StoreResult<Vec<GrantListing>> {
+    let (predicate, bound): (&str, Option<Vec<u8>>) = match filter {
+        GrantFilter::All => ("1 = 1", None),
+        GrantFilter::User(user) => (
+            "project_grants.user_id = ?1",
+            Some(user.as_bytes().to_vec()),
+        ),
+        GrantFilter::Project(project) => (
+            "project_grants.project_id = ?1",
+            Some(project.as_bytes().to_vec()),
+        ),
+    };
+    let mut stmt = conn.prepare(&format!(
         "SELECT users.username, workspaces.name, projects.name, project_grants.level \
            FROM project_grants \
            JOIN users      ON users.id = project_grants.user_id \
            JOIN projects   ON projects.id = project_grants.project_id \
            JOIN workspaces ON workspaces.id = project_grants.workspace_id \
-          ORDER BY workspaces.name, projects.name, users.username",
-    )?;
-    let rows = stmt.query_map([], |row| {
+          WHERE {predicate} \
+          ORDER BY workspaces.name, projects.name, users.username"
+    ))?;
+    let map = |row: &rusqlite::Row<'_>| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
             row.get::<_, String>(3)?,
         ))
-    })?;
+    };
+    let rows = match bound {
+        Some(id) => stmt
+            .query_map(params![id], map)?
+            .collect::<Result<Vec<_>, _>>()?,
+        None => stmt.query_map([], map)?.collect::<Result<Vec<_>, _>>()?,
+    };
     let mut out = Vec::new();
-    for row in rows {
-        let (username, workspace, project, level) = row?;
+    for (username, workspace, project, level) in rows {
         let Ok(level) = GrantLevel::parse(&level) else {
             // Same rule as `grants_for`: a row we cannot read is not repaired
             // into something plausible, even for display.
@@ -778,7 +806,7 @@ mod tests {
             .unwrap();
         w.revoke_memory(f.bob, f.personal, None).await.unwrap();
 
-        let listing = f.store.reader.list_grants().await.unwrap();
+        let listing = f.store.reader.list_grants(GrantFilter::All).await.unwrap();
         assert_eq!(
             listing,
             vec![GrantListing {
@@ -787,6 +815,35 @@ mod tests {
                 project: "client-work".into(),
                 level: GrantLevel::Write,
             }]
+        );
+
+        // Filtered: what one user reaches, and who reaches one project.
+        w.grant_memory(f.bob, f.client, GrantLevel::Read, None)
+            .await
+            .unwrap();
+        let alice = f
+            .store
+            .reader
+            .list_grants(GrantFilter::User(f.alice))
+            .await
+            .unwrap();
+        assert_eq!(alice.len(), 1);
+        assert_eq!(alice[0].username, "alice");
+        let on_client = f
+            .store
+            .reader
+            .list_grants(GrantFilter::Project(f.client))
+            .await
+            .unwrap();
+        let names: Vec<_> = on_client.iter().map(|g| g.username.as_str()).collect();
+        assert_eq!(names, ["alice", "bob"]);
+        assert!(
+            f.store
+                .reader
+                .list_grants(GrantFilter::Project(f.personal))
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -887,7 +944,7 @@ mod tests {
             ai_memory_auth::decide(&grants, f.alice, f.client, GrantLevel::Write),
             ai_memory_auth::Access::Granted
         );
-        let listing = f.store.reader.list_grants().await.unwrap();
+        let listing = f.store.reader.list_grants(GrantFilter::All).await.unwrap();
         assert_eq!(listing[0].workspace, "elsewhere");
         assert_eq!(listing[0].project, "client-renamed");
 

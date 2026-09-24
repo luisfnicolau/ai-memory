@@ -692,7 +692,7 @@ operator restricts one:
 
 ```sh
 ai-memory project access --workspace acme --project checkout-api --mode restricted
-ai-memory grant add alice checkout-api --workspace acme --role write
+ai-memory user grant --user alice --workspace acme --project checkout-api --level write
 ```
 
 Both are root-only. Restricting prints the users who have written to the
@@ -702,7 +702,10 @@ ones who should keep access; nothing is granted automatically.
 - **Grants** are `read` or `write`, per project; `write` includes `read`.
   There is no per-project administrator: granting, revoking and restricting
   are the root operator's, like every other administrative act.
-  `ai-memory grant list | add | revoke` manages them. A user holds one level
+  `ai-memory user grant | revoke` manages them; `ai-memory user grants
+  [--user NAME]` and `ai-memory project grants --workspace W --project P` list
+  them (REST: `POST /admin/users/{name}/grant|revoke`,
+  `GET /admin/users/{name}/grants`, `GET /admin/projects/grants`). A user holds one level
   per project; revoking deletes the grant, and purging a project or deleting
   its workspace takes its grants with it. Every grant, level change and revoke
   is recorded in the audit log (`grant_access` / `revoke_access`, with who did

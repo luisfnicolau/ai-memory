@@ -220,10 +220,6 @@ pub enum Command {
     /// the root bearer token and `[auth].token_pepper`.
     #[command(name = "api-key")]
     ApiKey(ApiKeyArgs),
-    /// Manage who may reach which repository (#708). All subcommands require
-    /// the root bearer token. Grants decide access to `restricted` projects;
-    /// an `open` project admits every user — see `ai-memory project access`.
-    Grant(GrantArgs),
     /// Project settings. `project access` sets a project `open` (any user)
     /// or `restricted` (root and grant holders) (#708). Requires the root
     /// bearer token.
@@ -638,54 +634,46 @@ pub struct UserArgs {
     pub command: UserCommand,
 }
 
-/// Arguments for `grant`.
+/// Arguments for `user grant`.
 #[derive(Debug, Args)]
-pub struct GrantArgs {
-    /// Grant-management action to run.
-    #[command(subcommand)]
-    pub command: GrantCommand,
-}
-
-/// `grant` subcommands.
-#[derive(Debug, Subcommand)]
-pub enum GrantCommand {
-    /// List every grant in force.
-    List(GrantListArgs),
-    /// Give a user a level on a repository, or change the level they hold.
-    Add(GrantAddArgs),
-    /// Take away whatever a user holds on a repository.
-    Revoke(GrantTargetArgs),
-}
-
-/// Arguments for `grant list`.
-#[derive(Debug, Args)]
-pub struct GrantListArgs {
-    /// Emit the response as JSON instead of a human-readable table.
-    #[arg(long)]
-    pub json: bool,
-}
-
-/// The user and repository a grant is about.
-#[derive(Debug, Args)]
-pub struct GrantTargetArgs {
+pub struct UserGrantArgs {
     /// The user, by username.
-    pub username: String,
-    /// The repository, by project name.
-    pub project: String,
+    #[arg(long)]
+    pub user: String,
     /// The workspace the project lives in.
     #[arg(long, default_value = "default")]
     pub workspace: String,
+    /// The project, by name.
+    #[arg(long)]
+    pub project: String,
+    /// `read` or `write`. Required: a level left unsaid is not guessed at.
+    #[arg(long)]
+    pub level: String,
 }
 
-/// Arguments for `grant add`.
+/// Arguments for `user revoke`.
 #[derive(Debug, Args)]
-pub struct GrantAddArgs {
-    #[command(flatten)]
-    pub target: GrantTargetArgs,
-    /// `read` or `write`. Required: a level left unsaid is not
-    /// guessed at.
+pub struct UserRevokeArgs {
+    /// The user, by username.
     #[arg(long)]
-    pub role: String,
+    pub user: String,
+    /// The workspace the project lives in.
+    #[arg(long, default_value = "default")]
+    pub workspace: String,
+    /// The project, by name.
+    #[arg(long)]
+    pub project: String,
+}
+
+/// Arguments for `user grants`.
+#[derive(Debug, Args)]
+pub struct UserGrantsArgs {
+    /// Only this user's grants. Omit for every grant on the server.
+    #[arg(long)]
+    pub user: Option<String>,
+    /// Emit the response as JSON instead of a table.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for `project`.
@@ -701,6 +689,22 @@ pub struct ProjectArgs {
 pub enum ProjectCommand {
     /// Set a project `open` or `restricted`.
     Access(ProjectAccessArgs),
+    /// List who holds a grant on one project.
+    Grants(ProjectGrantsArgs),
+}
+
+/// Arguments for `project grants`.
+#[derive(Debug, Args)]
+pub struct ProjectGrantsArgs {
+    /// The workspace the project lives in.
+    #[arg(long, default_value = "default")]
+    pub workspace: String,
+    /// The project, by name.
+    #[arg(long)]
+    pub project: String,
+    /// Emit the response as JSON instead of a table.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for `project access`.
@@ -757,6 +761,14 @@ pub enum UserCommand {
     Enable(UserEnableArgs),
     /// Update display name, email, and/or role (`root` or `user`).
     Patch(UserPatchArgs),
+    /// Grant a user `read` or `write` on a project, or change the level they
+    /// hold (#708). Grants decide access to `restricted` projects; an `open`
+    /// project admits every user — see `ai-memory project access`.
+    Grant(UserGrantArgs),
+    /// Take away whatever a user holds on a project.
+    Revoke(UserRevokeArgs),
+    /// List grants: one user's with `--user`, else every grant on the server.
+    Grants(UserGrantsArgs),
 }
 
 /// Arguments for `user add`.
@@ -2656,6 +2668,73 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::collections::BTreeSet;
+
+    /// The management surface uses the design's spelling (#708):
+    /// `user grant --user … --workspace … --project … --level …`, `user revoke`,
+    /// and listings under `user grants` / `project grants`. A level is never
+    /// defaulted, and the former top-level `grant` command is gone.
+    #[test]
+    fn grant_commands_use_the_designs_spelling() {
+        let parsed = Cli::try_parse_from([
+            "ai-memory",
+            "user",
+            "grant",
+            "--user",
+            "alice",
+            "--workspace",
+            "acme",
+            "--project",
+            "api",
+            "--level",
+            "write",
+        ])
+        .expect("user grant parses");
+        let Command::User(UserArgs {
+            command: UserCommand::Grant(args),
+        }) = parsed.command
+        else {
+            panic!("expected user grant");
+        };
+        assert_eq!(
+            (
+                args.user.as_str(),
+                args.workspace.as_str(),
+                args.project.as_str(),
+                args.level.as_str()
+            ),
+            ("alice", "acme", "api", "write")
+        );
+        assert!(
+            Cli::try_parse_from([
+                "ai-memory",
+                "user",
+                "grant",
+                "--user",
+                "alice",
+                "--project",
+                "api"
+            ])
+            .is_err(),
+            "a level left unsaid is not guessed at"
+        );
+        for argv in [
+            &[
+                "ai-memory",
+                "user",
+                "revoke",
+                "--user",
+                "alice",
+                "--project",
+                "api",
+            ][..],
+            &["ai-memory", "user", "grants"][..],
+            &["ai-memory", "user", "grants", "--user", "alice"][..],
+            &["ai-memory", "project", "grants", "--project", "api"][..],
+        ] {
+            Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+        }
+        assert!(Cli::try_parse_from(["ai-memory", "grant", "list"]).is_err());
+    }
 
     #[test]
     fn serve_parses_insecure_no_auth_override() {

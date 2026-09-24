@@ -4323,7 +4323,7 @@ mod tests {
     /// A user holding `role` on the capture fixture's repository.
     ///
     /// Uses the real grant API rather than raw SQL, so the test exercises the
-    /// same path an operator's `ai-memory grant` call takes.
+    /// same path an operator's `ai-memory user grant` call takes.
     async fn user_holding(
         state: &HookState,
         username: &str,
